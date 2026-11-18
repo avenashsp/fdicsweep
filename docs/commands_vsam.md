@@ -1,4 +1,4 @@
-# SWEEP CLI Command Reference - VSAM Migration Track (v5.0)
+# SWEEP CLI Command Reference - VSAM Migration Track (v5.1)
 
 Complete command reference for the **VSAM Migration Track** of the SWEEP Unified Data Migration Framework.
 
@@ -35,7 +35,7 @@ python3 sweep.py monitor
 python3 sweep.py monitor -w
 
 # Monitor VSAM track only with custom refresh interval (e.g. 5 seconds)
-python3 sweep.py monitor -t vsam -i 5
+python3 sweep.py monitor --track vsam --interval 5
 ```
 
 ### Execution Log Viewer (`logs`)
@@ -46,27 +46,28 @@ Follows live logs or inspects recent execution output:
 python3 sweep.py logs -f
 
 # Follow logs filtered strictly to the VSAM migration track
-python3 sweep.py logs -t vsam -f
+python3 sweep.py logs --track vsam -f
 
 # View the last 100 lines of the latest VSAM log
-python3 sweep.py logs -t vsam -n 100
+python3 sweep.py logs --track vsam -n 100
 
 # View a specific log file in the vsam logs directory
-python3 sweep.py logs -F vsam/logs/SWEEPB_vsam_06_load_data_20261108_154430.log
+python3 sweep.py logs --file vsam/logs/SWEEPB_vsam_06_load_data_20261108_154430.log
 ```
 
-### Clean Cancellation (`cancel` / `stop`)
-Safely terminates running background worker processes and cleans up PostgreSQL connections:
+### Clean Cancellation (`stop`)
+Safely terminates running background jobs *and every child process they started* (psql, aws, gzip), after verifying each PID still belongs to a SWEEP supervisor:
 
 ```bash
 # Stop all running background migration processes
-python3 sweep.py cancel
+python3 sweep.py stop
 
 # Stop a specific job by name
-python3 sweep.py cancel --job vsam_06_load_data
+python3 sweep.py stop --name vsam_06_load_data
 
-# Stop background processes AND kill in-flight PostgreSQL COPY sessions immediately
-python3 sweep.py cancel --kill-db
+# Stop background processes AND end in-flight PostgreSQL sessions opened by SWEEP
+# (only sessions with application_name = 'sweep'; other users' sessions are left alone)
+python3 sweep.py stop --kill-db
 ```
 
 ### Automated Full Pipeline (`run-all`)
@@ -91,13 +92,14 @@ python3 sweep.py vsam extract
 # Run extraction in background daemon
 python3 sweep.py vsam extract --bg
 
-# Standalone script equivalent:
-python3 vsam/vsam_01_extract_copybooks.py
+# Standalone module equivalent (run from the repository root):
+python3 -m vsam.vsam_01_extract_copybooks
 ```
 
 * **Outputs Generated**:
-  - `vsam/outputs/01_copybook_metadata.json`: Consolidated copybook schemas, field definitions, and PK definitions.
-  - `vsam/reports/01_copybook_extraction_report.xlsx`: Excel workbook summarizing all parsed copybooks, detected column counts, and candidate primary keys.
+  - `vsam/outputs/vsam_01_copybook_extracts.csv`: every copybook field (SQL type, lengths, key / filler flags).
+  - `vsam/reports/<db>_vsam_01_extract_report_<timestamp>.xlsx`: sheets `Summary` (per copybook) and `FieldExtract`.
+* **Exit code**: non-zero if any copybook failed to parse or the copybook directory is missing.
 
 ---
 
@@ -114,13 +116,15 @@ python3 sweep.py vsam inventory --s3 "s3://your-migration-bucket/vsam-flat-files
 # Restrict discovery to a specific source company (e.g. FDIC or AGILETIC)
 python3 sweep.py vsam inventory --company FDIC
 
-# Standalone script equivalent:
-python3 vsam/vsam_02_inventory.py --company FDIC
+# Standalone module equivalent (run from the repository root):
+python3 -m vsam.vsam_02_inventory --company FDIC
 ```
 
 * **Outputs Generated**:
-  - `vsam/outputs/02_vsam_inventory.json`: S3 file catalogue, timestamps, file sizes, and resolved table mappings.
-  - `vsam/reports/02_vsam_inventory_report.xlsx`: Multi-tab inventory workbook listing discovered files, resolved tables, and version pruning summaries.
+  - `vsam/outputs/vsam_02_inventory.csv`, `vsam_02_load_matrix.csv`, `vsam_02_latest_file_headers.csv` (unprefixed legacy copies are also written).
+  - `vsam/reports/<db>_vsam_02_inventory_report_<timestamp>.xlsx`: sheets `Summary`, `FileInventory`, `LatestFileHeaders`.
+
+> `--latest-only` is available on the standalone module (`python3 -m vsam.vsam_02_inventory --latest-only`); `sweep.py vsam inventory` exposes `--s3` and `--company`.
 
 ---
 
@@ -145,19 +149,17 @@ python3 sweep.py vsam type-gate --workers 4
 # Run in background daemon
 python3 sweep.py vsam type-gate --workers 4 --bg
 
-# Process only latest file versions
-python3 sweep.py vsam type-gate --latest-only
-
 # Filter by source company
 python3 sweep.py vsam type-gate --company FDIC
 
-# Standalone script equivalent:
-python3 vsam/vsam_03_type_gate.py --workers 4 --latest-only
+# Standalone module equivalent (adds --latest-only, which the sweep.py wrapper does not expose):
+python3 -m vsam.vsam_03_type_gate --workers 4 --latest-only
 ```
 
 * **Outputs Generated**:
-  - `vsam/outputs/03_type_gate_results.json`: Type profiling results, PK candidates, schema routing metadata, and column definitions.
-  - `vsam/reports/03_type_gate_report.xlsx`: 11-column gate report (`s3 filename`, `tablename`, `copybook`, `korg column`, `rows checked`, `pk status`, `pk columns`, `schema_col_is_pk`, `gate verdict`, `type errors`, `full s3 uri`).
+  - `vsam/outputs/vsam_03_type_gate.json` and `vsam_03_type_gate_status.csv`: type profiling results, PK candidates, schema routing metadata and column definitions.
+  - `vsam/reports/<db>_vsam_03_type_gate_report_<timestamp>.xlsx`: sheets `TypeGateSummary` (11 columns: `S3 file name`, `source key`, `schema`, `copybook`, `table`, `has PK?`, `PK Columns`, `is PK valid`, `has schema_col?`, `schema_col`, `Full S3 URI`), `GateSummary`, `PKVerification`, `SchemaColumnDetect`, `TypeIssues`.
+  - A source that fails to profile is recorded as `BLOCKED` with the error text; the step itself still completes.
 
 ---
 
@@ -180,8 +182,8 @@ python3 sweep.py vsam gen-ddl --execute
 # Generate DDL for a specific source company
 python3 sweep.py vsam gen-ddl --company FDIC
 
-# Standalone script equivalent:
-python3 vsam/vsam_04_generate_ddl.py --execute
+# Standalone module equivalent (run from the repository root):
+python3 -m vsam.vsam_04_generate_ddl --execute
 ```
 
 * **Outputs Generated**:
@@ -205,13 +207,15 @@ python3 sweep.py vsam apply-ddl --bg
 # Skip re-deploying sweep_meta.sql control schema
 python3 sweep.py vsam apply-ddl --skip-meta
 
-# Standalone script equivalent:
-python3 vsam/vsam_05_apply_ddl.py
+# Standalone module equivalent (run from the repository root):
+python3 -m vsam.vsam_05_apply_ddl
 ```
 
 * **Outputs Generated**:
   - Log records in `vsam/logs/` detailing schema creation and table provisioning.
+  - `vsam/reports/<db>_vsam_05_apply_ddl_report_<timestamp>.xlsx` (sheet `ProvisionedTables`).
   - PostgreSQL target tables ready for streaming bulk load.
+* **Exit code**: non-zero if the generated DDL is missing or any statement fails (the whole script runs with `ON_ERROR_STOP`).
 
 ---
 
@@ -222,11 +226,27 @@ Streams VSAM flat files directly from S3 into PostgreSQL with live database cons
 - **Default Mode (`python3 sweep.py vsam load-data` or `--mode default`)**:
   * **Fresh Table**: Applies PK constraints from `gen_ddl/<schema>_pk.sql` to available tables in PostgreSQL *before* loading data, validates every record against the PK constraint (`record_passes_pk_validation`), and inserts only valid records.
   * **Existing Table with PK**: Upserts incoming data using the PK constraint (`ON CONFLICT (pk_cols) DO UPDATE SET ...`).
-  * **Existing Table without PK**: Truncates the table and loads the data.
+  * **Existing Table without PK**: **Refuses to touch the table unless `--force-truncate` is given** (see below).
 - **Data Mode (`python3 sweep.py vsam load-data --mode data`)**:
   * **Fresh Table**: Does NOT apply PK constraints. Performs direct bulk load.
   * **Existing Table with PK**: Upserts incoming data using the PK constraint.
-  * **Existing Table without PK**: Truncates the table and loads the data.
+  * **Existing Table without PK**: **Refuses to touch the table unless `--force-truncate` is given** (see below).
+
+#### Truncation Safety (`--force-truncate`)
+Several source files can feed the same destination table (for example different companies routed to the shared `bcs` schema). SWEEP therefore:
+- never truncates implicitly: a table that already contains rows and has **no primary key** makes the file fail with *"Refusing to TRUNCATE ... without --force-truncate"*;
+- with `--force-truncate`, truncates each such table **once per run** - the first file to reach the table "claims" it, and every later file mapped to the same table **appends** (so earlier files are never wiped);
+- fails the file if the `TRUNCATE` itself fails (it is never ignored).
+
+```bash
+# Re-load tables that already contain data and have no PK (truncate once, then load every file)
+python3 sweep.py vsam load-data --mode data --force-truncate --workers 4
+
+# Preview which files would be loaded, without touching the database
+python3 sweep.py vsam load-data --dry-run
+```
+
+> VSAM Step 06 loads in 10,000-row `INSERT` batches (not one transaction per file) and does **not** skip files that were loaded earlier; re-running is idempotent for tables with a PK (upsert) and needs `--force-truncate` for tables without one. Load results are logged per destination schema in `sweep_ctl.load_log` (keyed `<uri>#<schema>`); if that log write fails the file is reported `FAILED`.
 
 #### Schema Routing Rules:
 - **No copybook and no korg column**: Loaded **directly into the `bcs` schema**.
@@ -255,11 +275,11 @@ python3 sweep.py vsam load-data --company FDIC --workers 4
 # Ingest data for specific tables only
 python3 sweep.py vsam load-data --tables vsamkorg,stg_ftxref_v --workers 4
 
-# Standalone script equivalent:
-python3 vsam/vsam_06_load_data.py --mode default --workers 4
+# Standalone module equivalent (run from the repository root):
+python3 -m vsam.vsam_06_load_data --mode default --workers 4
 ```
 
-#### Generated Excel Workbook (`vsam/reports/load_data_report_<timestamp>.xlsx`):
+#### Generated Excel Workbook (`vsam/reports/<db>_vsam_06_load_data_report_<timestamp>.xlsx`, plus `vsam/outputs/vsam_06_load_log_<run_id>.csv`):
 1. **`LoadSummary` Sheet (17 Columns)**:
    - `s3 filename`: Source S3 file basename.
    - `tablename`: Destination table name.
@@ -283,6 +303,9 @@ python3 vsam/vsam_06_load_data.py --mode default --workers 4
    - Destination **schemas** as columns (`bcs`, `bss01104`, `bss01105`, `bss01112`, etc.) plus a `Total` column.
    - Record counts populated at each file/schema intersection.
    - Grand `TOTAL` summary row at the bottom.
+3. **`RunOverview` Sheet**: run id, task / success / failed counts, rows loaded and skipped, `--latest-only` flag, worker count.
+
+* **Exit code**: non-zero if any file failed to load.
 
 ---
 
@@ -290,7 +313,9 @@ python3 vsam/vsam_06_load_data.py --mode default --workers 4
 Performs thorough reconciliation and audit:
 - Reconciles S3 files against `sweep_ctl.load_log`.
 - Executes exact PostgreSQL row counts (`COUNT(*)` with `--exact-counts`).
-- Verifies column structures, data types, lengths, precision, scale, and PK constraint status against copybook specifications (or reports `TABLE_UNCONSTRAINED` if PK constraints were not deployed).
+- Verifies column structures, data types, lengths, precision, scale, and PK constraint status against copybook specifications (or reports `TABLE_UNCONSTRAINED` if PK constraints were not deployed). Tables whose columns were inferred from the data (no copybook) are audited too.
+- A file routed entirely to the fallback `bcs` schema counts as loaded.
+- **Exit code**: `1` when a file is not loaded, a column is missing, a type mismatches, or the database catalog cannot be queried; `0` otherwise.
 
 ```bash
 # Fast validation using PostgreSQL catalog approximations
@@ -305,12 +330,12 @@ python3 sweep.py vsam validate --tables vsamkorg --exact-counts
 # Validate specific schema
 python3 sweep.py vsam validate --schema bss01001 --exact-counts
 
-# Standalone script equivalent:
-python3 vsam/vsam_07_validate.py --exact-counts
+# Standalone module equivalent (run from the repository root):
+python3 -m vsam.vsam_07_validate --exact-counts
 ```
 
 * **Outputs Generated**:
-  - `vsam/reports/07_validate_report_<timestamp>.xlsx`: Parity audit workbook with schema, table, column, constraint, and row count reconciliations.
+  - `vsam/reports/<db>_vsam_07_validate_report_<timestamp>.xlsx`: sheets `FileReconciliation`, `RowCounts`, `ColumnAudit`, `TypeAudit`, `PKAudit`.
 
 ---
 
@@ -324,11 +349,13 @@ python3 sweep.py status
 
 # 2. Check if the job is still alive or stopped
 # If needed, terminate stale database sessions:
-python3 sweep.py cancel --kill-db
+python3 sweep.py stop --kill-db
 
 # 3. Resume ingestion:
-# The loader checks sweep_ctl.load_log and skips already loaded files automatically!
+# VSAM re-processes every file in the load matrix: tables with a PK are upserted (idempotent);
+# tables without a PK need --force-truncate so rows from the interrupted run are not duplicated.
 python3 sweep.py vsam load-data --workers 4 --bg
+python3 sweep.py vsam load-data --mode data --force-truncate --workers 4 --bg   # PK-less tables
 ```
 
 ### Recipe 2: Initial Fresh Load without Constraints followed by Constrained Upsert
@@ -349,4 +376,6 @@ To run Oracle and VSAM pipelines sequentially overnight with automated logging:
 ```bash
 python3 sweep.py run-all --track all --workers 4 --bg
 python3 sweep.py monitor -w
+
+# A failing step stops the pipeline and the job finishes as ERRORED (check `python3 sweep.py status`)
 ```

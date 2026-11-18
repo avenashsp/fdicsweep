@@ -1,10 +1,12 @@
-# SWEEP Migration Framework - Complete CLI Flags Reference (v5.0)
+# SWEEP Migration Framework - Complete CLI Flags Reference (v5.1)
 
 Complete flags reference for all CLI commands and python scripts in the **SWEEP Unified Data Migration Framework** across both **Oracle** and **VSAM** tracks.
 
-Scripts can be invoked in two ways:
+Steps can be invoked in two ways:
 1. **Via Master CLI**: `python3 sweep.py <track> <command> [flags]` *(Recommended: includes `--bg` daemon management, logging, and unified environment configuration)*
-2. **As Standalone Scripts**: `python3 <track>/<script>.py [flags]`
+2. **As standalone modules** from the repository root: `python3 -m <track>.<script> [flags]` (for example `python3 -m oracle.oracle_06_load_data --workers 4`). The `--bg` flag is only honoured by `sweep.py`. Running the file path directly (`python3 oracle/oracle_06_load_data.py`) is not supported because the steps use package imports; alternatively run `pip install -e .` once.
+
+Every step exits with **status 0 on success and non-zero on failure**, so shell scripts, CI and `run-all` can rely on the exit code.
 
 ---
 
@@ -14,14 +16,14 @@ Scripts can be invoked in two ways:
 
 | Step | Script / Command | Available Flags |
 | :---: | :--- | :--- |
-| **01** | `oracle_01_extract_mtd.py`<br>`python3 sweep.py oracle extract` | `'--file FILE'`, `'--owners OWNERS'`, `'--bg'`, `'-h, --help'` |
-| **02** | `oracle_02_inventory.py`<br>`python3 sweep.py oracle inventory` | `'--s3 S3'`, `'--owners OWNERS'`, `'--tables TABLES'`, `'--bg'`, `'-h, --help'` |
-| **03** | `oracle_03_type_gate.py`<br>`python3 sweep.py oracle gate` | `'--rows ROWS'`, `'--tables TABLES'`, `'--max-tables MAX_TABLES'`, `'--bg'`, `'-h, --help'` |
-| **04** | `oracle_04_generate_ddl.py`<br>`python3 sweep.py oracle gen-ddl` | `'--owners OWNERS'`, `'--tables TABLES'`, `'--bg'`, `'-h, --help'` |
-| **05** | `oracle_05_apply_ddl.py`<br>`python3 sweep.py oracle apply-ddl` | `'--schemas SCHEMAS'`, `'--skip-meta'`, `'--bg'`, `'-h, --help'` |
-| **06** | `oracle_06_load_data.py`<br>`python3 sweep.py oracle load-data` | `'--workers WORKERS'`, `'--tables TABLES'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--file FILE'`, `'--filename FILENAME'`, `'--gate-pass'`, `'--limit-files LIMIT_FILES'`, `'--max-size-mb MAX_SIZE_MB'`, `'--min-size-mb MIN_SIZE_MB'`, `'--dry-run'`, `'--bg'`, `'-h, --help'` |
-| **07** | `oracle_07_load_objects.py`<br>`python3 sweep.py oracle load-obj` | `'--stage {all,pk,index,fk,validate,views,triggers}'`, `'--schemas SCHEMAS'`, `'--bg'`, `'-h, --help'` |
-| **08** | `oracle_08_validate.py`<br>`python3 sweep.py oracle validate` | `'--exact-counts'`, `'--tables TABLES'`, `'--schemas SCHEMAS'`, `'--file FILE'`, `'--bg'`, `'-h, --help'` |
+| **01** | `oracle.oracle_01_extract_mtd`<br>`python3 sweep.py oracle extract` | `'--file FILE'`, `'--owners OWNERS'`, `'--bg'`, `'-h, --help'` |
+| **02** | `oracle.oracle_02_inventory`<br>`python3 sweep.py oracle inventory` | `'--s3 S3'`, `'--owners OWNERS'`, `'--tables TABLES'`, `'--bg'`, `'-h, --help'` |
+| **03** | `oracle.oracle_03_type_gate`<br>`python3 sweep.py oracle gate` | `'--rows ROWS'`, `'--tables TABLES'`, `'--max-tables MAX_TABLES'`, `'--bg'`, `'-h, --help'` |
+| **04** | `oracle.oracle_04_generate_ddl`<br>`python3 sweep.py oracle gen-ddl` | `'--owners OWNERS'`, `'--tables TABLES'`, `'--bg'`, `'-h, --help'` |
+| **05** | `oracle.oracle_05_apply_ddl`<br>`python3 sweep.py oracle apply-ddl` | `'--schemas SCHEMAS'`, `'--skip-meta'`, `'--bg'`, `'-h, --help'` |
+| **06** | `oracle.oracle_06_load_data`<br>`python3 sweep.py oracle load-data` | `'--workers WORKERS'`, `'--tables TABLES'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--file FILE'`, `'--filename FILENAME'`, `'--gate-pass'`, `'--limit-files LIMIT_FILES'`, `'--max-size-mb MAX_SIZE_MB'`, `'--min-size-mb MIN_SIZE_MB'`, `'--dry-run'`, `'--reload'`, `'--bg'`, `'-h, --help'` |
+| **07** | `oracle.oracle_07_load_objects`<br>`python3 sweep.py oracle load-obj` | `'--stage {all,pk,alter,index,fk,validate,views,triggers}'`, `'--schemas SCHEMAS'`, `'--only-loaded'`, `'--bg'`, `'-h, --help'` |
+| **08** | `oracle.oracle_08_validate`<br>`python3 sweep.py oracle validate` | `'--exact-counts'`, `'--tables TABLES'`, `'--schemas SCHEMAS'`, `'--file FILE'`, `'--bg'`, `'-h, --help'` |
 | **All** | `python3 sweep.py oracle run-all` | `'--workers WORKERS'`, `'--bg'`, `'-h, --help'` |
 
 ---
@@ -30,14 +32,14 @@ Scripts can be invoked in two ways:
 
 | Step | Script / Command | Available Flags |
 | :---: | :--- | :--- |
-| **01** | `vsam_01_extract_copybooks.py`<br>`python3 sweep.py vsam extract` | `'--bg'`, `'-h, --help'` |
-| **02** | `vsam_02_inventory.py`<br>`python3 sweep.py vsam inventory` | `'--s3 S3'`, `'--company COMPANY'`, `'--latest-only'`, `'--bg'`, `'-h, --help'` |
-| **03** | `vsam_03_type_gate.py`<br>`python3 sweep.py vsam type-gate` | `'--workers WORKERS'`, `'--company COMPANY'`, `'--latest-only'`, `'--bg'`, `'-h, --help'` |
-| **04** | `vsam_04_generate_ddl.py`<br>`python3 sweep.py vsam gen-ddl` | `'--company COMPANY'`, `'--execute'`, `'--bg'`, `'-h, --help'` |
-| **05** | `vsam_05_apply_ddl.py`<br>`python3 sweep.py vsam apply-ddl` | `'--skip-meta'`, `'--bg'`, `'-h, --help'` |
-| **06** | `vsam_06_load_data.py`<br>`python3 sweep.py vsam load-data` | `'--mode {default,data}'`, `'--workers WORKERS'`, `'--company COMPANY'`, `'--tables TABLES'`, `'--limit-files LIMIT_FILES'`, `'--latest-only'`, `'--bg'`, `'-h, --help'` |
-| **07** | `vsam_07_validate.py`<br>`python3 sweep.py vsam validate` | `'--exact-counts'`, `'--tables TABLES'`, `'--schema SCHEMA'`, `'--bg'`, `'-h, --help'` |
-| **All** | `python3 sweep.py vsam run-all` | `'--workers WORKERS'`, `'--bg'`, `'-h, --help'` |
+| **01** | `vsam.vsam_01_extract_copybooks`<br>`python3 sweep.py vsam extract` | `'--bg'`, `'-h, --help'` |
+| **02** | `vsam.vsam_02_inventory`<br>`python3 sweep.py vsam inventory` | `'--s3 S3'`, `'--company COMPANY'`, `'--latest-only'` *(standalone module only)*, `'--bg'`, `'-h, --help'` |
+| **03** | `vsam.vsam_03_type_gate`<br>`python3 sweep.py vsam type-gate` | `'--workers WORKERS'`, `'--company COMPANY'`, `'--latest-only'` *(standalone module only)*, `'--bg'`, `'-h, --help'` |
+| **04** | `vsam.vsam_04_generate_ddl`<br>`python3 sweep.py vsam gen-ddl` | `'--company COMPANY'`, `'--execute'`, `'--bg'`, `'-h, --help'` |
+| **05** | `vsam.vsam_05_apply_ddl`<br>`python3 sweep.py vsam apply-ddl` | `'--skip-meta'`, `'--bg'`, `'-h, --help'` |
+| **06** | `vsam.vsam_06_load_data`<br>`python3 sweep.py vsam load-data` | `'--mode {default,data}'`, `'--workers WORKERS'`, `'--company COMPANY'`, `'--tables TABLES'`, `'--limit-files LIMIT_FILES'`, `'--latest-only'`, `'--force-truncate'`, `'--dry-run'`, `'--bg'`, `'-h, --help'` |
+| **07** | `vsam.vsam_07_validate`<br>`python3 sweep.py vsam validate` | `'--exact-counts'`, `'--tables TABLES'`, `'--schema SCHEMA'`, `'--bg'`, `'-h, --help'` |
+| **All** | `python3 sweep.py vsam run-all` | `'--workers WORKERS'`, `'--force-truncate'`, `'--bg'`, `'-h, --help'` |
 
 ---
 
@@ -50,8 +52,8 @@ Scripts can be invoked in two ways:
 | `python3 sweep.py status` | `'-h, --help'` |
 | `python3 sweep.py monitor` | `'-w, --watch'`, `'--interval INTERVAL'`, `'--track {all,oracle,vsam}'`, `'--no-color'`, `'-h, --help'` |
 | `python3 sweep.py logs` | `'-f, --follow'`, `'-n, --lines LINES'`, `'--track {oracle,vsam}'`, `'--file FILE'`, `'-h, --help'` |
-| `python3 sweep.py cancel` *(alias: `stop`)* | `'--job NAME'`, `'--kill-db'`, `'-h, --help'` |
-| `python3 sweep.py run-all` | `'--track {oracle,vsam,all}'`, `'--workers WORKERS'`, `'--bg'`, `'-h, --help'` |
+| `python3 sweep.py stop` | `'--name NAME'`, `'--kill-db'`, `'-h, --help'` |
+| `python3 sweep.py run-all` | `'--track {oracle,vsam,all}'`, `'--workers WORKERS'`, `'--force-truncate'`, `'--bg'`, `'-h, --help'` |
 
 ---
 
@@ -140,7 +142,8 @@ Scripts can be invoked in two ways:
 | `--limit-files N`| integer | all files | Limit total number of files loaded (testing) | `--limit-files 2` |
 | `--max-size-mb MB`| float | none | Only load files with size <= MB | `--max-size-mb 100` |
 | `--min-size-mb MB`| float | none | Only load files with size >= MB | `--min-size-mb 1000` |
-| `--dry-run` | flag | false | Verify S3 streams without inserting to DB | `--dry-run` |
+| `--dry-run` | flag | false | List the files that would load without inserting to DB | `--dry-run` |
+| `--reload` | flag | false | Re-load files already recorded as `SUCCESS` in `sweep_ctl.load_log` (upsert on PK, append otherwise) | `--reload` |
 | `--bg` | flag | false | Run as detached background daemon *(CLI only)* | `python3 sweep.py oracle load-data --bg` |
 
 ---
@@ -152,8 +155,9 @@ Scripts can be invoked in two ways:
 | Flag | Type | Default | Description | Example |
 | :--- | :--- | :--- | :--- | :--- |
 | `-h, --help` | flag | - | Show help message and exit | `python3 sweep.py oracle load-obj -h` |
-| `--stage STAGE` | choice | `all` | Specific stage: `all`, `pk`, `index`, `fk`, `validate`, `views`, `triggers` | `--stage pk` |
+| `--stage STAGE` | choice | `all` | Specific stage: `all`, `pk`, `alter`, `index`, `fk`, `validate`, `views`, `triggers` | `--stage pk` |
 | `--schemas SCHEMAS`| string | all schemas | Comma-separated schemas to build objects for | `--schemas bss01001` |
+| `--only-loaded` | flag | false | Only build objects for tables that have loaded data | `--only-loaded` |
 | `--bg` | flag | false | Run as detached background daemon *(CLI only)* | `python3 sweep.py oracle load-obj --bg` |
 
 ---
@@ -195,7 +199,7 @@ Scripts can be invoked in two ways:
 | `-h, --help` | flag | - | Show help message and exit | `python3 sweep.py vsam inventory -h` |
 | `--s3 S3` | string | `VSAM_S3_BUCKET`| S3 prefix to discover flat files | `--s3 s3://my-bucket/vsam/` |
 | `--company COMPANY`| string | all companies | Comma-separated company tokens to filter | `--company FDIC` |
-| `--latest-only` | flag | false | Keep only latest file version per table (based on timestamp) | `--latest-only` |
+| `--latest-only` | flag | false | Keep only latest file version per table (based on timestamp). *Standalone module only; `sweep.py vsam inventory` does not forward it* | `--latest-only` |
 | `--bg` | flag | false | Run in background daemon *(CLI only)* | `python3 sweep.py vsam inventory --bg` |
 
 ---
@@ -209,7 +213,7 @@ Scripts can be invoked in two ways:
 | `-h, --help` | flag | - | Show help message and exit | `python3 sweep.py vsam type-gate -h` |
 | `--workers WORKERS`| integer | `4` | Parallel profiling worker threads | `--workers 8` |
 | `--company COMPANY`| string | all companies | Comma-separated company tokens to filter | `--company FDIC` |
-| `--latest-only` | flag | false | Process only latest file version per table | `--latest-only` |
+| `--latest-only` | flag | false | Process only latest file version per table. *Standalone module only; `sweep.py vsam type-gate` does not forward it* | `--latest-only` |
 | `--bg` | flag | false | Run in background daemon *(CLI only)* | `python3 sweep.py vsam type-gate --bg` |
 
 ---
@@ -252,6 +256,8 @@ Scripts can be invoked in two ways:
 | `--tables TABLES`| string | all tables | Comma-separated target tables to load | `--tables vsamkorg` |
 | `--limit-files N`| integer | all files | Limit total number of files loaded (testing) | `--limit-files 2` |
 | `--latest-only` | flag | false | Load only the latest file version per table (based on timestamp in filename) | `--latest-only` |
+| `--force-truncate` | flag | false | Allow `TRUNCATE` of tables that already hold rows but have no PK - once per table per run; without it such files fail instead of being wiped | `--force-truncate` |
+| `--dry-run` | flag | false | List the files that would be loaded; no database changes | `--dry-run` |
 | `--bg` | flag | false | Run in background daemon | `python3 sweep.py vsam load-data --bg` |
 
 ---
@@ -273,7 +279,7 @@ Scripts can be invoked in two ways:
 ## 4. Universal Framework Operations: Detailed Flag Specifications
 
 ### `python3 sweep.py check`
-Pre-flight host environment, AWS S3, and RDS Aurora diagnostic check.
+Pre-flight host environment, AWS S3, and RDS Aurora diagnostic check. Exits non-zero when `psql` is missing, credentials are absent, or the database connection fails.
 
 | Flag | Type | Default | Description | Example |
 | :--- | :--- | :--- | :--- | :--- |
@@ -308,14 +314,14 @@ View or stream execution logs.
 
 ---
 
-### `python3 sweep.py cancel` *(alias: `stop`)*
-Terminate running migration jobs cleanly.
+### `python3 sweep.py stop`
+Terminate running background migration jobs cleanly: each registered PID is verified to be a SWEEP supervisor (a stale/re-used PID is never signalled), then the supervisor's whole process group (psql, aws, gzip children included) is terminated.
 
 | Flag | Type | Default | Description | Example |
 | :--- | :--- | :--- | :--- | :--- |
-| `-h, --help` | flag | - | Show help message and exit | `python3 sweep.py cancel -h` |
-| `--job NAME` | string | all jobs | Specific background job name to terminate | `python3 sweep.py cancel --job vsam_06_load_data` |
-| `--kill-db` | flag | false | Also terminate in-flight PostgreSQL COPY sessions | `python3 sweep.py cancel --kill-db` |
+| `-h, --help` | flag | - | Show help message and exit | `python3 sweep.py stop -h` |
+| `--name NAME` | string | all jobs | Specific background job name to terminate | `python3 sweep.py stop --name vsam_06_load_data` |
+| `--kill-db` | flag | false | Also terminate in-flight PostgreSQL sessions opened by SWEEP (`application_name = 'sweep'`); other users' sessions are never touched | `python3 sweep.py stop --kill-db` |
 
 ---
 
@@ -327,13 +333,16 @@ Automated end-to-end execution across tracks.
 | `-h, --help` | flag | - | Show help message and exit | `python3 sweep.py run-all -h` |
 | `--track TRACK` | choice | `all` | Track to execute: `oracle`, `vsam`, or `all` | `python3 sweep.py run-all --track oracle` |
 | `--workers WORKERS`| integer | `4` | Parallel workers for ingestion steps | `python3 sweep.py run-all --workers 8` |
-| `--bg` | flag | false | Run full pipeline as detached background daemon | `python3 sweep.py run-all --track all --bg` |
+| `--force-truncate` | flag | false | Forwarded to the VSAM load step (see Step 06) | `python3 sweep.py run-all --force-truncate` |
+| `--bg` | flag | false | Run full pipeline as one detached background job (stops at the first failing step) | `python3 sweep.py run-all --track all --bg` |
 
 ---
 
 ## 5. Environment Variables (`sweep.env`)
 
-All parameters can be pre-configured via `sweep.env` located in the root repository folder:
+All parameters can be pre-configured via `sweep.env` located in the root repository folder (copy `sweep.env.sample`).
+**Variables already exported in your shell win over `sweep.env`**, so `VAR=value python3 sweep.py ...` always works.
+`sweep.env` is git-ignored; never commit it.
 
 | Variable | Description | Example / Default |
 | :--- | :--- | :--- |
@@ -341,11 +350,25 @@ All parameters can be pre-configured via `sweep.env` located in the root reposit
 | `PGPORT` | Target PostgreSQL port | `5432` |
 | `PGDATABASE` | Target database name | `sweep` |
 | `PGUSER` | Target database master user | `postgres` |
-| `PGPASSWORD` | Target database master password | `secret_password` |
+| `PGPASSWORD` | Target database password. Optional if `~/.pgpass`, `PGPASSFILE` or `PGSERVICE` is configured | `secret_password` |
 | `PGSSLMODE` | PostgreSQL SSL connection mode | `prefer` (or `require`) |
+| `SWEEP_ALLOW_NO_PASSWORD` | Set to `1` for trust / peer authentication (no password, no `.pgpass`) | unset |
+| `SWEEP_PSQL_TIMEOUT` | Timeout in seconds for every `psql` call (queries, DDL files) | `7200` |
+| `SWEEP_LOAD_TIMEOUT` | Timeout in seconds for one file load (`\copy` pipeline); `0` disables. The load and its S3/gzip children are killed on expiry | `21600` |
+| `SWEEP_CONNECT_RETRIES` | Retries (exponential backoff) for connection-establishment failures only; statements that actually ran are never retried | `3` |
 | `AWS_DEFAULT_REGION` | AWS Region for S3 buckets | `us-east-2` |
 | `ORACLE_S3_BUCKET` | S3 URI for Oracle track flat files | `s3://your-migration-bucket/oracle-migration-qa/` |
 | `VSAM_S3_BUCKET` | S3 URI for VSAM track flat files | `s3://your-migration-bucket/vsam-migration-qa/` |
-| `SWEEP_WORKERS` | Default worker threads for Oracle track | `4` |
-| `VSAM_WORKERS` | Default worker threads for VSAM track | `4` |
-| `VSAM_CHUNK_ROWS` | Streaming batch size for VSAM load | `200000` |
+| `ORACLE_WORKERS` / `SWEEP_WORKERS` / `VSAM_WORKERS` | Default worker threads (first one set wins, in that order) | `4` |
+| `VSAM_DELIM` / `VSAM_QUOTE` / `VSAM_ENCODING` | Delimiter / quoting / encoding handling for VSAM files | `auto` |
+| `VSAM_VERSION_MODE` | How multiple file versions are handled | `upsert` |
+| `VSAM_COMMON_SCHEMA_CASE` | Case of the shared fallback schema name | `lower` |
+| `VSAM_FOLDERS` | Comma-separated S3/local folders to scan (overrides discovery) | unset |
+| `VSAM_BASE` | Local directory scanned for VSAM files when not using S3 | repository root |
+| `VSAM_COPYBOOK_DIR` | Directory holding the COBOL copybooks | `vsam/inputs/copybooks` |
+| `VSAM_MASTER_MAPPING` / `VSAM_MASTER_OVERRIDES` | Paths of the mapping / override workbooks | `vsam/inputs/vsam_master_mapping.xlsx` / `vsam_master_overrides.xlsx` |
+| `VSAM_ANALYZE_MAX_ROWS` | Cap on rows read per file when profiling (`0` = all) | `0` |
+| `PSQL` | `psql` executable to use | `psql` |
+| `NO_COLOR` | Disable ANSI colours in the dashboard | unset |
+
+> `sweep.env.sample` also lists `VSAM_CHUNK_ROWS` and `VSAM_ENABLE_FINTEC`; the current code does not read them, so they have no effect.
