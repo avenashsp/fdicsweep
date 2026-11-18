@@ -18,6 +18,7 @@ from sweep_common import (
     query_db_rows,
     VSAM_LOGS_DIR,
     VSAM_OUTPUTS_DIR,
+    DB_ERRORS,
 )
 from sweep_format import format_runtime_display
 from sweep_jobs import list_jobs
@@ -81,7 +82,7 @@ def get_track_metrics(track_name, jobs=None):
                                 "started_at": datetime.now().isoformat()
                             }
                             break
-        except Exception:
+        except (OSError, subprocess.SubprocessError, ValueError):
             pass
 
     daemon_name = active_job.get("name", "None") if active_job else "None"
@@ -134,7 +135,7 @@ def get_track_metrics(track_name, jobs=None):
                             total_bytes_planned += int(float(smb.strip()) * 1024 * 1024)
                         except ValueError:
                             pass
-        except Exception:
+        except (OSError, ValueError, csv.Error):
             pass
 
     total_gb_planned = round(total_bytes_planned / (1024**3), 2)
@@ -170,7 +171,7 @@ def get_track_metrics(track_name, jobs=None):
             files_loaded = int(parts[0].strip() or 0)
             rows_loaded = int(parts[1].strip() or 0)
             gb_loaded = float(parts[2].strip() or 0.0)
-    except Exception:
+    except DB_ERRORS:
         pass
 
     # 4. Instant Speed
@@ -187,7 +188,7 @@ def get_track_metrics(track_name, jobs=None):
         spd_rows = query_db_rows(sql_spd)
         if spd_rows and spd_rows[0].strip():
             speed = int(float(spd_rows[0].strip()))
-    except Exception:
+    except DB_ERRORS:
         pass
 
     pct = round((files_loaded / total_files_planned) * 100, 1) if total_files_planned > 0 else 0.0
@@ -254,7 +255,7 @@ def get_active_workers():
                                 "mb": float(w.get("mb") or 0.0),
                                 "seconds": w_sec
                             })
-            except Exception:
+            except (OSError, ValueError):
                 pass
 
     # Tier 2: Check OS process tree (Linux / Unix native inspection)
@@ -301,7 +302,7 @@ def get_active_workers():
                                     "mb": 0.0,
                                     "seconds": sec_val
                                 })
-        except Exception:
+        except (OSError, subprocess.SubprocessError, ValueError):
             pass
 
     # Tier 3: Query PostgreSQL Database Catalog (pg_stat_activity & pg_stat_progress_copy)
@@ -326,7 +327,7 @@ def get_active_workers():
         worker_rows = []
         try:
             worker_rows = query_db_rows(sql_workers)
-        except Exception:
+        except DB_ERRORS:
             sql_fallback = (
                 "SELECT "
                 "    a.pid, "
@@ -344,7 +345,7 @@ def get_active_workers():
             )
             try:
                 worker_rows = query_db_rows(sql_fallback)
-            except Exception:
+            except DB_ERRORS:
                 worker_rows = []
 
         for wr in worker_rows:
@@ -387,7 +388,7 @@ def get_active_workers():
                         "mb": w_mb,
                         "seconds": w_sec
                     })
-    except Exception:
+    except DB_ERRORS:
         pass
 
     return active_workers
@@ -444,6 +445,6 @@ def get_top_completed(limit=5, track_filter=None):
                     "time": sec_val,
                     "speed": spd_val
                 })
-    except Exception:
+    except DB_ERRORS:
         pass
     return completed

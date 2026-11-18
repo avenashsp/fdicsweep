@@ -13,17 +13,24 @@ Generates:
   - outputs/gate_pass_tables.txt
   - reports/03_typeGateway_report_<timestamp>.xlsx
 """
-import os
 import re
 import sys
 import csv
 import argparse
-import subprocess
 from pathlib import Path
 from collections import defaultdict
+from sweep_streaming import read_stream_head
 from sweep_common import (
-    ORACLE_OUTPUTS_DIR, ORACLE_REPORTS_DIR, AWS_REGION, STREAM_SCRIPT,
-    META_TABLES_CSV, get_logger, get_timestamp, get_db_name, generate_excel_report, norm_col, oracle_to_pg
+    AWS_REGION,
+    generate_excel_report,
+    get_db_name,
+    get_logger,
+    get_timestamp,
+    META_TABLES_CSV,
+    norm_col,
+    ORACLE_OUTPUTS_DIR,
+    ORACLE_REPORTS_DIR,
+    oracle_to_pg,
 )
 
 logger = get_logger("oracle_03_type_gate", "oracle_03_type_gate")
@@ -70,25 +77,16 @@ def sample_s3_file(uri, sample_rows=1000, region=AWS_REGION):
                 records = list(reader)
                 if records:
                     return records, ""
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - boto3/botocore/gzip raise many unrelated types; fall back to the CLI stream
             logger.debug(f"Boto3 streaming sample notice for {clean_uri}: {e}")
 
-        # 2. Fallback to sweep_stream.sh
-        env = os.environ.copy()
-        if "/usr/local/lib/python3.9/site-packages" not in env.get("PYTHONPATH", ""):
-            env["PYTHONPATH"] = f"/usr/local/lib/python3.9/site-packages:{env.get('PYTHONPATH', '')}"
-
-        cmd = f"bash \"{STREAM_SCRIPT}\" \"{clean_uri}\" \"{region}\" | head -n {sample_rows + 1}"
-        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
-        if res.stdout.strip():
-            lines = res.stdout.splitlines()
-            reader = csv.DictReader(lines)
-            records = list(reader)
+        # 2. Fallback to sweep_stream.sh (argument list, no shell; exit status and stderr are honoured)
+        lines, err_out = read_stream_head(clean_uri, region, max_lines=sample_rows + 1)
+        if lines:
+            records = list(csv.DictReader(lines))
             if records:
                 return records, ""
-
-        err_out = res.stderr.strip() if res.stderr else "Empty stream output"
-        return [], err_out
+        return [], err_out or "Empty stream output"
 
     # Local file fallback
     p = Path(clean_uri)
@@ -103,7 +101,7 @@ def sample_s3_file(uri, sample_rows=1000, region=AWS_REGION):
                     lines = [fh.readline() for _ in range(sample_rows + 1)]
             records = list(csv.DictReader([l for l in lines if l]))
             return records, ""
-        except Exception as e:
+        except (OSError, EOFError, UnicodeError, csv.Error) as e:
             return [], str(e)
 
     return [], f"File not found: {clean_uri}"

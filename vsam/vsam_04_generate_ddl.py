@@ -31,13 +31,18 @@ from pathlib import Path
 import pandas as pd
 
 from sweep_common import (
-    VSAM_OUTPUTS_DIR, VSAM_GEN_DDL_DIR, VSAM_REPORTS_DIR,
-    get_logger, get_timestamp, get_db_name, generate_excel_report, run_psql
+    VSAM_OUTPUTS_DIR,
+    VSAM_GEN_DDL_DIR,
+    VSAM_REPORTS_DIR,
+    get_logger,
+    get_timestamp,
+    get_db_name,
+    generate_excel_report,
+    run_psql,
+    q,
+    norm_col,
 )
-from vsam.vsam_common import (
-    OUT, q, norm_col, load_csv_safe, get_korg_override_pkey,
-    get_all_active_schemas
-)
+from vsam.vsam_common import get_all_active_schemas, get_korg_override_pkey, load_csv_safe, OUT
 
 logger = get_logger("vsam_04_generate_ddl", "vsam_04_generate_ddl")
 
@@ -167,8 +172,8 @@ def main():
     for old in VSAM_GEN_DDL_DIR.glob("*.sql"):
         try:
             old.unlink()
-        except Exception:
-            pass
+        except OSError as exc:
+            logger.debug(f"Could not remove old DDL file {old}: {exc}")
 
     # Remove obsolete pre_load and post_load directories if they exist
     for obsolete_dir in [VSAM_OUTPUTS_DIR / "pre_load", VSAM_OUTPUTS_DIR / "post_load"]:
@@ -176,7 +181,7 @@ def main():
             try:
                 shutil.rmtree(obsolete_dir)
                 logger.info(f"Removed legacy directory: {obsolete_dir}")
-            except Exception as e:
+            except OSError as e:
                 logger.debug(f"Could not remove {obsolete_dir}: {e}")
 
     src_col = "source_filename" if "source_filename" in lm.columns else "source_file"

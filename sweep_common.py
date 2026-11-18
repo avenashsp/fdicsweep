@@ -13,6 +13,7 @@ import io
 import logging
 import subprocess
 import time
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -35,6 +36,24 @@ def get_next_version(current_ver: str) -> str:
     else:
         minr += 1
     return f"{maj}.{minr}"
+
+# -----------------------------------------------------------------------------
+# Exception groups used instead of blanket `except Exception`
+# -----------------------------------------------------------------------------
+PARSE_ERRORS = (ValueError, TypeError)                 # int()/float()/datetime parsing of untrusted text
+DB_ERRORS = (RuntimeError, ValueError, KeyError, IndexError)   # run_psql/query_db_* failure + row parsing
+FILE_READ_ERRORS = (OSError, ValueError, KeyError, UnicodeError, zipfile.BadZipFile)  # files, CSV, Excel via pandas
+try:  # openpyxl signals an unreadable workbook with its own exception type
+    from openpyxl.utils.exceptions import InvalidFileException as _InvalidXlsx
+    FILE_READ_ERRORS = FILE_READ_ERRORS + (_InvalidXlsx,)
+except ImportError:
+    pass
+AWS_ERRORS = (ImportError, OSError, ValueError, KeyError, EOFError)  # boto3 / S3 access
+try:
+    from botocore.exceptions import BotoCoreError as _BotoCoreError, ClientError as _ClientError
+    AWS_ERRORS = AWS_ERRORS + (_BotoCoreError, _ClientError)
+except ImportError:
+    pass
 
 # -----------------------------------------------------------------------------
 # Base Directories & Environment Configuration
@@ -286,7 +305,7 @@ def get_logger(name, step_name=None, to_file=None, track=None):
                         determined_track = 'oracle'
                     elif '/vsam/' in caller_file or 'vsam_' in caller_file:
                         determined_track = 'vsam'
-                except Exception:
+                except (ValueError, AttributeError):
                     pass
 
             if not determined_track:
@@ -400,7 +419,7 @@ def generate_excel_report(report_path, sheets_data):
 
         wb.save(report_path)
         return str(report_path)
-    except Exception as e:
+    except (ImportError, OSError, ValueError, TypeError, KeyError) as e:
         print(f"Warning: Failed to create Excel report via openpyxl ({e}). Writing CSV fallback.")
         csv_path = Path(report_path).with_suffix(".csv")
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -701,7 +720,7 @@ def format_size_actual(mb_val):
         return '0MB'
     try:
         mb = float(mb_val)
-    except Exception:
+    except PARSE_ERRORS:
         return str(mb_val)
     if mb < 0:
         return f'-{format_size_actual(-mb)}'

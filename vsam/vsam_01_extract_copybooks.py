@@ -22,13 +22,15 @@ from pathlib import Path
 
 import pandas as pd
 from sweep_common import (
-    VSAM_COPYBOOK_DIR, VSAM_REPORTS_DIR,
-    get_logger, get_timestamp, get_db_name, generate_excel_report
+    VSAM_COPYBOOK_DIR,
+    VSAM_REPORTS_DIR,
+    get_logger,
+    get_timestamp,
+    get_db_name,
+    generate_excel_report,
+    norm_col,
 )
-from vsam.vsam_common import (
-    OUT, norm_col, sql_type, field_lengths, norm_usage,
-    is_key_group_or_field
-)
+from vsam.vsam_common import field_lengths, is_key_group_or_field, norm_usage, OUT, sql_type
 
 logger = get_logger("vsam_01_extract_copybooks", "vsam_01_extract_copybooks")
 

@@ -64,13 +64,29 @@ from pathlib import Path
 from collections import defaultdict
 
 from sweep_common import (
-    ORACLE_INPUTS_DIR, ORACLE_DUMP_DIR, ORACLE_OUTPUTS_DIR,
-    ORACLE_REPORTS_DIR, LOAD_LOG_TABLE,
-    META_TABLES_CSV, META_CONSTRAINTS_CSV, META_INDEXES_CSV,
-    META_PARTITIONS_CSV, META_TABLE_STATS_CSV, META_SEQUENCES_CSV, META_OBJECTS_CSV,
-    PGHOST, PGPORT, PGDATABASE, PGUSER,
-    get_logger, get_timestamp, get_db_name, generate_excel_report,
-    norm_col, oracle_to_pg
+    ORACLE_INPUTS_DIR,
+    ORACLE_DUMP_DIR,
+    ORACLE_OUTPUTS_DIR,
+    ORACLE_REPORTS_DIR,
+    LOAD_LOG_TABLE,
+    META_TABLES_CSV,
+    META_CONSTRAINTS_CSV,
+    META_INDEXES_CSV,
+    META_PARTITIONS_CSV,
+    META_TABLE_STATS_CSV,
+    META_SEQUENCES_CSV,
+    META_OBJECTS_CSV,
+    PGHOST,
+    PGPORT,
+    PGDATABASE,
+    PGUSER,
+    get_logger,
+    get_timestamp,
+    get_db_name,
+    generate_excel_report,
+    norm_col,
+    oracle_to_pg,
+    DB_ERRORS,
 )
 
 logger = get_logger("oracle_08_validate", "oracle_08_validate")
@@ -188,7 +204,7 @@ def test_db_connection():
         from sweep_common import run_psql
         out = run_psql("SELECT 1 AS ok;", tuples_only=True, unaligned=True)
         return bool(out and "1" in out)
-    except Exception as e:
+    except RuntimeError as e:
         logger.warning(f"PostgreSQL connection failed ({PGUSER}@{PGHOST}:{PGPORT}/{PGDATABASE}): {e}")
         return False
 
@@ -227,7 +243,7 @@ def load_or_extract_metadata(dump_file=None, owners_filter=None):
                 except ImportError:
                     mod = importlib.import_module("oracle_01_extract_mtd")
                 mod.extract_metadata_from_master(sql_file_path=str(target_dump), owners_filter=owners_filter)
-            except Exception as e:
+            except (RuntimeError, OSError, ValueError, ImportError, AttributeError, KeyError) as e:
                 logger.error(f"Failed to auto-extract metadata: {e}")
         else:
             logger.warning("No Oracle SQL dump file found in inputs/oracle/oracle_dump/. Proceeding with available files.")
@@ -281,7 +297,7 @@ def fetch_target_postgres_catalogs(exact_counts=False, tables_filter=None, schem
     """
     try:
         catalog["schemas"] = execute_db_query(sql_schemas)
-    except Exception as e:
+    except DB_ERRORS as e:
         logger.warning(f"Could not query pg_namespace: {e}")
 
     # 2. Tables and Partition Hierarchy
@@ -324,7 +340,7 @@ def fetch_target_postgres_catalogs(exact_counts=False, tables_filter=None, schem
                 r["stat_live_rows"] = int(float(r.get("stat_live_rows") or 0))
             except (ValueError, TypeError):
                 r["stat_live_rows"] = 0
-    except Exception as e:
+    except DB_ERRORS as e:
         logger.warning(f"Could not query PostgreSQL tables: {e}")
 
     # 3. Columns & Formatted Data Types
@@ -354,7 +370,7 @@ def fetch_target_postgres_catalogs(exact_counts=False, tables_filter=None, schem
         catalog["columns"] = execute_db_query(sql_cols)
         for r in catalog["columns"]:
             r["is_nullable"] = str(r.get("is_nullable") or "").lower() in ("t", "true", "1", "yes")
-    except Exception as e:
+    except DB_ERRORS as e:
         logger.warning(f"Could not query PostgreSQL columns: {e}")
 
     # 4. Constraints
@@ -390,7 +406,7 @@ def fetch_target_postgres_catalogs(exact_counts=False, tables_filter=None, schem
         catalog["constraints"] = execute_db_query(sql_cons)
         for r in catalog["constraints"]:
             r["is_validated"] = str(r.get("is_validated") or "").lower() in ("t", "true", "1", "yes")
-    except Exception as e:
+    except DB_ERRORS as e:
         logger.warning(f"Could not query PostgreSQL constraints: {e}")
 
     # 5. Indexes
@@ -422,7 +438,7 @@ def fetch_target_postgres_catalogs(exact_counts=False, tables_filter=None, schem
             r["is_unique"] = str(r.get("is_unique") or "").lower() in ("t", "true", "1", "yes")
             r["is_primary"] = str(r.get("is_primary") or "").lower() in ("t", "true", "1", "yes")
             r["is_valid"] = str(r.get("is_valid") or "").lower() in ("t", "true", "1", "yes")
-    except Exception as e:
+    except DB_ERRORS as e:
         logger.warning(f"Could not query PostgreSQL indexes: {e}")
 
     # 6. Sequences
@@ -439,7 +455,7 @@ def fetch_target_postgres_catalogs(exact_counts=False, tables_filter=None, schem
     """
     try:
         catalog["sequences"] = execute_db_query(sql_seqs)
-    except Exception as e:
+    except DB_ERRORS as e:
         logger.warning(f"Could not query PostgreSQL sequences: {e}")
 
     # 7. Views & Materialized Views
@@ -457,7 +473,7 @@ def fetch_target_postgres_catalogs(exact_counts=False, tables_filter=None, schem
     """
     try:
         catalog["views"] = execute_db_query(sql_views)
-    except Exception as e:
+    except DB_ERRORS as e:
         logger.warning(f"Could not query PostgreSQL views: {e}")
 
     # 8. Triggers
@@ -479,7 +495,7 @@ def fetch_target_postgres_catalogs(exact_counts=False, tables_filter=None, schem
         catalog["triggers"] = execute_db_query(sql_trgs)
         for r in catalog["triggers"]:
             r["is_enabled"] = str(r.get("is_enabled") or "").lower() in ("t", "true", "1", "yes")
-    except Exception as e:
+    except DB_ERRORS as e:
         logger.warning(f"Could not query PostgreSQL triggers: {e}")
 
     # 9. Loaded S3 File Records from sweep_ctl.load_log
@@ -497,7 +513,7 @@ def fetch_target_postgres_catalogs(exact_counts=False, tables_filter=None, schem
     """
     try:
         catalog["load_log"] = execute_db_query(sql_load_log)
-    except Exception as e:
+    except DB_ERRORS as e:
         logger.warning(f"Could not query {LOAD_LOG_TABLE}: {e}")
 
     # 10. Exact Table Counts (if requested)
@@ -514,7 +530,7 @@ def fetch_target_postgres_catalogs(exact_counts=False, tables_filter=None, schem
             try:
                 res = execute_db_query(f'SELECT COUNT(*) AS cnt FROM "{s}"."{t}";')
                 catalog["exact_row_counts"][(s, t)] = int(res[0]["cnt"]) if res else 0
-            except Exception as e:
+            except DB_ERRORS as e:
                 logger.warning(f"Exact count failed for {s}.{t}: {e}")
                 catalog["exact_row_counts"][(s, t)] = -1
 

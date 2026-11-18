@@ -42,3 +42,7 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Log pointers / logs
+sweep_latest.log
+*.log

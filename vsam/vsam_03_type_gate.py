@@ -31,17 +31,31 @@ from pathlib import Path
 import pandas as pd
 
 from sweep_common import (
-    VSAM_REPORTS_DIR, AWS_REGION,
-    get_logger, get_timestamp, get_db_name, generate_excel_report
+    VSAM_REPORTS_DIR,
+    AWS_REGION,
+    get_logger,
+    get_timestamp,
+    get_db_name,
+    generate_excel_report,
+    AWS_ERRORS,
+    FILE_READ_ERRORS,
+    norm_col,
 )
 from vsam.vsam_common import (
-    OUT, norm_col, write_json, delim_for,
-    _opener, load_csv_safe, filter_latest_versions,
-    get_korg_override_pkey, extract_version_key,
+    _opener,
+    check_schema_col_is_pk,
+    delim_for,
+    extract_version_key,
     filter_invalid_rows,
+    filter_latest_versions,
     find_unique_key_columns_sequential,
-    check_schema_col_is_pk, load_copybook_korg_mapping, infer_columns_from_df,
-    get_last_3_digits
+    get_korg_override_pkey,
+    get_last_3_digits,
+    infer_columns_from_df,
+    load_copybook_korg_mapping,
+    load_csv_safe,
+    OUT,
+    write_json,
 )
 
 logger = get_logger("vsam_03_type_gate", "vsam_03_type_gate")
@@ -102,7 +116,7 @@ def read_file_data(path, has_hdr=True, columns_meta=None, nrows=MAX_ROWS, mode="
                     header=0, keep_default_na=False,
                     on_bad_lines="skip"
                 )
-        except Exception as e:
+        except AWS_ERRORS as e:
             logger.warning(f"Boto3 read failed for {p_str} ({e}); falling back to standard opener...")
             try:
                 with _opener(p_str) as f:
@@ -111,7 +125,7 @@ def read_file_data(path, has_hdr=True, columns_meta=None, nrows=MAX_ROWS, mode="
                         header=0, keep_default_na=False,
                         on_bad_lines="skip"
                     )
-            except Exception as e2:
+            except FILE_READ_ERRORS as e2:
                 logger.error(f"Failed to read S3 file {p_str}: {e2}")
                 raise
     else:
@@ -134,7 +148,7 @@ def read_file_data(path, has_hdr=True, columns_meta=None, nrows=MAX_ROWS, mode="
                         header=0, keep_default_na=False,
                         on_bad_lines="skip"
                     )
-        except Exception as e:
+        except FILE_READ_ERRORS as e:
             logger.error(f"Failed to read local file {lp}: {e}")
             raise
 
@@ -457,7 +471,7 @@ def profile_source(source_key, rows, key_cols, target_schemas, columns_meta, mod
                 first_fn = cand_row.get("s3_filename", "") or Path(cand_row["full_path"]).name
                 result["latest_filename"] = first_fn
                 break
-        except Exception as e:
+        except FILE_READ_ERRORS as e:
             logger.warning(f"Could not read {cand_path} ({e}); trying next version if available...")
 
     total_rows = len(df)
@@ -753,7 +767,7 @@ def main():
                 source_key_std, rows_meta, key_cols, target_schemas, columns_meta,
                 korg_map=korg_map, target_table=target_table, cb_key=cb_key
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - worker boundary: record the failure for this item and continue
             logger.exception(f"Error profiling {source_key_std}: {e}")
             result = {
                 "source_key": source_key_std, "status": "BLOCKED", "issues": [str(e)[:200]],

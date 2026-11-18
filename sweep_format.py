@@ -3,6 +3,7 @@
 sweep_format.py - Duration, number and size formatting helpers shared by status/monitor output.
 """
 import re
+from sweep_common import PARSE_ERRORS
 
 
 def parse_duration_to_seconds(val):
@@ -85,7 +86,7 @@ def format_time_duration(seconds):
         return "0s"
     try:
         total_sec = int(round(float(seconds)))
-    except Exception:
+    except PARSE_ERRORS:
         return str(seconds)
     if total_sec < 0:
         return "0s"
@@ -111,7 +112,7 @@ def format_approx_number(num, decimals=2):
         return "0"
     try:
         n = float(num)
-    except Exception:
+    except PARSE_ERRORS:
         return str(num)
     if n < 0:
         return f"-{format_approx_number(-n, decimals)}"
@@ -144,7 +145,7 @@ def format_word_number(num):
         return "0"
     try:
         n = float(num)
-    except Exception:
+    except PARSE_ERRORS:
         return str(num)
     if n < 0:
         return f"-{format_word_number(-n)}"
@@ -178,7 +179,7 @@ def format_size_actual(mb_val):
         return "0MB"
     try:
         mb = float(mb_val)
-    except Exception:
+    except PARSE_ERRORS:
         return str(mb_val)
     if mb < 0:
         return f"-{format_size_actual(-mb)}"

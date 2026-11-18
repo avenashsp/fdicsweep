@@ -10,9 +10,23 @@ import sys
 import argparse
 from pathlib import Path
 from sweep_common import (
-    BASE_DIR, SWEEP_META_SQL, ORACLE_PRE_LOAD_DIR, ORACLE_REPORTS_DIR, get_logger, get_timestamp, get_db_name,
-    generate_excel_report, run_psql, query_db_dicts,
-    PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD
+    BASE_DIR,
+    SWEEP_META_SQL,
+    ORACLE_PRE_LOAD_DIR,
+    ORACLE_REPORTS_DIR,
+    get_logger,
+    get_timestamp,
+    get_db_name,
+    generate_excel_report,
+    run_psql,
+    query_db_dicts,
+    PGHOST,
+    PGPORT,
+    PGDATABASE,
+    PGUSER,
+    has_db_auth,
+    AUTH_HELP,
+    DB_ERRORS,
 )
 
 logger = get_logger("oracle_05_apply_ddl", "oracle_05_apply_ddl")
@@ -20,8 +34,8 @@ logger = get_logger("oracle_05_apply_ddl", "oracle_05_apply_ddl")
 
 def deploy_ddl(schemas_filter=None, skip_meta=False):
     ts = get_timestamp()
-    if not PGPASSWORD:
-        logger.error("PGPASSWORD is not set in sweep.env. Please configure export PGPASSWORD=... in sweep.env")
+    if not has_db_auth():
+        logger.error(AUTH_HELP)
         return False
     meta_sql_file = SWEEP_META_SQL if SWEEP_META_SQL.exists() else (BASE_DIR / "sweep_meta.sql")
 
@@ -33,7 +47,7 @@ def deploy_ddl(schemas_filter=None, skip_meta=False):
         try:
             run_psql(meta_sql_file, is_file=True)
             logger.info("Control schemas applied successfully.")
-        except Exception as e:
+        except RuntimeError as e:
             logger.error(f"Failed to apply sweep_meta.sql: {e}")
             return False
 
@@ -53,7 +67,7 @@ def deploy_ddl(schemas_filter=None, skip_meta=False):
         try:
             run_psql(ddl_f, is_file=True)
             deployed_files.append({"schema": schema_name, "file": ddl_f.name, "status": "SUCCESS"})
-        except Exception as e:
+        except RuntimeError as e:
             logger.error(f"Failed to execute {ddl_f.name}: {e}")
             deployed_files.append({"schema": schema_name, "file": ddl_f.name, "status": f"FAILED: {e}"})
 
@@ -88,7 +102,7 @@ def deploy_ddl(schemas_filter=None, skip_meta=False):
                 "is_partitioned": p_cnt > 0,
                 "child_partitions": p_cnt
             })
-    except Exception as e:
+    except DB_ERRORS as e:
         logger.warning(f"Could not verify catalog tables: {e}")
 
     # Generate Excel Report
@@ -126,7 +140,10 @@ def deploy_ddl(schemas_filter=None, skip_meta=False):
     for line in summary_lines:
         logger.info(line)
         
-    return True
+    failed = [d for d in deployed_files if d["status"] != "SUCCESS"]
+    if failed:
+        logger.error(f"{len(failed)} DDL script(s) failed: {', '.join(d['file'] for d in failed)}")
+    return not failed
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from sweep_common import (
     ORACLE_LOGS_DIR,
     run_psql,
     VSAM_LOGS_DIR,
+    PARSE_ERRORS,
 )
 from sweep_format import format_runtime_display
 from sweep_platform import (
@@ -76,13 +77,13 @@ def _detect_job_outcome(log_path, started_iso):
                     status = "FINISHED"
                 else:
                     status = "FINISHED"
-        except Exception:
+        except OSError:
             pass
 
     if not ended_time:
         try:
             ended_time = datetime.fromisoformat(started_iso)
-        except Exception:
+        except PARSE_ERRORS:
             ended_time = datetime.now()
 
     return status, ended_time
@@ -254,7 +255,7 @@ def list_jobs():
 
         try:
             st = datetime.fromisoformat(started)
-        except Exception:
+        except PARSE_ERRORS:
             st = datetime.now()
 
         if alive:
@@ -280,7 +281,7 @@ def list_jobs():
                     try:
                         et = datetime.fromisoformat(ended_iso)
                         runtime = str(et - st).split(".")[0]
-                    except Exception:
+                    except PARSE_ERRORS:
                         runtime = "N/A"
                 else:
                     runtime = "N/A"
@@ -326,12 +327,12 @@ def print_status():
             try:
                 st_dt = datetime.fromisoformat(started)
                 date_str = st_dt.strftime("%b-%d")
-            except Exception:
+            except PARSE_ERRORS:
                 try:
                     from dateutil import parser as dt_parser
                     st_dt = dt_parser.parse(str(started))
                     date_str = st_dt.strftime("%b-%d")
-                except Exception:
+                except (ImportError, ValueError, OverflowError, TypeError):
                     date_str = str(started)[:6]
 
         pid_str = str(j.get("pid", ""))

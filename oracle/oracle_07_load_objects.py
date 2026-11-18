@@ -20,9 +20,24 @@ import time
 import argparse
 from pathlib import Path
 from sweep_common import (
-    ORACLE_POST_LOAD_DIR, ORACLE_REPORTS_DIR, get_logger, get_timestamp, get_db_name,
-    generate_excel_report, run_psql, query_db_rows, query_db_dicts,
-    PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD, CTL_SCHEMA, LOAD_LOG_TABLE
+    ORACLE_POST_LOAD_DIR,
+    ORACLE_REPORTS_DIR,
+    get_logger,
+    get_timestamp,
+    get_db_name,
+    generate_excel_report,
+    run_psql,
+    query_db_rows,
+    query_db_dicts,
+    PGHOST,
+    PGPORT,
+    PGDATABASE,
+    PGUSER,
+    has_db_auth,
+    AUTH_HELP,
+    CTL_SCHEMA,
+    LOAD_LOG_TABLE,
+    DB_ERRORS,
 )
 
 logger = get_logger("oracle_07_load_objects", "oracle_07_load_objects")
@@ -120,8 +135,8 @@ def get_loaded_tables():
     )
     try:
         run_psql(sql_check)
-    except Exception:
-        pass
+    except RuntimeError as exc:
+        logger.debug(f"Existence check failed (continuing): {exc}")
 
     sql_loaded = (
         "WITH raw_loaded AS ( "
@@ -155,13 +170,13 @@ def get_loaded_tables():
         rows = query_db_rows(sql_loaded)
         for r in rows:
             loaded.add(r.strip().lower())
-    except Exception:
+    except DB_ERRORS:
         # Fallback to pg_stat_user_tables if load_log is not yet present
         try:
             fallback_sql = "SELECT LOWER(schemaname) || '.' || LOWER(relname) FROM pg_stat_user_tables WHERE n_live_tup > 0;"
             for r in query_db_rows(fallback_sql):
                 loaded.add(r.strip().lower())
-        except Exception as e2:
+        except DB_ERRORS as e2:
             logger.warning(f"Could not query loaded tables from PostgreSQL: {e2}")
 
     return loaded
@@ -242,7 +257,7 @@ def get_existing_catalog_objects():
             catalog["triggers"].add((s, t, trg))
             catalog["triggers"].add((s, trg))
 
-    except Exception as e:
+    except DB_ERRORS as e:
         logger.warning(f"Could not query existing PostgreSQL catalog objects: {e}")
 
     return catalog
@@ -573,7 +588,7 @@ def sync_identity_sequences():
     try:
         run_psql(sql_sync)
         logger.info("Identity sequences synchronized successfully.")
-    except Exception as e:
+    except DB_ERRORS as e:
         logger.warning(f"Could not synchronize identity sequences: {e}")
 
 def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False):
@@ -584,8 +599,8 @@ def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False):
       - If only_loaded=True, restricts creation to tables where data has been loaded.
     """
     ts = get_timestamp()
-    if not PGPASSWORD:
-        logger.error("PGPASSWORD is not set in sweep.env. Please configure export PGPASSWORD=... in sweep.env")
+    if not has_db_auth():
+        logger.error(AUTH_HELP)
         return False
     all_script_results = []
     all_object_actions = []
@@ -840,7 +855,7 @@ def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False):
                             "duration_sec": obj_sec
                         })
                         logger.info(f"  [+] APPLIED: {b['raw']} ({obj_sec}s)")
-                    except Exception as e:
+                    except RuntimeError as e:
                         obj_sec = round(time.time() - obj_t0, 2)
                         err_msg = str(e).strip()
                         err_lower = err_msg.lower()
@@ -928,7 +943,7 @@ def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False):
             "GROUP BY n.nspname ORDER BY 1"
         )
         catalog_summary = query_db_dicts(sql_counts)
-    except Exception as e:
+    except DB_ERRORS as e:
         logger.warning(f"Could not query catalog constraint counts: {e}")
 
     # 5. Generate Excel Report

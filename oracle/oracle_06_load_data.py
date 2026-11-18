@@ -24,10 +24,25 @@ import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from sweep_common import (
-    ORACLE_OUTPUTS_DIR, ORACLE_REPORTS_DIR, ORACLE_LOGS_DIR, AWS_REGION, DEFAULT_WORKERS,
-    LOAD_LOG_TABLE, has_db_auth, AUTH_HELP,
-    get_logger, get_timestamp, get_db_name, generate_excel_report, run_psql, run_psql_script,
-    norm_col, q, lit, format_size_actual
+    ORACLE_OUTPUTS_DIR,
+    ORACLE_REPORTS_DIR,
+    ORACLE_LOGS_DIR,
+    AWS_REGION,
+    DEFAULT_WORKERS,
+    LOAD_LOG_TABLE,
+    has_db_auth,
+    AUTH_HELP,
+    get_logger,
+    get_timestamp,
+    get_db_name,
+    generate_excel_report,
+    run_psql,
+    run_psql_script,
+    norm_col,
+    q,
+    lit,
+    format_size_actual,
+    DB_ERRORS,
 )
 from sweep_streaming import read_stream_head, stream_program_literal
 from sweep_platform import atomic_write_json
@@ -115,7 +130,7 @@ def get_loaded_uris():
         sql = f"SELECT uri FROM {LOAD_LOG_TABLE} WHERE status = 'SUCCESS';"
         out = run_psql(sql)
         return {line.strip() for line in out.splitlines() if line.strip()}
-    except Exception as e:
+    except DB_ERRORS as e:
         logger.warning(f"Could not read loaded URIs from {LOAD_LOG_TABLE} (table might be new): {e}")
         return set()
 

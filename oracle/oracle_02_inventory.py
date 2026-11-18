@@ -18,8 +18,19 @@ import subprocess
 from pathlib import Path
 from collections import defaultdict
 from sweep_common import (
-    ORACLE_INPUTS_DIR, ORACLE_OUTPUTS_DIR, ORACLE_REPORTS_DIR, S3_BUCKET, AWS_REGION,
-    META_TABLES_CSV, get_logger, get_timestamp, get_db_name, generate_excel_report, norm_col
+    ORACLE_INPUTS_DIR,
+    ORACLE_OUTPUTS_DIR,
+    ORACLE_REPORTS_DIR,
+    S3_BUCKET,
+    AWS_REGION,
+    META_TABLES_CSV,
+    get_logger,
+    get_timestamp,
+    get_db_name,
+    generate_excel_report,
+    norm_col,
+    DB_ERRORS,
+    AWS_ERRORS,
 )
 
 logger = get_logger("oracle_02_inventory", "oracle_02_inventory")
@@ -49,7 +60,7 @@ def get_known_tables():
             t = (r.get("table_name") or "").upper().strip()
             if s and t:
                 known[s].add(t)
-    except Exception as e:
+    except DB_ERRORS as e:
         logger.debug(f"Could not load tables from database catalog: {e}")
 
     return known
@@ -101,7 +112,7 @@ def list_s3_objects(s3_uri, region=AWS_REGION):
                     })
         logger.info(f"Discovered {len(objects)} candidate S3 file(s) via Boto3 SDK.")
         return objects
-    except Exception as be:
+    except AWS_ERRORS as be:
         logger.warning(f"Boto3 S3 listing notice: {be}. Attempting AWS CLI fallback...")
 
     # Attempt 2: Fallback to AWS CLI s3api

@@ -22,18 +22,39 @@ from collections import defaultdict
 import pandas as pd
 
 from sweep_common import (
-    VSAM_REPORTS_DIR, VSAM_S3_BUCKET, AWS_REGION,
-    get_logger, get_timestamp, get_db_name, generate_excel_report
+    VSAM_REPORTS_DIR,
+    VSAM_S3_BUCKET,
+    AWS_REGION,
+    get_logger,
+    get_timestamp,
+    get_db_name,
+    generate_excel_report,
+    AWS_ERRORS,
+    FILE_READ_ERRORS,
+    norm_col,
 )
 from vsam.vsam_common import (
-    BASE, get_vsam_folders, COPYBOOK_DIR, OUT,
-    ref_tables, copybook_overrides,
-    copybook_ref, find_copybook_files, match_source, parse_filename,
-    common_schema_name, S3File, first_row,
-    filter_latest_versions, get_korg_override_pkey,
-    make_columns_unique, delim_for, norm_col, extract_version_key,
-    filter_invalid_rows, find_unique_key_columns_sequential,
-    load_master_copybook_info
+    BASE,
+    common_schema_name,
+    COPYBOOK_DIR,
+    copybook_overrides,
+    copybook_ref,
+    delim_for,
+    extract_version_key,
+    filter_invalid_rows,
+    filter_latest_versions,
+    find_copybook_files,
+    find_unique_key_columns_sequential,
+    first_row,
+    get_korg_override_pkey,
+    get_vsam_folders,
+    load_master_copybook_info,
+    make_columns_unique,
+    match_source,
+    OUT,
+    parse_filename,
+    ref_tables,
+    S3File,
 )
 
 logger = get_logger("vsam_02_inventory", "vsam_02_inventory")
@@ -62,7 +83,7 @@ def discover_s3_files(s3_uri, folders):
                         mtime = obj.get("LastModified").timestamp() if obj.get("LastModified") else 0
                         s3_files.append((fld, S3File(uri, size=size, mtime=mtime)))
         logger.info(f"Discovered {len(s3_files)} S3 candidate file(s) across {len(folders)} folder(s).")
-    except Exception as e:
+    except AWS_ERRORS as e:
         logger.warning(f"S3 listing failed ({e}); checking local data directories.")
     return s3_files
 
@@ -102,11 +123,11 @@ def fast_read_first_row(path):
                         line = raw.decode("utf-8-sig", errors="replace").rstrip("\r\n")
                 finally:
                     body.close()
-        except Exception as e:
+        except AWS_ERRORS as e:
             logger.warning(f"Fast S3 read failed for {p_str} ({e}); falling back to standard reader.")
             try:
                 return first_row(p_str)
-            except Exception:
+            except (OSError, ValueError, KeyError, UnicodeError, csv.Error):
                 return []
     # Case 2: Local file
     else:
@@ -120,7 +141,7 @@ def fast_read_first_row(path):
             else:
                 with open(lp, "r", newline="", encoding="utf-8-sig", errors="replace") as f:
                     line = f.readline().rstrip("\r\n")
-        except Exception as e:
+        except FILE_READ_ERRORS as e:
             logger.warning(f"Failed reading local file {lp}: {e}")
             return []
 
@@ -135,7 +156,7 @@ def fast_read_first_row(path):
         if row and row[-1] == "" and line.rstrip().endswith(best_delim):
             row = row[:-1]
         return row
-    except Exception:
+    except (csv.Error, ValueError, IndexError):
         return [c.strip() for c in line.split(best_delim)]
 
 
@@ -204,7 +225,7 @@ def load_copybook_columns_map():
                     cols_map[cb].add(cname)
                 if fname:
                     cols_map[cb].add(fname)
-        except Exception as e:
+        except FILE_READ_ERRORS as e:
             logger.warning(f"Error reading {cb_csv}: {e}")
     return cols_map
 
@@ -322,7 +343,7 @@ def main():
                         if cb_key:
                             cb_cols_map[cb_key] = cb_cols
                         cb_cols_map[g_src] = cb_cols
-                except Exception as e:
+                except FILE_READ_ERRORS as e:
                     logger.debug(f"Could not parse copybook {files_found}: {e}")
                     cb_cols = set()
 
@@ -489,7 +510,7 @@ def main():
                             sample_df.columns = make_columns_unique(sample_df.columns)
                             sample_df = filter_invalid_rows(sample_df)
                             final_keys = find_unique_key_columns_sequential(sample_df, max_cols=8)
-                        except Exception:
+                        except FILE_READ_ERRORS:
                             final_keys = []
                 keys_cache[(tok.upper(), src.upper())] = final_keys
 
@@ -524,7 +545,7 @@ def main():
             try:
                 st = p.stat()
                 size_mb = round(st.st_size / (1024 * 1024), 2)
-            except Exception:
+            except OSError:
                 size_mb = 0
 
             inv.append({

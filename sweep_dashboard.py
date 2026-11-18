@@ -6,6 +6,7 @@ import os
 import sys
 import time
 from datetime import datetime
+from sweep_platform import enable_ansi
 from sweep_format import format_approx_number, format_size_actual, format_time_duration, format_word_number
 from sweep_jobs import list_jobs
 from sweep_metrics import get_active_workers, get_top_completed, get_track_metrics
@@ -38,11 +39,7 @@ def render_dashboard(use_color=True, track="all"):
     along with combined migration totals, active worker streams, and completed tables.
     When track='vsam' or track='oracle', renders the focused single-track dashboard.
     """
-    if os.name == "nt":
-        try:
-            os.system("")
-        except Exception:
-            pass
+    enable_ansi()
 
     if os.environ.get("NO_COLOR"):
         use_color = False

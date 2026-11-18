@@ -27,11 +27,27 @@ from pathlib import Path
 from itertools import groupby
 from collections import defaultdict
 from sweep_common import (
-    ORACLE_INPUTS_DIR, ORACLE_DUMP_DIR, ORACLE_PRE_LOAD_DIR, ORACLE_POST_LOAD_DIR, ORACLE_REPORTS_DIR,
-    META_TABLES_CSV, META_CONSTRAINTS_CSV, META_INDEXES_CSV,
-    META_PARTITIONS_CSV, META_SEQUENCES_CSV,
-    get_logger, get_timestamp, get_db_name, generate_excel_report,
-    norm_col, q, oracle_to_pg, bound_pg, split_bounds, child_name
+    ORACLE_INPUTS_DIR,
+    ORACLE_DUMP_DIR,
+    ORACLE_PRE_LOAD_DIR,
+    ORACLE_POST_LOAD_DIR,
+    ORACLE_REPORTS_DIR,
+    META_TABLES_CSV,
+    META_CONSTRAINTS_CSV,
+    META_INDEXES_CSV,
+    META_PARTITIONS_CSV,
+    META_SEQUENCES_CSV,
+    get_logger,
+    get_timestamp,
+    get_db_name,
+    generate_excel_report,
+    norm_col,
+    q,
+    oracle_to_pg,
+    bound_pg,
+    split_bounds,
+    child_name,
+    FILE_READ_ERRORS,
 )
 
 logger = get_logger("oracle_04_generate_ddl", "oracle_04_generate_ddl")
@@ -284,7 +300,7 @@ def extract_views_and_triggers_from_dump(dump_file=None):
             elif in_view and curr_stmt:
                 raw_ddl = "".join(curr_stmt)
                 views_by_owner[owner].append({"name": name, "ddl": raw_ddl})
-    except Exception as e:
+    except FILE_READ_ERRORS as e:
         logger.warning(f"Could not extract views/triggers from dump: {e}")
 
     logger.info(f"Extracted {sum(len(v) for v in views_by_owner.values())} view(s) and {sum(len(t) for t in triggers_by_owner.values())} trigger(s) from dump.")

@@ -41,20 +41,35 @@ import pandas as pd
 
 from sweep_common import (
     VSAM_GEN_DDL_DIR,
-    VSAM_LOGS_DIR, VSAM_REPORTS_DIR, DEFAULT_WORKERS,
+    VSAM_LOGS_DIR,
+    VSAM_REPORTS_DIR,
+    DEFAULT_WORKERS,
     CTL_SCHEMA,
-    get_logger, get_timestamp, get_db_name, generate_excel_report,
-    run_psql, q, lit
+    get_logger,
+    get_timestamp,
+    get_db_name,
+    generate_excel_report,
+    run_psql,
+    q,
+    lit,
+    norm_col,
 )
 from sweep_platform import atomic_write_json
 from collections import defaultdict
 from vsam.vsam_common import (
-    OUT, read_json, delim_for,
-    norm_col, load_csv_safe, filter_latest_versions,
+    _opener,
+    AUDIT_COL_NAMES,
+    build_table_ddl,
+    check_table_exists,
+    delim_for,
+    filter_latest_versions,
+    get_all_active_schemas,
+    get_pk_validation_failure_reason,
+    load_csv_safe,
     match_schema_by_last3,
-    AUDIT_COL_NAMES, build_table_ddl, check_table_exists,
-    get_all_active_schemas, _opener,
-    record_passes_pk_validation, get_pk_validation_failure_reason
+    OUT,
+    read_json,
+    record_passes_pk_validation,
 )
 
 logger = get_logger("vsam_06_load_data", "vsam_06_load_data")
@@ -738,7 +753,7 @@ def main():
                 rows = res.get("rows_loaded", 0)
                 sec = res.get("seconds", 0)
                 logger.info(f"[{st}] {res.get('schema')}.{res.get('table')} <- {res.get('filename')} ({rows} rows, {sec}s)")
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - worker boundary: record the failure for this item and continue
                 logger.error(f"[ERROR] Task failed for {task.get('s3_filename')}: {e}")
                 results.append({
                     "schema": task.get("target_schema"), "table": task.get("target_table"),
