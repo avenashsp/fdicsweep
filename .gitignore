@@ -47,3 +47,6 @@ Thumbs.db
 sweep_latest.log
 *.log
 .sweep_bg_jobs.json*
+
+# Generated hand-over document (base64 zip of the repo)
+package/
