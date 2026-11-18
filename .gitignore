@@ -1,0 +1,44 @@
+# --- Secrets / environment (keep only sweep.env.sample in git) ---
+sweep.env
+sweep.env.txt
+sweep_env.sh
+qa.env
+.env
+*.pem
+*.key
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# --- SWEEP runtime state (generated at run time) ---
+.sweep_bg_jobs.json
+run_all_tracks.py
+logs/
+reports/
+outputs/
+oracle/logs/
+oracle/reports/
+oracle/outputs/
+vsam/logs/
+vsam/reports/
+vsam/outputs/
+
+# --- Large / customer data inputs (never commit data dumps) ---
+vsam/inputs/copybooks/
+*.csv
+*.csv.gz
+*.gz
+*.dat
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
