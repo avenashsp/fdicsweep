@@ -618,7 +618,9 @@ def lit(val):
     """Escapes and formats SQL string literal."""
     if val is None:
         return "NULL"
-    escaped = str(val).replace("'", "''")
+    # NUL cannot be stored in PostgreSQL text; backslashes are literal because every SWEEP psql
+    # session sets standard_conforming_strings=on (see BASE_PGOPTIONS).
+    escaped = str(val).replace("\x00", "").replace("'", "''")
     return f"'{escaped}'"
 
 

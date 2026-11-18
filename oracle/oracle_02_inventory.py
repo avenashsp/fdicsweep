@@ -133,7 +133,10 @@ def list_s3_objects(s3_uri, region=AWS_REGION):
         if continuation_token:
             cmd.extend(["--continuation-token", continuation_token])
 
-        res = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=300)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("aws s3api list-objects-v2 timed out after 300s")
         if res.returncode != 0:
             raise RuntimeError(f"aws s3api failed: {res.stderr.strip()}")
 

@@ -48,7 +48,7 @@ def get_track_metrics(track_name, jobs=None):
     # Also check unmanaged process tree on Unix if active_job is not alive
     if (not active_job or not active_job.get("alive")) and os.name != "nt":
         try:
-            res = subprocess.run(["ps", "-eo", "pid,ppid,etimes,args"], capture_output=True, text=True)
+            res = subprocess.run(["ps", "-eo", "pid,ppid,etimes,args"], capture_output=True, text=True, timeout=15)
             if res.returncode == 0:
                 for line in res.stdout.splitlines()[1:]:
                     parts = line.strip().split(None, 3)
@@ -262,7 +262,7 @@ def get_active_workers():
     if os.name != "nt":
         try:
             ps_cmd = ["ps", "-eo", "pid,ppid,etimes,args"]
-            res = subprocess.run(ps_cmd, capture_output=True, text=True)
+            res = subprocess.run(ps_cmd, capture_output=True, text=True, timeout=15)
             if res.returncode == 0:
                 for line in res.stdout.splitlines()[1:]:
                     parts = line.strip().split(None, 3)

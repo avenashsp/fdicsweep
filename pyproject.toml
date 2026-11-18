@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sweep-migration"
+version = "5.1.0"
+description = "SWEEP: Oracle dump and VSAM flat-file migration framework for AWS RDS Aurora PostgreSQL"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pandas>=1.5",
+    "numpy>=1.23",
+    "openpyxl>=3.0",
+    "boto3>=1.26",
+    "python-dateutil>=2.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pyflakes>=3"]
+
+[project.scripts]
+sweep = "sweep:main"
+
+[tool.setuptools]
+# SWEEP resolves its inputs/outputs relative to the repository checkout, so install it editable:
+#   pip install -e .
+py-modules = [
+    "sweep", "sweep_bg", "sweep_common", "sweep_dashboard", "sweep_format",
+    "sweep_jobs", "sweep_metrics", "sweep_platform", "sweep_streaming",
+]
+packages = ["oracle", "vsam"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "integration: needs a reachable PostgreSQL (set PGHOST/PGPORT/PGUSER, or SWEEP_TEST_PG=1)",
+]

@@ -44,7 +44,7 @@ def pid_alive(pid):
     if pid <= 0:
         return False
     if IS_WINDOWS:
-        res = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True)
+        res = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True, timeout=15)
         return str(pid) in res.stdout
     try:
         os.kill(pid, 0)
@@ -54,6 +54,14 @@ def pid_alive(pid):
         return True
     except OSError:
         return False
+    # A zombie (exited, not yet reaped by its parent) is not "running".
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            state = fh.read().rsplit(b")", 1)[1].split()[0]
+        if state == b"Z":
+            return False
+    except (OSError, IndexError):
+        pass
     return True
 
 
@@ -107,7 +115,7 @@ def terminate_tree(pid, grace_seconds=3.0):
     """
     pid = int(pid)
     if IS_WINDOWS:
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=30)
         return not pid_alive(pid)
 
     try:

@@ -46,3 +46,4 @@ Thumbs.db
 # Log pointers / logs
 sweep_latest.log
 *.log
+.sweep_bg_jobs.json*

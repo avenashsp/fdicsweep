@@ -122,7 +122,9 @@ def main():
     for r in lm.itertuples():
         fname = getattr(r, fname_col, "")
         done_key = f"{r.full_path}|{r.target_schema}"
-        l_info = loaded_map.get(done_key, {})
+        # Files without a schema column are routed 100% to the fallback 'bcs' schema (Step 06 rule), so a
+        # 'bcs' load-log row also counts as the file having been loaded.
+        l_info = loaded_map.get(done_key) or loaded_map.get(f"{r.full_path}|bcs", {})
         recon.append({
             "schema": r.target_schema, "table": r.target_table,
             "filename": fname, "full_path": r.full_path,
@@ -271,7 +273,7 @@ def main():
                     "schema": schema, "table": table, "column": col,
                     "expected_type": eff_type,
                     "actual_type": "COLUMN_MISSING",
-                    "expected_len": c["len_display"],
+                    "expected_len": c.get("len_display", ""),
                     "actual_len": "",
                     "match": "FAIL"
                 })
@@ -280,7 +282,7 @@ def main():
             db_info = db_col_map[col]
             exp_base = cb_sql_base(eff_type)
             act_base = pg_base_type(db_info["data_type"])
-            exp_len = c["len_display"]
+            exp_len = c.get("len_display", "")
             act_len = db_info["char_max_len"] or db_info["numeric_precision"] or ""
             type_match = "OK" if exp_base == act_base else "MISMATCH"
 

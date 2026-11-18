@@ -652,7 +652,8 @@ def main():
     logger.info("=" * 75)
     logger.info(f"SWEEP VSAM MIGRATION - STEP 06: S3 STREAMING INGESTION (Run: {run_id})")
     logger.info(f"Workers: {args.workers}")
-    logger.info("Strategy: Live Database Inspection (Direct load for fresh tables; Dynamic Upsert if PK exists; Truncate & load if no PK)")
+    logger.info("Strategy: Live Database Inspection (Direct load for fresh tables; Dynamic Upsert if PK exists; "
+                "Truncate & load once per table only with --force-truncate when a table has rows and no PK)")
     if args.latest_only:
         logger.info("Version Filter: LATEST FILE VERSION ONLY (--latest-only active)")
     else:
