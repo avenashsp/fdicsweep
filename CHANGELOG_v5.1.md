@@ -5,7 +5,7 @@ All notable changes to the **SWEEP Unified Data Migration Framework** (Oracle & 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-**Maintenance rule:** every change set gets its own version heading. The **newest release is always at the top**; older releases keep their text unchanged below it. Version numbers only increase (`MAJOR.MINOR.PATCH`).
+**Maintenance rule:** every change set gets its own version heading. The **newest release is always at the top**; older releases keep their text unchanged below it. Version numbers only increase (`MAJOR.MINOR.PATCH`). The **file name carries the current version** (`CHANGELOG_v<MAJOR.MINOR>.md`); when a new release is added, rename the file to the new version (`git mv CHANGELOG_v5.1.md CHANGELOG_v5.2.md`) and update the links in `README.md` and `docs/project_overview.md`.
 
 ---
 
@@ -56,7 +56,7 @@ and no longer build shell commands from file names.
   - `oracle_07_load_objects.py` -> `oracle_07_parser.py` (SQL block parser).
   - VSAM Step 06: duplicated row-routing loops merged, report building moved into `build_load_summary` / `build_schema_breakdown`, dead code (`_load_via_pipe`, `_load_filtered`, `_is_schema_match`) removed.
 - **Formatting:** `oracle_02_inventory.py` and `oracle_06_load_data.py` had a blank line after every line (1,267 -> 636 and 1,083 -> 531 lines, AST unchanged); module docstrings now come first in every script.
-- Version bumped to 5.1; changelog renamed `CHANGELOG_v5.0.md` -> `CHANGELOG.md`.
+- Version bumped to 5.1; changelog file renamed `CHANGELOG_v5.0.md` -> `CHANGELOG_v5.1.md` (the file name carries the current version).
 - **Documentation (`docs/`, README) rewritten against the real code:** correct commands (`stop --name`, `monitor --track/--interval`, `logs --track/--file`), real output file names and report sheets, real `sweep_ctl.load_log` definition, VSAM truncation semantics, new flags and environment variables, module layout, exit codes and the run-as-module convention.
 
 ### Removed

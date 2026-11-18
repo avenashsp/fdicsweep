@@ -148,7 +148,7 @@ fdicsweep/
 │   ├── commands_vsam.md         # Complete CLI command reference for VSAM track
 │   ├── flag_arguments.md        # Comprehensive CLI flags & environment variables reference
 │   └── sweep_outputs.md         # Operational monitoring sample outputs & Excel structures
-└── CHANGELOG.md                 # Release changelog and version history (newest first)
+└── CHANGELOG_v5.1.md                 # Release changelog and version history (newest first)
 ```
 
 > **How steps are launched.** Steps are modules run from the repository root: `python3 -m oracle.oracle_06_load_data ...`

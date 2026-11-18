@@ -94,4 +94,4 @@ python3 -m pytest                     # PG* env vars (or SWEEP_ALLOW_NO_PASSWORD
 - [VSAM commands](docs/commands_vsam.md)
 - [Flag and environment reference](docs/flag_arguments.md)
 - [Sample outputs](docs/sweep_outputs.md)
-- [Changelog](CHANGELOG.md)
+- [Changelog](CHANGELOG_v5.1.md)
