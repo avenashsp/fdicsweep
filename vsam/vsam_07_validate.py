@@ -27,6 +27,7 @@ from sweep_common import (
     VSAM_REPORTS_DIR, CTL_SCHEMA,
     get_logger, get_timestamp, get_db_name, generate_excel_report, run_psql, query_db_rows, q
 )
+from vsam.common_colmap import effective_columns_meta
 from vsam.vsam_common import OUT, load_csv_safe, read_json
 
 logger = get_logger("vsam_07_validate", "vsam_07_validate")
@@ -244,6 +245,7 @@ def main():
         src = src_rows[src_col].iloc[0] if not src_rows.empty and src_col in src_rows.columns else ""
         tg_entry = tg_prof.get(f"{co}|{src}", {})
         type_overrides = tg_entry.get("type_overrides", {})
+        expected_cols = effective_columns_meta(co, src, expected_cols)     # Step 02 column map (table column names)
 
         if not expected_cols:
             expected_cols = tg_entry.get("columns", [])

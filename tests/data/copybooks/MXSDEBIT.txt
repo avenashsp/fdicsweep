@@ -1,0 +1,15 @@
+000100 01  MXS-DEBIT-RECORD.                                            00000100
+000200     05  MXS-KEY                 PIC 9(02).                       00000200
+           05  MXS-COUNTER-ARRAY.                                       00000210
+000300         10 MXS-DEBIT-CNT0       PIC S9(01).                      00000300
+000400         10 MXS-DEBIT-CNT1       PIC S9(01).                      00000400
+000500         10 MXS-DEBIT-CNT2       PIC S9(01).                      00000500
+000600         10 MXS-DEBIT-CNT3       PIC S9(01).                      00000600
+000700         10 MXS-DEBIT-CNT4       PIC S9(01).                      00000700
+000800         10 MXS-DEBIT-CNT5       PIC S9(01).                      00000800
+           05  MXS-COUNTER-ARRAY-R REDEFINES                            00000810
+               MXS-COUNTER-ARRAY OCCURS 6 TIMES                         00000820
+                                       PIC S9(01).                      00000830
+000900     05    FILLER                PIC X(12).                       00000900
+
+=================================================================================

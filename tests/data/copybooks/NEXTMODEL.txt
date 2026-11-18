@@ -1,0 +1,16 @@
+101979*****  NEXT AVAILABLE MODEL RECORD*******                                 
+       01  :NEXT-MODEL:-INFO-WORK-REC.                                          
+           02  :NEXT-MODEL:-BANK-AREA.                                          
+               05  :NEXT-MODEL:-KEY.                                            
+                10  :NEXT-MODEL:-TYPE          PIC 9(3)  VALUE 006.             
+                10  :NEXT-MODEL:-BANK          PIC 9(4)  VALUE ZERO.            
+                10  FILLER                     PIC X(13)                        
+                                                       VALUE LOW-VALUES.        
+               05  :NEXT-MODEL:-READ-KEY.                                       
+                 10  :NEXT-MODEL:-READ-TYPE  PIC 9(3)  VALUE 007.               
+                 10  :NEXT-MODEL:-READ-BANK  PIC 9(4)  VALUE ZERO.              
+                 10  :NEXT-MODEL:-READ-CUSIP PIC X(9)  VALUE SPACE.             
+                 10  :NEXT-MODEL:-READ-FILL  PIC X(4)  VALUE LOW-VALUE.         
+               05  :NEXT-MODEL:-MAX-MODEL      PIC 9(04) VALUE ZERO.            
+               05  :NEXT-MODEL:-REST-OF-RECORD PIC X(2836)                      
+                                                       VALUE SPACE.             

@@ -50,11 +50,13 @@ from sweep_common import (
     get_db_name,
     generate_excel_report,
     run_psql,
+    query_db_rows,
     q,
     lit,
     norm_col,
 )
 from sweep_platform import atomic_write_json
+from vsam.common_colmap import effective_columns_meta, header_to_table_map
 from collections import defaultdict
 from vsam.vsam_common import (
     _opener,
@@ -124,51 +126,61 @@ def record_stream_end(worker_id):
 
 
 # -----------------------------------------------------------------------------
-# Truncate-once-per-run bookkeeping
+# Snapshot replace for tables WITHOUT a primary key
 # -----------------------------------------------------------------------------
-# Several source files (e.g. different companies routed to the shared 'bcs' schema) can map to the
-# SAME target table. A table is therefore "claimed" by the first file that touches it in this run;
-# only that first claim may TRUNCATE (and only with --force-truncate). Later files always append /
-# upsert, so they can never wipe rows loaded earlier in the same run.
+# VSAM files are full snapshots. A table that has no primary key cannot be upserted, so it is REPLACED by the
+# newest snapshot - atomically:
+#   1. every file that feeds the table loads into one staging table (`<table>__sweep_stg`, same schema)
+#   2. when the run is finished and every file of that table succeeded, ONE transaction does
+#      TRUNCATE target; INSERT INTO target SELECT * FROM stage; <load_log rows>; DROP stage
+#   3. if any file of the table failed, the staging table is dropped and the target stays untouched
+# Several source files may feed one table (e.g. different companies into the shared `bcs` schema); because all
+# of them are staged before the swap, none of them is wiped by another. In a PARTIAL run (--company, --tables,
+# --limit-files) files that feed the same table could be missing, so replacing a table that already holds rows
+# needs --force-truncate.
 FORCE_TRUNCATE = False
-_CLAIM_LOCK = threading.Lock()
-_CLAIMED_TABLES = set()
+PARTIAL_RUN = False
+_STAGE_LOCK = threading.Lock()
+_STAGED = {}     # (schema, table) -> {"stage": str, "ok": bool, "files": [uri], "logs": [tuple]}
+
+
+def _stage_name(table):
+    return f"{table[:48]}__sweep_stg"
 
 
 def claim_table(dest_schema, table, strategy):
     """
-    Called once per (file, destination table). Truncates the table at most once per run and only
-    when the operator opted in. Raises RuntimeError when truncation is needed but not permitted,
-    or when the TRUNCATE itself fails (a failed truncate must never be ignored: it would leave old
-    rows in place and silently duplicate data).
-    Returns True when this call truncated the table.
+    Called per (file, destination table). Returns None for tables that have a primary key (they are upserted in
+    place) or the shared staging state for tables without one. Raises RuntimeError when the table already holds
+    rows and the run is partial without --force-truncate.
     """
+    if strategy.get("has_pk"):
+        return None
     key = (dest_schema.lower(), table.lower())
-    with _CLAIM_LOCK:
-        if key in _CLAIMED_TABLES:
-            return False
-        if strategy["action"] == "TRUNCATE_AND_LOAD":
-            if not FORCE_TRUNCATE:
-                raise RuntimeError(
-                    f"{dest_schema}.{table} already contains rows and has no primary key. Refusing to TRUNCATE it "
-                    f"without --force-truncate (re-run with that flag to truncate once and reload)."
-                )
-            run_psql(f"TRUNCATE TABLE {q(dest_schema)}.{q(table)};")
-            _CLAIMED_TABLES.add(key)
-            return True
-        _CLAIMED_TABLES.add(key)
-        return False
+    with _STAGE_LOCK:
+        state = _STAGED.get(key)
+        if state:
+            return state
+        if strategy.get("has_data") and PARTIAL_RUN and not FORCE_TRUNCATE:
+            raise RuntimeError(
+                f"{dest_schema}.{table} already contains rows and has no primary key; this partial run "
+                f"(--company/--tables/--limit-files) cannot replace it safely because other source files of the "
+                f"table may be missing. Run without filters, or pass --force-truncate."
+            )
+        stage = _stage_name(table)
+        tgt = f"{q(dest_schema)}.{q(table)}"
+        run_psql(f"DROP TABLE IF EXISTS {q(dest_schema)}.{q(stage)};\n"
+                 f"CREATE UNLOGGED TABLE {q(dest_schema)}.{q(stage)} (LIKE {tgt} INCLUDING DEFAULTS);")
+        state = {"stage": stage, "ok": True, "files": [], "logs": []}
+        _STAGED[key] = state
+        return state
 
 
-def write_load_log(full_path, dest_schema, table, size_bytes, rows, seconds, worker_id, status="SUCCESS", message=None):
-    """
-    Records a per-destination-schema load in sweep_ctl.load_log (keyed `<uri>#<schema>`, which Step 07
-    strips). Errors propagate: a lost log row would cause the file to be reloaded.
-    """
+def load_log_sql(full_path, dest_schema, table, size_bytes, rows, seconds, worker_id, status="SUCCESS", message=None):
     msg_cols = ", message" if message else ""
     msg_val = f", {lit(message)}" if message else ""
     msg_upd = f", message={lit(message)}" if message else ""
-    run_psql(
+    return (
         f"INSERT INTO {CTL_SCHEMA}.load_log "
         f"(uri, target_schema, target_table, size_bytes, loaded_rows, seconds, worker_id, status{msg_cols}, loaded_at) "
         f"VALUES ({lit(f'{full_path}#{dest_schema}')}, {lit(dest_schema)}, {lit(table)}, {size_bytes}, "
@@ -176,6 +188,67 @@ def write_load_log(full_path, dest_schema, table, size_bytes, rows, seconds, wor
         f"ON CONFLICT (uri) DO UPDATE SET status={lit(status)}, loaded_rows={int(rows)}, "
         f"seconds={seconds}, loaded_at=now(){msg_upd};"
     )
+
+
+def write_load_log(full_path, dest_schema, table, size_bytes, rows, seconds, worker_id, status="SUCCESS", message=None):
+    """
+    Records a per-destination-schema load in sweep_ctl.load_log (keyed `<uri>#<schema>`, which Step 07
+    strips). Errors propagate: a lost log row would cause the file to be reloaded.
+    """
+    run_psql(load_log_sql(full_path, dest_schema, table, size_bytes, rows, seconds, worker_id, status, message))
+
+
+def finalize_replacements(results):
+    """
+    Swaps every staged table into place (one transaction each) or discards it. Downgrades the result rows of
+    files whose data was discarded so reports and the exit code tell the truth.
+    """
+    by_uri = {}
+    for r in results:
+        by_uri.setdefault(r.get("uri") or r.get("full_path"), []).append(r)
+
+    def fail(uris, reason):
+        for u in uris:
+            for r in by_uri.get(u, []):
+                if r.get("status") == "SUCCESS":
+                    r["status"] = "FAILED"
+                    r["error"] = reason
+                    r["rows_loaded"] = r["records_loaded"] = 0
+
+    for (schema, table), st in sorted(_STAGED.items()):
+        tgt, stage = f"{q(schema)}.{q(table)}", f"{q(schema)}.{q(st['stage'])}"
+        if st["ok"]:
+            logs = "\n".join(load_log_sql(*args) for args in st["logs"])
+            try:
+                run_psql(f"BEGIN;\nTRUNCATE TABLE {tgt};\nINSERT INTO {tgt} SELECT * FROM {stage};\n{logs}\n"
+                         f"DROP TABLE {stage};\nCOMMIT;")
+                logger.info(f"[REPLACE] {schema}.{table} replaced by the new snapshot ({len(st['files'])} file(s))")
+                continue
+            except RuntimeError as e:
+                fail(st["files"], f"snapshot swap failed for {schema}.{table}: {str(e)[:200]}")
+                logger.error(f"[REPLACE] swap failed for {schema}.{table}: {e}")
+        else:
+            fail(st["files"], f"staged data discarded: another file for {schema}.{table} failed; table left unchanged")
+            logger.error(f"[REPLACE] {schema}.{table} left unchanged (a source file failed)")
+        try:
+            run_psql(f"DROP TABLE IF EXISTS {stage};")
+        except RuntimeError as e:
+            logger.warning(f"Could not drop staging table {stage}: {e}")
+    _STAGED.clear()
+
+
+def newer_snapshot_loaded(table, source_key, version):
+    """True when load_log already holds a snapshot of this source that is newer than `version`."""
+    if not version:
+        return False
+    try:
+        rows = query_db_rows(
+            f"SELECT message FROM {CTL_SCHEMA}.load_log WHERE target_table = {lit(table)} "
+            f"AND message LIKE {lit(f'source={source_key};snapshot=%')}")
+    except RuntimeError:
+        return False
+    loaded = [r.split("snapshot=", 1)[1].strip() for r in rows if "snapshot=" in r]
+    return any(v > str(version) for v in loaded)
 
 
 def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
@@ -238,6 +311,9 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
         cb_key = cb_name_raw.upper().split(".")[0] if (cb_name_raw and cb_name_raw.upper() != "NO_COPYBOOK") else ""
         cb_display = cb_name_raw if (cb_name_raw and cb_name_raw.upper() != "NO_COPYBOOK") else "NO_COPYBOOK"
         columns_meta = cb_meta.get(cb_key, []) if cb_key else []
+        # Step 02 column map: S3 headers as column names (or copybook names per --tbl-col), copybook datatypes
+        columns_meta = effective_columns_meta(co, src, columns_meta)
+        h2t = header_to_table_map(columns_meta)      # header in the file -> table column
 
         if not columns_meta:
             # When copybook is missing: retrieve columns inferred in Step 03
@@ -262,6 +338,8 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
 
         cols = [c["col_name"] for c in columns_meta if c.get("is_filler") != "YES"]
         schema_col = tg.get("schema_col")
+        if schema_col:
+            schema_col = h2t.get(schema_col, schema_col)
         sc_display = schema_col if (schema_col and schema_col.upper() != "NO_KORG") else "NO_KORG"
         d = delim_for(full_path)
         type_overrides = tg.get("type_overrides", {})
@@ -270,6 +348,7 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
         # Dynamic strategy per destination schema (inspects PostgreSQL live)
         from vsam.vsam_common import check_table_load_strategy
         schema_strategies = {}
+        touched_stages = []
 
         def get_schema_strategy(dest_s):
             if dest_s not in schema_strategies:
@@ -289,10 +368,14 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
                     mode=mode
                 )
                 schema_strategies[dest_s] = strat
-                if claim_table(dest_s, table, strat):
-                    logger.info(f"[Worker {worker_id}] Table {dest_s}.{table} had existing data and NO PK constraints. Truncated once (--force-truncate) before load.")
-                elif strat["action"] == "TRUNCATE_AND_LOAD":
-                    logger.info(f"[Worker {worker_id}] Table {dest_s}.{table} already loaded earlier in this run (no PK). Appending.")
+                state = claim_table(dest_s, table, strat)
+                strat["stage_state"] = state
+                if state:
+                    with _STAGE_LOCK:
+                        state["files"].append(full_path)
+                    touched_stages.append(state)
+                    logger.info(f"[Worker {worker_id}] Table {dest_s}.{table} has no PK: loading snapshot into staging table; "
+                                f"it replaces the table atomically when the run completes.")
                 elif strat["action"] == "UPSERT":
                     logger.info(f"[Worker {worker_id}] Table {dest_s}.{table} has existing data and active PK ({', '.join(strat['pk_cols'])}). Upsert enabled.")
                 elif strat["action"] == "INSERT_FRESH":
@@ -332,8 +415,9 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
             batch = dest_batches[dest_s]
             if not batch:
                 return
-            tgt = f"{q(dest_s)}.{q(table)}"
             strat = get_schema_strategy(dest_s)
+            state = strat.get("stage_state")
+            tgt = f"{q(dest_s)}.{q(state['stage'] if state else table)}"
             active_pks = strat.get("pk_cols", [])
 
             if active_pks:
@@ -402,7 +486,7 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
             else:
                 for row_idx, raw_row in enumerate(csv.DictReader(f, delimiter=d), start=2):
                     total_rows_read += 1
-                    route_row(row_idx, {norm_col(k): v for k, v in raw_row.items()})
+                    route_row(row_idx, {h2t.get(norm_col(k), norm_col(k)): v for k, v in raw_row.items()})
 
         for dest_s in list(dest_batches.keys()):
             flush_batch(dest_s)
@@ -430,8 +514,14 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
             skipped_summary = "None (0 skipped)" if has_pk_flag else "None (table has no PK constraint; 100% rows loaded)"
 
         # Log load for each schema (errors propagate -> the file is reported FAILED, never silently unlogged)
+        snapshot_msg = f"source={source_key};snapshot={task.get('version_date', '')}"
         for dest_s, cnt in dest_loaded.items():
-            write_load_log(full_path, dest_s, table, size_bytes, cnt, dur, worker_id)
+            state = schema_strategies[dest_s].get("stage_state")
+            if state:       # written inside the swap transaction, so a log row exists only if the data does
+                with _STAGE_LOCK:
+                    state["logs"].append((full_path, dest_s, table, size_bytes, cnt, dur, worker_id, "SUCCESS", snapshot_msg))
+            else:
+                write_load_log(full_path, dest_s, table, size_bytes, cnt, dur, worker_id)
 
         bcs_loaded = dest_loaded.get("bcs", 0)
         if mapped_schemas_set == {"bcs"}:
@@ -486,6 +576,9 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
         dur = round(time.time() - t0, 2)
         err = str(e)[:300]
         logger.error(f"[Worker {worker_id}] Load failed for {filename}: {e}")
+        with _STAGE_LOCK:
+            for st_state in locals().get("touched_stages", []):
+                st_state["ok"] = False
         schema_str = ",".join(target_schemas)
         try:
             fail_sql = (
@@ -639,21 +732,23 @@ def main():
     parser.add_argument("--limit-files", type=int, help="Limit number of files loaded")
     parser.add_argument("--latest-only", "--latest-version-only", action="store_true", help="Load only the latest file version per table (based on timestamp in filename)")
     parser.add_argument("--force-truncate", action="store_true",
-                        help="Allow TRUNCATE of existing tables that have rows but no primary key (once per table per run). "
-                             "Without it such tables make the file fail instead of being wiped.")
+                        help="Tables without a primary key are replaced by the new snapshot automatically in a full run. "
+                             "In a PARTIAL run (--company/--tables/--limit-files) replacing a table that already has rows "
+                             "needs this flag, because other source files of the table may be missing.")
     parser.add_argument("--dry-run", action="store_true", help="List the files and tables that would be loaded, then exit without writing")
     parser.add_argument("--bg", action="store_true", help="Run in background daemon mode")
     args = parser.parse_args()
 
-    global FORCE_TRUNCATE
+    global FORCE_TRUNCATE, PARTIAL_RUN
     FORCE_TRUNCATE = args.force_truncate
+    PARTIAL_RUN = bool(args.company or args.tables or args.limit_files)
 
     run_id = get_timestamp()
     logger.info("=" * 75)
     logger.info(f"SWEEP VSAM MIGRATION - STEP 06: S3 STREAMING INGESTION (Run: {run_id})")
     logger.info(f"Workers: {args.workers}")
     logger.info("Strategy: Live Database Inspection (Direct load for fresh tables; Dynamic Upsert if PK exists; "
-                "Truncate & load once per table only with --force-truncate when a table has rows and no PK)")
+                "Tables without a PK are replaced atomically by the newest snapshot)")
     if args.latest_only:
         logger.info("Version Filter: LATEST FILE VERSION ONLY (--latest-only active)")
     else:
@@ -736,7 +831,20 @@ def main():
             except RuntimeError as pe:
                 logger.warning(f"Could not pre-apply PK constraints (tables keep their current constraints): {pe}")
 
-    results = []
+    # A full snapshot must never overwrite a NEWER snapshot of the same source that is already loaded.
+    runnable, stale_results = [], []
+    for t in tasks:
+        sk = f"{t.get('source_company', '')}|{t.get('source_filename', t.get('source_file', ''))}"
+        if newer_snapshot_loaded(t["target_table"], sk, t.get("version_date", "")):
+            logger.warning(f"[SKIPPED] {t.get('s3_filename')}: a newer snapshot of {sk} is already loaded; not loading an older file")
+            stale_results.append({"s3_filename": t.get("s3_filename"), "filename": t.get("s3_filename"), "table": t["target_table"],
+                                  "uri": t["full_path"], "full_path": t["full_path"], "status": "SKIPPED", "seconds": 0,
+                                  "rows_loaded": 0, "records_loaded": 0, "error": "older snapshot than the one already loaded"})
+        else:
+            runnable.append(t)
+    tasks = runnable
+
+    results = list(stale_results)
     max_workers = min(args.workers, max(1, len(tasks)))
     logger.info(f"Starting ingestion with {max_workers} worker threads...")
 
@@ -768,6 +876,7 @@ def main():
                     "error": str(e)[:300], "schema_counts": {}
                 })
 
+    finalize_replacements(results)     # atomic snapshot swap (or discard) for tables without a primary key
     record_stream_end(None)
 
     # Save outputs and report

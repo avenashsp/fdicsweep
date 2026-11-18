@@ -41,6 +41,7 @@ from sweep_common import (
     FILE_READ_ERRORS,
     norm_col,
 )
+from vsam.common_colmap import effective_columns_meta
 from vsam.vsam_common import (
     _opener,
     check_schema_col_is_pk,
@@ -326,12 +327,13 @@ def detect_type_overrides(df, columns_meta):
         return overrides
 
     for c in columns_meta:
-        col_name = c["col_name"]
+        col_name = c["col_name"]                      # table column (override key)
+        df_col = c.get("header") or col_name          # column name in the file
         orig_type = c.get("sql_type", "text")
-        if col_name not in df.columns:
+        if df_col not in df.columns:
             continue
 
-        val = df[col_name]
+        val = df[df_col]
         col_series = val.iloc[:, 0] if isinstance(val, pd.DataFrame) else val
         s_clean = col_series.dropna().astype(str).str.strip()
         s_non_empty = s_clean[s_clean != ""]
@@ -378,9 +380,10 @@ def validate_types(df, columns_meta, type_overrides=None):
     for c in columns_meta:
         name = c["col_name"]
         t = type_overrides.get(name, c["sql_type"])
-        if name not in df.columns:
+        df_col = c.get("header") or name
+        if df_col not in df.columns:
             continue
-        val = df[name]
+        val = df[df_col]
         col_series = val.iloc[:, 0] if isinstance(val, pd.DataFrame) else val
         s = col_series.dropna().astype(str).str.strip()
         s = s[s != ""]
@@ -487,6 +490,9 @@ def profile_source(source_key, rows, key_cols, target_schemas, columns_meta, mod
         result["schema_col_is_pk"] = "NO_SCHEMA_COL"
         return result
 
+    hdr_of = {m["col_name"]: (m.get("header") or m["col_name"]) for m in (columns_meta or [])}
+    key_cols_df = [hdr_of.get(k, k) for k in key_cols]   # key columns as named in the file
+
     if is_agiletic:
         # AGILETIC: Directly create column names and datatype by inferring from S3 CSV file and data
         inferred_cols = infer_columns_from_df(df)
@@ -522,17 +528,15 @@ def profile_source(source_key, rows, key_cols, target_schemas, columns_meta, mod
                 result["issues"].append(f"KEY_COLS_MISSING_IN_DATA:{','.join(missing)}")
         else:
             discovered = find_unique_key_columns_sequential(df, max_cols=8)
-            result["extracted_pk_cols"] = list(discovered) if discovered else []
+            result["extracted_pk_cols"] = []
+            result["candidate_pk_cols"] = list(discovered) if discovered else []
+            result["pk_valid"] = False
+            result["pk_cols"] = []
+            result["pk_type"] = "NO_PK"
             if discovered:
-                result["pk_valid"] = True
-                result["pk_cols"] = list(discovered)
-                result["pk_type"] = "SINGLE" if len(discovered) == 1 else f"COMPOSITE({len(discovered)})"
-                result["issues"].append(f"KEY_AUTO_DISCOVERED({len(discovered)}): {', '.join(discovered)}")
-                logger.info(f"  [AGILETIC-AUTO-PK] Found sequential unique key for {source_key}: {', '.join(discovered)}")
+                result["issues"].append(f"KEY_CANDIDATE_NOT_APPLIED({len(discovered)}): {', '.join(discovered)}")
+                logger.info(f"  [AGILETIC-KEY-CANDIDATE] {source_key}: unique columns {', '.join(discovered)} (not applied)")
             else:
-                result["pk_valid"] = False
-                result["pk_cols"] = []
-                result["pk_type"] = "NO_PK"
                 result["issues"].append("NO_UNIQUE_DATA_UPTO_8_COLS")
     else:
         # Other source companies: follow existing process
@@ -540,9 +544,9 @@ def profile_source(source_key, rows, key_cols, target_schemas, columns_meta, mod
         if has_copybook:
             result["extracted_pk_cols"] = list(key_cols) if key_cols else []
             if key_cols:
-                col_map = resolve_df_key_cols(df.columns, key_cols)
-                actual_key_cols = [col_map[k] for k in key_cols if k in col_map]
-                if len(actual_key_cols) == len(key_cols):
+                col_map = resolve_df_key_cols(df.columns, key_cols_df)
+                actual_key_cols = [col_map[k] for k in key_cols_df if k in col_map]
+                if len(actual_key_cols) == len(key_cols_df):
                     is_unique, null_cnt, dup_cnt, checked_rows, msg, detail = verify_pk_uniqueness(df, actual_key_cols)
                     if is_unique and null_cnt == 0:
                         result["pk_valid"] = True
@@ -557,7 +561,7 @@ def profile_source(source_key, rows, key_cols, target_schemas, columns_meta, mod
                         result["issues"].append(comp_msg)
                         logger.warning(f"  [PK COMPROMISED] Copybook PK {key_cols} failed on {source_key}: {comp_msg}. Table will load WITHOUT PK.")
                 else:
-                    missing = [k for k in key_cols if k not in col_map]
+                    missing = [k for k in key_cols_df if k not in col_map]
                     result["pk_valid"] = False
                     result["pk_cols"] = []
                     result["pk_type"] = "NO_PK"
@@ -568,19 +572,18 @@ def profile_source(source_key, rows, key_cols, target_schemas, columns_meta, mod
                 result["pk_type"] = "NO_PK"
                 result["issues"].append("NO_PK_IN_COPYBOOK")
         else:
-            # Copybook NOT present -> Sequential positional auto-discovery up to 8 columns
+            # Copybook NOT present: sequential positional discovery is only a SUGGESTION. A guessed key can be
+            # wrong or unstable, so it is reported as a candidate and never applied as a primary key.
             discovered = find_unique_key_columns_sequential(df, max_cols=8)
-            result["extracted_pk_cols"] = list(discovered) if discovered else []
+            result["extracted_pk_cols"] = []
+            result["candidate_pk_cols"] = list(discovered) if discovered else []
+            result["pk_valid"] = False
+            result["pk_cols"] = []
+            result["pk_type"] = "NO_PK"
             if discovered:
-                result["pk_valid"] = True
-                result["pk_cols"] = list(discovered)
-                result["pk_type"] = "SINGLE" if len(discovered) == 1 else f"COMPOSITE({len(discovered)})"
-                result["issues"].append(f"KEY_AUTO_DISCOVERED({len(discovered)}): {', '.join(discovered)}")
-                logger.info(f"  [AUTO-DISCOVERY] Found sequential unique key for {source_key}: {', '.join(discovered)}")
+                result["issues"].append(f"KEY_CANDIDATE_NOT_APPLIED({len(discovered)}): {', '.join(discovered)}")
+                logger.info(f"  [KEY-CANDIDATE] {source_key}: unique columns {', '.join(discovered)} (not applied; add to korg_overrides to approve)")
             else:
-                result["pk_valid"] = False
-                result["pk_cols"] = []
-                result["pk_type"] = "NO_PK"
                 result["issues"].append("NO_UNIQUE_DATA_UPTO_8_COLS")
 
         # Dynamic Datatype Profiling (Regex dates + Dynamic Varchar Auto-Widening)
@@ -596,6 +599,14 @@ def profile_source(source_key, rows, key_cols, target_schemas, columns_meta, mod
             result["type_issues"].extend(type_issues)
             if type_issues:
                 result["issues"].append(f"TYPE_MISMATCHES:{len(type_issues)}_columns")
+                # A numeric/date type that the data violates would turn those values into NULL at load time
+                # (e.g. a header matched to the wrong copybook column). Keep the data: fall back to text.
+                fallback = [ti["col_name"] for ti in type_issues if not re.match(r"(var)?char", ti["sql_type"])]
+                for cn in fallback:
+                    type_overrides[cn] = "text"
+                if fallback:
+                    result["issues"].append(f"TYPE_FALLBACK_TEXT:{len(fallback)}_columns({', '.join(fallback[:5])})")
+                    logger.warning(f"  [TYPE-FALLBACK] {source_key}: {len(fallback)} column(s) hold values that do not fit the copybook type; loading them as text")
 
             effective_cols = []
             for c in columns_meta:
@@ -754,7 +765,8 @@ def main():
         # Copybook field metadata
         cb_name_raw = grp["copybook_map"].iloc[0] if "copybook_map" in grp.columns else ""
         cb_key = cb_name_raw.upper().split(".")[0] if cb_name_raw else ""
-        columns_meta = cb_meta.get(cb_key, [])
+        # With a Step 02 column map: one column per S3 header, datatype from the mapped copybook column
+        columns_meta = effective_columns_meta(co, src, cb_meta.get(cb_key, []))
 
         target_schemas = grp["target_schema"].dropna().unique().tolist()
         source_key_std = f"{co}|{src}"

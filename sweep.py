@@ -415,6 +415,7 @@ def handle_vsam(args):
         c = step("vsam", "vsam_02_inventory")
         if getattr(args, "s3", None): c.extend(["--s3", args.s3])
         if getattr(args, "company", None): c.extend(["--company", args.company])
+        if getattr(args, "tbl_col", None): c.extend(["--tbl-col", args.tbl_col])
         run_or_bg("vsam_02_inventory", c, getattr(args, "bg", False))
 
     # Step 03: Type Gate - PK verification & schema col detection
@@ -460,8 +461,9 @@ def handle_vsam(args):
     elif cmd == "run-all":
         workers = getattr(args, "workers", DEFAULT_WORKERS)
         extra = ["--force-truncate"] if getattr(args, "force_truncate", False) else []
-        commands = [step("vsam", m, *(["--workers", workers, *extra] if m == "vsam_06_load_data" else [])) for m in VSAM_STEPS]
-        bg_cmd = [sys.executable, str(BASE_DIR / "sweep.py"), "vsam", "run-all", "--workers", str(workers), *extra]
+        tbl = ["--tbl-col", args.tbl_col] if getattr(args, "tbl_col", None) else []
+        commands = [step("vsam", m, *(["--workers", workers, *extra] if m == "vsam_06_load_data" else tbl if m == "vsam_02_inventory" else [])) for m in VSAM_STEPS]
+        bg_cmd = [sys.executable, str(BASE_DIR / "sweep.py"), "vsam", "run-all", "--workers", str(workers), *extra, *tbl]
         pipeline_or_bg("vsam_full_pipeline", "VSAM Full", commands, bg_cmd, getattr(args, "bg", False))
 
 
@@ -480,9 +482,10 @@ def cmd_run_all(args):
     else:
         logger.info("Executing End-to-End Migration for BOTH Oracle and VSAM tracks...")
         extra = ["--force-truncate"] if getattr(args, "force_truncate", False) else []
+        tbl = ["--tbl-col", args.tbl_col] if getattr(args, "tbl_col", None) else []
         oracle_cmds = [step("oracle", m, *(["--workers", workers] if m == "oracle_06_load_data" else [])) for m in ORACLE_STEPS]
-        vsam_cmds = [step("vsam", m, *(["--workers", workers, *extra] if m == "vsam_06_load_data" else [])) for m in VSAM_STEPS]
-        bg_cmd = [sys.executable, str(BASE_DIR / "sweep.py"), "run-all", "--track", "all", "--workers", str(workers), *extra]
+        vsam_cmds = [step("vsam", m, *(["--workers", workers, *extra] if m == "vsam_06_load_data" else tbl if m == "vsam_02_inventory" else [])) for m in VSAM_STEPS]
+        bg_cmd = [sys.executable, str(BASE_DIR / "sweep.py"), "run-all", "--track", "all", "--workers", str(workers), *extra, *tbl]
         pipeline_or_bg("sweep_all_tracks", "Oracle + VSAM", oracle_cmds + vsam_cmds, bg_cmd, getattr(args, "bg", False))
 
 
@@ -507,6 +510,7 @@ def main():
     p_all.add_argument("--track", choices=["oracle", "vsam", "all"], default="all", help="Migration track to execute (default: all)")
     p_all.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Parallel workers (default: {DEFAULT_WORKERS})")
     p_all.add_argument("--force-truncate", action="store_true", help="Pass --force-truncate to the VSAM load step")
+    p_all.add_argument("--tbl-col", choices=["headers", "copybook"], help="VSAM table column names: S3 file headers (default) or copybook column names")
     p_all.add_argument("--bg", action="store_true", help="Run full pipeline as detached background daemon")
 
     # Background operations
@@ -603,6 +607,7 @@ def main():
     v_inv = v_sub.add_parser("inventory", help="Step 02: S3 Discovery & Source-to-Target Mapping")
     v_inv.add_argument("--s3", help="Target S3 prefix")
     v_inv.add_argument("--company", help="Comma-separated companies")
+    v_inv.add_argument("--tbl-col", choices=["headers", "copybook"], help="Table column names: S3 file headers (default) or mapped copybook column names")
     v_inv.add_argument("--bg", action="store_true", help="Run in background")
 
     v_gate = v_sub.add_parser("type-gate", aliases=["gate"], help="Step 03: PK uniqueness verification & schema column detection")
@@ -626,7 +631,7 @@ def main():
     v_load.add_argument("--tables", help="Comma-separated tables")
     v_load.add_argument("--limit-files", type=int, help="Limit files loaded")
     v_load.add_argument("--latest-only", "--latest-version-only", action="store_true", help="Load only latest file version per table based on timestamp in filename")
-    v_load.add_argument("--force-truncate", action="store_true", help="Allow TRUNCATE of existing tables that have rows but no primary key (once per table per run)")
+    v_load.add_argument("--force-truncate", action="store_true", help="Allow replacing a table that already has rows and no PK in a PARTIAL run (--company/--tables/--limit-files); full runs replace such tables automatically")
     v_load.add_argument("--dry-run", action="store_true", help="List the files that would be loaded without writing to the database")
     v_load.add_argument("--bg", action="store_true", help="Run in background daemon")
 
@@ -643,6 +648,7 @@ def main():
     v_runall = v_sub.add_parser("run-all", help="Execute complete VSAM 7-step pipeline end-to-end")
     v_runall.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Parallel workers")
     v_runall.add_argument("--force-truncate", action="store_true", help="Pass --force-truncate to the VSAM load step")
+    v_runall.add_argument("--tbl-col", choices=["headers", "copybook"], help="Table column names: S3 file headers (default) or copybook column names")
     v_runall.add_argument("--bg", action="store_true", help="Run full pipeline in background")
 
     args = parser.parse_args()

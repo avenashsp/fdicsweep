@@ -134,7 +134,9 @@ def common_schema_name(name: str) -> str:
     return name.lower() if COMMON_SCHEMA_CASE == "lower" else name.upper()
 
 
-FN = re.compile(r"^FDICSWP_([A-Z0-9]+)_(.+?)_FLAT(?:_(\d{8}))?\.csv(?:\.gz)?$", re.I)
+# FDICSWP_<COMPANY>_<SOURCE>_FLAT[_<timestamp>].csv[.gz]
+# The timestamp may be MMDDYYYY / YYYYMMDD, YYMMDD, YYYYMMDDHHMMSS or YYYYMMDD_HHMMSS (also with '-').
+FN = re.compile(r"^FDICSWP_([A-Z0-9]+)_(.+?)_FLAT(?:_(\d{4}-\d{2}-\d{2}(?:[_T-]\d{2}[:-]?\d{2}[:-]?\d{2})?|\d{6,14}(?:[_-]\d{4,6})?))?\.csv(?:\.gz)?$", re.I)
 
 
 IDENT = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]*$")

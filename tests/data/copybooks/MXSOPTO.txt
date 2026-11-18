@@ -1,0 +1,14 @@
+=================================================================================
+
+154130***********  LAYOUT TO FILE MXSOPTO THE OPT OUT FILE              00010001
+       01  MXSOPTO-WORK-RECORD.                                         00020001
+           02  MXSOPTO-WORK-KEY.                                        00030001
+               05  MXSOPTO-AGILE-BANK           PIC 9(4)    VALUE ZERO. 00040001
+               05  MXSOPTO-BROKER-ACCOUNT       PIC X(12)   VALUE SPACE.00050001
+           02  MXSOPTO-WORK-DATA-AREA.                                  00060001
+               05  MXSOPTO-FROM-PRODUCT-CUSIP   PIC X(9)    VALUE SPACE.00070001
+               05  MXSOPTO-TO-PRODUCT-CUSIP     PIC X(9)    VALUE SPACE.00080001
+               05  MXSOPTO-OPT-OUT-IND          PIC X(1)    VALUE SPACE.00090001
+               05  MXSOPTO-ORIGINAL-BRK-CUSIP   PIC X(9)    VALUE SPACE.00090002
+106618         05  MXSOPTO-REPORT-BRK-CUSIP     PIC X(9)    VALUE SPACE.00090003
+106618     02  FILLER                           PIC X(17)   VALUE SPACE.00100001

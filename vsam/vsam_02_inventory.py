@@ -33,6 +33,11 @@ from sweep_common import (
     FILE_READ_ERRORS,
     norm_col,
 )
+from vsam.common_colmap import (
+    COLMAP_FIELDS, finalize_entries, load_column_overrides, load_previous_map, map_columns, no_copybook_entries,
+    overrides_for, resolve_tbl_col, table_column_names, TBL_COL_CHOICES, translate_key_columns,
+    translate_key_columns_from_rows, write_column_map,
+)
 from vsam.vsam_common import (
     BASE,
     common_schema_name,
@@ -230,6 +235,74 @@ def load_copybook_columns_map():
     return cols_map
 
 
+def load_copybook_fields():
+    """All copybook field rows per copybook (Step 01 output): {COPYBOOK_UPPER: [row dicts]}."""
+    cb_csv = OUT / "vsam_01_copybook_extracts.csv"
+    fields = {}
+    if cb_csv.exists():
+        try:
+            df = pd.read_csv(cb_csv, dtype=str).fillna("")
+        except FILE_READ_ERRORS as e:
+            logger.warning(f"Error reading {cb_csv}: {e}")
+            return fields
+        for r in df.to_dict(orient="records"):
+            r["is_key"] = r.get("is_key") == "YES"
+            fields.setdefault(r["copybook_file"].upper().split(".")[0], []).append(r)
+    return fields
+
+
+def resolve_user_keys(keys, entries, mode):
+    """Keys typed by a person (korg_overrides / mapping sheet) -> table column names (header or copybook name)."""
+    names = table_column_names(entries, mode)
+    by_header, by_cb, k = {}, {}, 0
+    for e in entries:
+        if e["status"] == "COPYBOOK_ONLY":
+            continue
+        by_header[e["header"]] = names[k]
+        if e["copybook_col"] and e["status"] in ("ACCEPTED", "REVIEW"):
+            by_cb[e["copybook_col"]] = names[k]
+        k += 1
+    return [by_header.get(norm_col(c)) or by_cb.get(norm_col(c)) or norm_col(c) for c in keys]
+
+
+def unify_shared_table_columns(inv_rows, colmap_cache):
+    """
+    Several source files can feed one table (e.g. different companies into the same `bcs` table). When their
+    headers differ, columns matched to the SAME copybook column must still end up as ONE table column, so the
+    first source (alphabetical) names the column and the others follow it. Unmapped headers stay as they are
+    (Step 04 builds the union of columns for the table). Sources whose column sets still differ are flagged.
+    """
+    by_table = defaultdict(list)
+    for r in inv_rows:
+        if r.get("table_name") and r.get("source_filename"):
+            key = ((r["company_token"] or "").upper(), r["source_filename"].upper())
+            if key in colmap_cache and key not in by_table[r["table_name"]]:
+                by_table[r["table_name"]].append(key)
+    for table, keys in by_table.items():
+        if len(keys) < 2:
+            continue
+        keys.sort()
+        ref_rows = colmap_cache[keys[0]][1]
+        ref = {x["copybook_col"]: x["table_column"] for x in ref_rows
+               if x["status"] in ("ACCEPTED", "REVIEW") and x["copybook_col"]}
+        ref_cols = {x["table_column"] for x in ref_rows if x["table_column"]}
+        for key in keys[1:]:
+            rows = colmap_cache[key][1]
+            for x in rows:
+                if x["status"] in ("ACCEPTED", "REVIEW") and x["copybook_col"] in ref and x["table_column"] != ref[x["copybook_col"]]:
+                    x["table_column"] = ref[x["copybook_col"]]
+            own = [x["table_column"] for x in rows if x["table_column"]]
+            if len(own) != len(set(own)):
+                logger.warning(f"Shared table {table}: duplicate column names after unification for {key}; review the column map")
+            extra = sorted(set(own) - ref_cols)
+            if extra:
+                logger.warning(f"Shared table {table}: {key[0]}/{key[1]} has {len(extra)} column(s) the first source "
+                               f"does not ({', '.join(extra[:5])}); Step 04 will add them to the table.")
+        for r in inv_rows:
+            if r.get("table_name") == table and ((r["company_token"] or "").upper(), r["source_filename"].upper()) in keys:
+                r["issues"] = "|".join(filter(None, [r.get("issues", ""), f"SHARED_TABLE:{len(keys)}_sources"]))
+
+
 def token_matches_copybook(token, cb_set):
     """
     Check if a normalized 1st-line token matches any copybook column name.
@@ -256,8 +329,13 @@ def main():
     parser.add_argument("--s3", default=VSAM_S3_BUCKET, help="Target S3 URI prefix")
     parser.add_argument("--company", help="Comma-separated company tokens to filter")
     parser.add_argument("--latest-only", "--latest-version-only", action="store_true", help="Keep only latest file version per table")
+    parser.add_argument("--tbl-col", choices=TBL_COL_CHOICES, default=None,
+                        help="Table column names: 'headers' = S3 file headers (default, or VSAM_TBL_COL env) or "
+                             "'copybook' = names of the mapped copybook columns. Datatypes always come from the "
+                             "mapped copybook column.")
     parser.add_argument("--bg", action="store_true", help="Run in background")
     args = parser.parse_args()
+    tbl_col = resolve_tbl_col(args.tbl_col)
 
     filter_companies = [c.strip().upper() for c in args.company.split(",")] if args.company else None
 
@@ -271,6 +349,14 @@ def main():
     cbo = copybook_overrides()
     cb_key_map = load_copybook_key_map()
     cb_cols_map = load_copybook_columns_map()
+    cb_fields_map = load_copybook_fields()
+    column_overrides = load_column_overrides()
+    previous_maps = load_previous_map()          # sticky: headers keep last run's copybook match
+    keys_cache = {}                              # (token, source) -> (keys, key source, candidates, issues)
+    colmap_cache = {}                            # (token, source) -> (entries, finalized rows)
+    column_map_rows = []
+    row_refs = defaultdict(list)                 # (token, source) -> inventory / matrix rows to refresh after unification
+    logger.info(f"Table column names will use: {'S3 file headers' if tbl_col == 'headers' else 'copybook column names'} (--tbl-col {tbl_col})")
 
     inv = []
     loads = []
@@ -309,7 +395,6 @@ def main():
         # Check latest file version first; if latest has NO headers, check previous version.
         header_cache = {}
         header_tokens_cache = {}
-        keys_cache = {}
 
         for (g_tok, g_src), g_files in groups.items():
             if filter_companies and g_tok not in filter_companies:
@@ -481,40 +566,72 @@ def main():
             # Every file has headers: take column names from the first line of the file
             has_header_str = "YES"
 
-            # Determine key columns using hierarchy:
-            # 1. Copybook keys
-            # 2. korg_overrides sheet in vsam_master_overrides.xlsx
-            # 3. Auto-discovery from data (single or composite up to 8 columns)
+            # ----- Column mapping: S3 headers -> copybook columns (datatype source) -----
             cb_key_name = name.upper().split(".")[0] if name else ""
-            if (tok.upper(), src.upper()) in keys_cache:
-                final_keys = keys_cache[(tok.upper(), src.upper())]
+            cm_key = (tok.upper(), src.upper())
+            if cm_key not in colmap_cache:
+                if cb_found:
+                    cb_fields = cb_fields_map.get(cb_key_name)
+                    if not cb_fields and files_found:
+                        from vsam.vsam_01_extract_copybooks import parse_copybook_with_keys
+                        cb_fields = parse_copybook_with_keys(next(f for f in files_found if f.exists()))
+                    entries = map_columns(
+                        tokens_for_file, cb_fields or [],
+                        overrides=overrides_for(column_overrides, company, src, p.name),
+                        previous=previous_maps.get(((company or "").upper(), src.upper())))
+                else:
+                    entries = no_copybook_entries(tokens_for_file)
+                rows = finalize_entries(entries, tbl_col, company or "", src, p.name, cb_map_display)
+                colmap_cache[cm_key] = (entries, rows)
+                column_map_rows.extend(rows)
+                n_map = sum(1 for e in entries if e["status"] == "ACCEPTED")
+                n_rev = sum(1 for e in entries if e["status"] == "REVIEW")
+                if cb_found:
+                    logger.info(f"[{tok}/{src}] Column mapping: {n_map} accepted, {n_rev} to review, "
+                                f"{sum(1 for e in entries if e['status'] == 'UNMAPPED')} unmapped of {len(tokens_for_file)} headers")
+            col_entries, col_rows = colmap_cache[cm_key]
+            col_mapped = sum(1 for e in col_entries if e["status"] == "ACCEPTED")
+            col_review = sum(1 for e in col_entries if e["status"] == "REVIEW")
+            col_unmapped = sum(1 for e in col_entries if e["status"] == "UNMAPPED")
+
+            # Determine key columns using hierarchy (a key is only applied when it comes from a trusted source):
+            # 1. Copybook keys            (translated to table columns; every key column must be ACCEPTED)
+            # 2. korg_overrides sheet / mapping sheet (typed by a person)
+            # 3. Auto-discovery from data -> reported as CANDIDATE only, NEVER applied as a primary key
+            if cm_key in keys_cache:
+                final_keys, key_source, candidate_keys, key_issues = keys_cache[cm_key]
             else:
                 cb_keys = cb_key_map.get(cb_key_name, [])
                 override_keys = get_korg_override_pkey(company, src, p.name)
                 korg_key_raw = (m[2] or "") if m else ""
                 korg_keys = [norm_col(c.strip()) for c in re.split(r"[,;+]", korg_key_raw) if c.strip()] if korg_key_raw else []
+                key_issues, candidate_keys = [], []
 
-                if cb_keys:
-                    final_keys = cb_keys
+                if cb_keys and cb_found:
+                    final_keys, key_issues = translate_key_columns(cb_keys, col_entries, tbl_col)
+                    key_source = "COPYBOOK" if final_keys else "COPYBOOK_UNMAPPED"
                 elif override_keys:
-                    final_keys = override_keys
-                elif korg_keys:
-                    final_keys = korg_keys
+                    final_keys, key_source = resolve_user_keys(override_keys, col_entries, tbl_col), "OVERRIDE"
+                elif korg_keys and cb_found:     # without a copybook the korg column is only a schema discriminator
+                    final_keys, key_source = resolve_user_keys(korg_keys, col_entries, tbl_col), "KORG_SHEET"
                 else:
-                    final_keys = []
-                    # Fallback: Auto-discover ONLY if copybook is not present, using sequential positional search!
-                    if isinstance(p, Path) and p.exists() and p.stat().st_size > 0:
-                        try:
-                            d = delim_for(str(p))
-                            sample_df = pd.read_csv(p, sep=d, nrows=5000, header=0, dtype=str)
-                            sample_df.columns = make_columns_unique(sample_df.columns)
-                            sample_df = filter_invalid_rows(sample_df)
-                            final_keys = find_unique_key_columns_sequential(sample_df, max_cols=8)
-                        except FILE_READ_ERRORS:
-                            final_keys = []
-                keys_cache[(tok.upper(), src.upper())] = final_keys
+                    final_keys, key_source = [], "NONE"
+                if not final_keys and isinstance(p, Path) and p.exists() and p.stat().st_size > 0:
+                    # Auto-discovery is only a suggestion: it can pick a wrong or unstable key.
+                    try:
+                        d = delim_for(str(p))
+                        sample_df = pd.read_csv(p, sep=d, nrows=5000, header=0, dtype=str)
+                        sample_df.columns = make_columns_unique(sample_df.columns)
+                        sample_df = filter_invalid_rows(sample_df)
+                        candidate_keys = find_unique_key_columns_sequential(sample_df, max_cols=8)
+                    except FILE_READ_ERRORS:
+                        candidate_keys = []
+                keys_cache[cm_key] = (final_keys, key_source, candidate_keys, key_issues)
 
             key_col_display = ", ".join(final_keys)
+            issues.extend(key_issues)
+            if candidate_keys and not final_keys:
+                issues.append(f"KEY_CANDIDATE_NOT_APPLIED:{','.join(candidate_keys)}")
 
             # RULE EVALUATION
             # Rule 1: No copybook and No korg -> directly load it in the bcs schema
@@ -548,7 +665,7 @@ def main():
             except OSError:
                 size_mb = 0
 
-            inv.append({
+            inv_row = {
                 "folder": folder,
                 "version_date": vdate.isoformat() if vdate else "",
                 "s3_filename": p.name,
@@ -564,16 +681,23 @@ def main():
                 "table_name": tname or "",
                 "postgres_table": tbl_mapped,
                 "key_columns": key_col_display,
+                "key_source": key_source,
+                "candidate_key_columns": ", ".join(candidate_keys),
+                "mapped_columns": col_mapped,
+                "review_columns": col_review,
+                "unmapped_columns": col_unmapped,
                 "file_size_mb": size_mb,
                 "mapping_status": "READY" if ready else "REVIEW",
                 "full_path": str(p),
                 "copybook_file": cb_file,
                 "issues": "|".join(issues)
-            })
+            }
+            inv.append(inv_row)
+            row_refs[cm_key].append(inv_row)
 
             if ready:
                 for s in tgt_schemas:
-                    loads.append({
+                    load_row = {
                         "folder": folder,
                         "s3_filename": p.name,
                         "full_path": str(p),
@@ -589,14 +713,17 @@ def main():
                         "copybook_file": cb_file,
                         "copybook_map": cb_map_display,
                         "korg_map": korg_display
-                    })
+                    }
+                    loads.append(load_row)
+                    row_refs[cm_key].append(load_row)
 
     loads = sorted(loads, key=lambda x: (x.get("target_schema", ""), x.get("target_table", ""), x.get("size_mb", 0)))
 
     inv_cols = [
         "folder", "version_date", "s3_filename", "company_token", "source_company", "source_filename",
         "has_header", "copybook_map", "korg_map", "copybook_status", "broker_name", "schema_name", "table_name",
-        "postgres_table", "key_columns", "file_size_mb", "mapping_status", "full_path", "copybook_file", "issues"
+        "postgres_table", "key_columns", "key_source", "candidate_key_columns", "mapped_columns", "review_columns",
+        "unmapped_columns", "file_size_mb", "mapping_status", "full_path", "copybook_file", "issues"
     ]
     lm_cols = [
         "folder", "s3_filename", "full_path", "source_company", "source_filename", "has_header", "version_date",
@@ -616,6 +743,18 @@ def main():
     df.to_csv(OUT / "inventory.csv", index=False)
     lm.to_csv(OUT / "vsam_02_load_matrix.csv", index=False)
     lm.to_csv(OUT / "load_matrix.csv", index=False)
+
+    unify_shared_table_columns(inv, colmap_cache)
+    for ck, refs in row_refs.items():            # keys follow any column renamed by the unification
+        cached = keys_cache.get(ck)
+        if cached and cached[1] == "COPYBOOK":
+            cb_keys_now = cb_key_map.get(refs[0].get("copybook_map", "").upper().split(".")[0], [])
+            new_keys, _ = translate_key_columns_from_rows(cb_keys_now, colmap_cache[ck][1])
+            if new_keys and new_keys != cached[0]:
+                for r in refs:
+                    r["key_columns"] = ", ".join(new_keys)
+    write_column_map(column_map_rows)
+    logger.info(f"Saved column map: {OUT / 'vsam_02_column_map.csv'} ({len(column_map_rows)} rows, tbl-col={tbl_col})")
 
     hdr_cols = [
         "company_token", "source_filename", "latest_filename", "has_header",
@@ -643,6 +782,11 @@ def main():
             "schema name": r.get("schema_name", ""),
             "table name": r.get("table_name", ""),
             "key columns": r.get("key_columns", ""),
+            "key source": r.get("key_source", ""),
+            "candidate key (not applied)": r.get("candidate_key_columns", ""),
+            "mapped columns": r.get("mapped_columns", 0),
+            "review columns": r.get("review_columns", 0),
+            "unmapped columns": r.get("unmapped_columns", 0),
             "file size (MB)": r.get("file_size_mb", 0),
             "mapping status": r.get("mapping_status", "REVIEW"),
             "full S3 file path": r.get("full_path", "")
@@ -666,7 +810,8 @@ def main():
     generate_excel_report(report_file, {
         "Summary": summary_rows,
         "FileInventory": file_inventory_rows,
-        "LatestFileHeaders": latest_headers_records
+        "LatestFileHeaders": latest_headers_records,
+        "ColumnMapping": [{k: r.get(k, "") for k in COLMAP_FIELDS} for r in column_map_rows],
     })
 
     logger.info(f"Inventory Complete: {len(df)} files discovered, {len(lm)} target table mappings planned.")

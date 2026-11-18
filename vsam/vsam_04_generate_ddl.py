@@ -42,6 +42,7 @@ from sweep_common import (
     q,
     norm_col,
 )
+from vsam.common_colmap import effective_columns_meta
 from vsam.vsam_common import get_all_active_schemas, get_korg_override_pkey, load_csv_safe, OUT
 
 logger = get_logger("vsam_04_generate_ddl", "vsam_04_generate_ddl")
@@ -239,6 +240,17 @@ def main():
         if is_agiletic:
             # For AGILETIC: directly create column names and datatype inferred from CSV in Step 03
             columns_meta = tg.get("columns", [])
+        elif columns_meta:
+            # Step 02 column map: columns named per --tbl-col, datatype from the mapped copybook column.
+            # Sources that share this table contribute their columns too (union, first occurrence wins).
+            merged, seen = [], set()
+            src_pairs = src_rows[["source_company", src_col]].drop_duplicates().itertuples(index=False)
+            for co_i, src_i in src_pairs:
+                for c in effective_columns_meta(co_i, src_i, cb_meta.get(cb_key, [])):
+                    if c["col_name"] not in seen:
+                        seen.add(c["col_name"])
+                        merged.append(c)
+            columns_meta = merged
         elif not columns_meta:
             # When copybook is missing: retrieve columns inferred from file header in Step 03
             columns_meta = tg.get("columns", [])

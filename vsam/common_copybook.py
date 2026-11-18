@@ -4,10 +4,10 @@ vsam/common_copybook.py - COBOL copybook parsing, SQL type derivation and column
 """
 import re
 from datetime import datetime
-from pathlib import Path
 import pandas as pd
 from sweep_common import norm_col
-from vsam.common_config import FN, USAGE
+from vsam.common_cobol import read_copybook_tree
+from vsam.common_config import FN
 
 
 def norm_usage(u):
@@ -29,13 +29,25 @@ def dedupe(names):
 
 
 def parse_filename(name):
-    """FDICSWP_<COMPANY>_<SOURCE>_FLAT[_MMDDYYYY].csv[.gz] -> (company_token, source, date|None)"""
+    """
+    FDICSWP_<COMPANY>_<SOURCE>_FLAT[_<timestamp>].csv[.gz] -> (company_token, source, date | datetime | None)
+    The timestamp is interpreted by `extract_version_key` (MMDDYYYY, YYYYMMDD, YYMMDD, YYYYMMDDHHMMSS ...).
+    """
     m = FN.match(name)
     if not m:
         return None
-    co, src, d = m.groups()
+    co, src, stamp = m.groups()
+    from vsam.common_files import extract_version_key      # imported lazily: common_files imports this module
+    digits = re.sub(r"\D", "", stamp or "")
+    key = re.sub(r"\D", "", extract_version_key(digits)) if digits else ""
+    dt = None
     try:
-        dt = datetime.strptime(d, "%m%d%Y").date() if d else None
+        if len(key) >= 14:
+            dt = datetime.strptime(key[:14], "%Y%m%d%H%M%S")
+        elif len(key) == 8:
+            dt = datetime.strptime(key, "%Y%m%d").date()
+        elif len(key) == 6:
+            dt = datetime.strptime(key, "%y%m%d").date()
     except ValueError:
         dt = None
     return co.upper(), src.upper(), dt
@@ -118,35 +130,12 @@ def field_lengths(pic, usage):
 
 
 def parse_copybook(path):
-    lines = []
-    for ln in Path(path).read_text(errors="ignore").splitlines():
-        ln = re.sub(r"^\d{5,8}\s*", "", ln)
-        if ln[:1] == "*" or ln.strip().startswith(("*", "/")) or (len(ln) > 0 and ln[0] in "*/"):
-            continue
-        lines.append(ln.strip())
-    stmts = [s.strip() for s in re.split(r"\.(?=\s|$)", " ".join(lines)) if s.strip()]
-    root = {"level": 0, "children": []}
+    root = read_copybook_tree(path)
     stack = [root]
-    for s in stmts:
-        m = re.match(r"(\d{1,2})\s+([A-Za-z0-9_\-]+)\s*(.*)$", s, re.S)
-        if not m:
-            continue
-        lvl, name, rest = int(m.group(1)), m.group(2), m.group(3)
-        if lvl in (66, 88):
-            continue
-        pic = re.search(r"\bPIC(?:TURE)?\s+(?:IS\s+)?(\S+)", rest, re.I)
-        occ = re.search(r"\bOCCURS\s+(\d+)", rest, re.I)
-        node = {
-            "level": lvl, "name": name,
-            "redef": bool(re.search(r"\bREDEFINES\b", rest, re.I)),
-            "pic": pic.group(1) if pic else None,
-            "usage": (norm_usage(USAGE.search(rest).group(1)) if USAGE.search(rest) else None),
-            "occurs": int(occ.group(1)) if occ else None, "children": []
-        }
-        while len(stack) > 1 and stack[-1]["level"] >= lvl:
-            stack.pop()
-        stack[-1]["children"].append(node)
-        stack.append(node)
+    while stack:                      # normalise raw usage / defaults on every node
+        node = stack.pop()
+        stack.extend(node["children"])
+        node["usage"] = norm_usage(node["usage_raw"]) if node.get("usage_raw") else None
 
     def flat(nodes, sfx=""):
         for n in nodes:

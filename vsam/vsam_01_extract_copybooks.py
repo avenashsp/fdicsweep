@@ -22,17 +22,24 @@ from pathlib import Path
 
 import pandas as pd
 from sweep_common import (
-    VSAM_COPYBOOK_DIR,
-    VSAM_REPORTS_DIR,
+    generate_excel_report,
+    get_db_name,
     get_logger,
     get_timestamp,
-    get_db_name,
-    generate_excel_report,
     norm_col,
+    VSAM_REPORTS_DIR,
 )
+from vsam.common_cobol import read_copybook_tree
+from vsam.common_config import COPYBOOK_DIR
 from vsam.vsam_common import field_lengths, is_key_group_or_field, norm_usage, OUT, sql_type
 
 logger = get_logger("vsam_01_extract_copybooks", "vsam_01_extract_copybooks")
+
+
+def _walk(node):
+    for child in node["children"]:
+        yield child
+        yield from _walk(child)
 
 USAGE_RX = re.compile(r"\b(COMPUTATIONAL-[1-5]|COMPUTATIONAL|COMP-[1-5]|COMP|BINARY|PACKED-DECIMAL)\b", re.I)
 
@@ -42,50 +49,13 @@ def parse_copybook_with_keys(path):
     Parse a COBOL copybook file. Returns list of field dicts with:
       name, pic, usage, sql_type, len_display, len_storage, is_key, is_filler
     Key fields are those whose parent group or field name matches KEY/KEM conventions.
+    Text handling (sequence areas, comments, :TAG: names, multi-line statements) lives in
+    vsam.common_cobol.
     """
-    lines = []
-    for ln in Path(path).read_text(errors="ignore").splitlines():
-        # Strip 5 to 8 digit sequence numbers at start of line
-        ln = re.sub(r"^\d{5,8}\s*", "", ln)
-        # Skip comment lines
-        if ln[:1] == "*" or ln.strip().startswith(("*", "/")) or (len(ln) > 0 and ln[0] in "*/"):
-            continue
-        lines.append(ln.strip())
-
-    stmts = [s.strip() for s in re.split(r"\.(?=\s|$)", " ".join(lines)) if s.strip()]
-
-    root = {"level": 0, "name": "__ROOT__", "is_key_group": False, "children": []}
-    stack = [root]
-
-    for s in stmts:
-        m = re.match(r"(\d{1,2})\s+([A-Za-z0-9_\-]+)\s*(.*)$", s, re.S)
-        if not m:
-            continue
-        lvl, name, rest = int(m.group(1)), m.group(2), m.group(3)
-        if lvl in (66, 88):
-            continue
-
-        pic = re.search(r"\bPIC(?:TURE)?\s+(?:IS\s+)?(\S+)", rest, re.I)
-        occ = re.search(r"\bOCCURS\s+(\d+)", rest, re.I)
-        usage_m = USAGE_RX.search(rest)
-
-        node = {
-            "level": lvl,
-            "name": name,
-            "redef": bool(re.search(r"\bREDEFINES\b", rest, re.I)),
-            "pic": pic.group(1) if pic else None,
-            "usage": norm_usage(usage_m.group(1)) if usage_m else None,
-            "occurs": int(occ.group(1)) if occ else None,
-            "is_key_group": is_key_group_or_field(name),
-            "children": []
-        }
-
-        # Pop stack to correct parent level
-        while len(stack) > 1 and stack[-1]["level"] >= lvl:
-            stack.pop()
-
-        stack[-1]["children"].append(node)
-        stack.append(node)
+    root = read_copybook_tree(path)
+    for node in _walk(root):
+        node["usage"] = norm_usage(node["usage_raw"]) if node.get("usage_raw") else None
+        node["is_key_group"] = is_key_group_or_field(node.get("name", ""))
 
     # Flatten: carry down key-group status from parent
     def flat(nodes, parent_is_key=False):
@@ -128,7 +98,7 @@ def main():
     logger.info("SWEEP VSAM MIGRATION - STEP 01: COPYBOOK METADATA EXTRACTION")
     logger.info("=" * 75)
 
-    copybook_dir = VSAM_COPYBOOK_DIR
+    copybook_dir = COPYBOOK_DIR      # honours the VSAM_COPYBOOK_DIR environment variable
     if not copybook_dir.exists():
         logger.error(f"Copybook directory not found: {copybook_dir}")
         sys.exit(1)
