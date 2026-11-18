@@ -1,4 +1,4 @@
-# SWEEP Migration Framework - Complete CLI Flags Reference (v5.1)
+# SWEEP Migration Framework - Complete CLI Flags Reference (v5.2)
 
 Complete flags reference for all CLI commands and python scripts in the **SWEEP Unified Data Migration Framework** across both **Oracle** and **VSAM** tracks.
 
@@ -33,13 +33,13 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 | Step | Script / Command | Available Flags |
 | :---: | :--- | :--- |
 | **01** | `vsam.vsam_01_extract_copybooks`<br>`python3 sweep.py vsam extract` | `'--bg'`, `'-h, --help'` |
-| **02** | `vsam.vsam_02_inventory`<br>`python3 sweep.py vsam inventory` | `'--s3 S3'`, `'--company COMPANY'`, `'--latest-only'` *(standalone module only)*, `'--bg'`, `'-h, --help'` |
+| **02** | `vsam.vsam_02_inventory`<br>`python3 sweep.py vsam inventory` | `'--s3 S3'`, `'--company COMPANY'`, `'--tbl-col {headers,copybook}'`, `'--latest-only'` *(standalone module only)*, `'--bg'`, `'-h, --help'` |
 | **03** | `vsam.vsam_03_type_gate`<br>`python3 sweep.py vsam type-gate` | `'--workers WORKERS'`, `'--company COMPANY'`, `'--latest-only'` *(standalone module only)*, `'--bg'`, `'-h, --help'` |
 | **04** | `vsam.vsam_04_generate_ddl`<br>`python3 sweep.py vsam gen-ddl` | `'--company COMPANY'`, `'--execute'`, `'--bg'`, `'-h, --help'` |
 | **05** | `vsam.vsam_05_apply_ddl`<br>`python3 sweep.py vsam apply-ddl` | `'--skip-meta'`, `'--bg'`, `'-h, --help'` |
 | **06** | `vsam.vsam_06_load_data`<br>`python3 sweep.py vsam load-data` | `'--mode {default,data}'`, `'--workers WORKERS'`, `'--company COMPANY'`, `'--tables TABLES'`, `'--limit-files LIMIT_FILES'`, `'--latest-only'`, `'--force-truncate'`, `'--dry-run'`, `'--bg'`, `'-h, --help'` |
 | **07** | `vsam.vsam_07_validate`<br>`python3 sweep.py vsam validate` | `'--exact-counts'`, `'--tables TABLES'`, `'--schema SCHEMA'`, `'--bg'`, `'-h, --help'` |
-| **All** | `python3 sweep.py vsam run-all` | `'--workers WORKERS'`, `'--force-truncate'`, `'--bg'`, `'-h, --help'` |
+| **All** | `python3 sweep.py vsam run-all` | `'--workers WORKERS'`, `'--force-truncate'`, `'--tbl-col {headers,copybook}'`, `'--bg'`, `'-h, --help'` |
 
 ---
 
@@ -53,7 +53,7 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 | `python3 sweep.py monitor` | `'-w, --watch'`, `'--interval INTERVAL'`, `'--track {all,oracle,vsam}'`, `'--no-color'`, `'-h, --help'` |
 | `python3 sweep.py logs` | `'-f, --follow'`, `'-n, --lines LINES'`, `'--track {oracle,vsam}'`, `'--file FILE'`, `'-h, --help'` |
 | `python3 sweep.py stop` | `'--name NAME'`, `'--kill-db'`, `'-h, --help'` |
-| `python3 sweep.py run-all` | `'--track {oracle,vsam,all}'`, `'--workers WORKERS'`, `'--force-truncate'`, `'--bg'`, `'-h, --help'` |
+| `python3 sweep.py run-all` | `'--track {oracle,vsam,all}'`, `'--workers WORKERS'`, `'--force-truncate'`, `'--tbl-col {headers,copybook}'`, `'--bg'`, `'-h, --help'` |
 
 ---
 
@@ -199,6 +199,7 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 | `-h, --help` | flag | - | Show help message and exit | `python3 sweep.py vsam inventory -h` |
 | `--s3 S3` | string | `VSAM_S3_BUCKET`| S3 prefix to discover flat files | `--s3 s3://my-bucket/vsam/` |
 | `--company COMPANY`| string | all companies | Comma-separated company tokens to filter | `--company FDIC` |
+| `--tbl-col MODE` | choice: `headers`, `copybook` | `headers` (or `VSAM_TBL_COL`) | Table column names: the S3 file headers, or the mapped copybook column names. Datatypes always come from the mapped copybook column. Stored in `vsam_02_column_map.csv` for Steps 03-07 | `--tbl-col copybook` |
 | `--latest-only` | flag | false | Keep only latest file version per table (based on timestamp). *Standalone module only; `sweep.py vsam inventory` does not forward it* | `--latest-only` |
 | `--bg` | flag | false | Run in background daemon *(CLI only)* | `python3 sweep.py vsam inventory --bg` |
 
@@ -256,7 +257,7 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 | `--tables TABLES`| string | all tables | Comma-separated target tables to load | `--tables vsamkorg` |
 | `--limit-files N`| integer | all files | Limit total number of files loaded (testing) | `--limit-files 2` |
 | `--latest-only` | flag | false | Load only the latest file version per table (based on timestamp in filename) | `--latest-only` |
-| `--force-truncate` | flag | false | Allow `TRUNCATE` of tables that already hold rows but have no PK - once per table per run; without it such files fail instead of being wiped | `--force-truncate` |
+| `--force-truncate` | flag | false | Tables without a PK are replaced by the newest snapshot automatically in a full run. In a PARTIAL run (`--company`, `--tables`, `--limit-files`) replacing a table that already has rows needs this flag, because other source files of the table may be missing | `--force-truncate` |
 | `--dry-run` | flag | false | List the files that would be loaded; no database changes | `--dry-run` |
 | `--bg` | flag | false | Run in background daemon | `python3 sweep.py vsam load-data --bg` |
 
@@ -334,6 +335,7 @@ Automated end-to-end execution across tracks.
 | `--track TRACK` | choice | `all` | Track to execute: `oracle`, `vsam`, or `all` | `python3 sweep.py run-all --track oracle` |
 | `--workers WORKERS`| integer | `4` | Parallel workers for ingestion steps | `python3 sweep.py run-all --workers 8` |
 | `--force-truncate` | flag | false | Forwarded to the VSAM load step (see Step 06) | `python3 sweep.py run-all --force-truncate` |
+| `--tbl-col MODE` | choice | `headers` | Forwarded to VSAM Step 02 | `python3 sweep.py run-all --tbl-col copybook` |
 | `--bg` | flag | false | Run full pipeline as one detached background job (stops at the first failing step) | `python3 sweep.py run-all --track all --bg` |
 
 ---
@@ -362,6 +364,8 @@ All parameters can be pre-configured via `sweep.env` located in the root reposit
 | `ORACLE_WORKERS` / `SWEEP_WORKERS` / `VSAM_WORKERS` | Default worker threads (first one set wins, in that order) | `4` |
 | `VSAM_DELIM` / `VSAM_QUOTE` / `VSAM_ENCODING` | Delimiter / quoting / encoding handling for VSAM files | `auto` |
 | `VSAM_VERSION_MODE` | How multiple file versions are handled | `upsert` |
+| `VSAM_TBL_COL` | Default for `--tbl-col`: `headers` (S3 file headers) or `copybook` (copybook column names) | `headers` |
+| `VSAM_MAP_ACCEPT` / `VSAM_MAP_MIN` | Column-mapping thresholds: scores >= ACCEPT are ACCEPTED, >= MIN are REVIEW, below MIN UNMAPPED | `0.70` / `0.35` |
 | `VSAM_COMMON_SCHEMA_CASE` | Case of the shared fallback schema name | `lower` |
 | `VSAM_FOLDERS` | Comma-separated S3/local folders to scan (overrides discovery) | unset |
 | `VSAM_BASE` | Local directory scanned for VSAM files when not using S3 | repository root |

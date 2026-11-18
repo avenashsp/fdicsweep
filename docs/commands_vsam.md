@@ -1,4 +1,4 @@
-# SWEEP CLI Command Reference - VSAM Migration Track (v5.1)
+# SWEEP CLI Command Reference - VSAM Migration Track (v5.2)
 
 Complete command reference for the **VSAM Migration Track** of the SWEEP Unified Data Migration Framework.
 
@@ -83,7 +83,13 @@ python3 sweep.py vsam run-all --workers 4 --bg
 ## 2. VSAM Step-by-Step Command Reference (Steps 01 - 07)
 
 ### Step 01: Extract Copybook Metadata (`extract` / `extract-copybooks`)
-Parses all COBOL copybooks (`.txt`) in `vsam/inputs/copybooks/` to extract column metadata, Cobol PICTURE datatypes, and identify candidate primary keys (fields grouped under `KEY` or `KEM`, or containing `KEY` in field name).
+Parses all COBOL copybooks (`.txt`, `.cbl`, `.cob`) in `vsam/inputs/copybooks/` (or `VSAM_COPYBOOK_DIR`) to extract column metadata, Cobol PICTURE datatypes, and identify candidate primary keys (fields grouped under `KEY` or `KEM`, or containing `KEY` in field name).
+
+The reader (`vsam/common_cobol.py`) copes with real mainframe layouts:
+- fixed-format **sequence areas** - line/change numbers in columns 1-6 (`106618`) and in columns 73-80 (`00040001`), including numbers glued to the closing period (`VALUE SPACE.00050001`);
+- comment lines (`*` / `/` in column 7, `*>` inline comments) and banner lines (`=====`);
+- `COPY ... REPLACING` placeholders such as `:USA090:-KORG` or `:NEXT-MODEL:-KEY` (the colons are removed: `USA090-KORG`);
+- statements that continue over several lines (`VALUE LOW-VALUES.` on the next line), quoted literals containing periods, fields that start with digits (`06BALCUR`), `COMP-3`, `OCCURS`, and `REDEFINES` (the redefining field is not duplicated).
 
 ```bash
 # Extract metadata from all copybooks
@@ -103,8 +109,31 @@ python3 -m vsam.vsam_01_extract_copybooks
 
 ---
 
-### Step 02: S3 Discovery & Inventory Mapping (`inventory`)
+### Step 02: S3 Discovery, Inventory Mapping & Column Mapping (`inventory`)
 Discovers all S3 VSAM flat files, maps them to copybooks and target schemas/tables using `vsam_master_mapping.xlsx`. Evaluates multiple file versions and prunes older versions so only the single latest version per file is retained in the load matrix.
+
+File names are `FDICSWP_<COMPANY>_<SOURCE>_FLAT_<timestamp>.csv[.gz]`; the timestamp may be `MMDDYYYY`, `YYYYMMDD`, `YYMMDD`, `YYYYMMDDHHMMSS`, `YYYYMMDD_HHMMSS` or `YYYY-MM-DD[THH:MM:SS]` and decides which file is the newest snapshot.
+
+#### Column mapping (S3 headers -> copybook columns)
+Every VSAM file has a header row, but the header names and their order do **not** match the copybook. Step 02 therefore maps each S3 header to a copybook column:
+
+1. **`column_overrides` sheet** of `vsam_master_overrides.xlsx` (`sourcecompany`, `filename` = source name or S3 file name, `header`, `copybook_column`; blank `copybook_column` forces *unmapped*) - a human decision always wins.
+2. **Sticky**: headers that were matched in the previous run keep their match, so a new file version cannot silently re-shuffle columns.
+3. **Exact name** after normalisation.
+4. **Similarity + optimal assignment** (Kuhn-Munkres / Hungarian) over the remaining headers and copybook columns: name segmentation, mainframe abbreviations (`ACCT`, `NBR`, `DT`...), acronyms, `PREV`/`TODAY`/`FEE`/`DIV`/`STM` guards, occurrence-index checks, optional single-letter prefixes (`b_korg` = `KORG`).
+
+Each match carries a score and a status: **ACCEPTED** (score >= 0.70, exact, override or sticky), **REVIEW** (0.35-0.70, mapped but flagged), **UNMAPPED** (header with no copybook column - loaded as its own column, type inferred from data), and **COPYBOOK_ONLY** (copybook column that is not in the file). Thresholds can be tuned with `VSAM_MAP_ACCEPT` / `VSAM_MAP_MIN`.
+
+#### Table column names: `--tbl-col`
+| Value | Table column names | Datatype |
+| :--- | :--- | :--- |
+| `headers` (default) | the S3 file headers | from the mapped copybook column |
+| `copybook` | the mapped copybook column names (unmapped headers keep their own name) | from the mapped copybook column |
+
+The default can also be set with `VSAM_TBL_COL`. The choice is stored in `vsam/outputs/vsam_02_column_map.csv`, which Steps 03, 04, 06 and 07 read, so they cannot disagree. Switching later means re-running Steps 02-05 on fresh tables (existing tables are not renamed).
+
+#### Keys
+A primary key is applied only when it comes from a **copybook KEY/KEM group** (every key column must be an ACCEPTED match) or from a person (`korg_overrides` sheet). Unique columns that the code finds by itself are listed as `candidate key (not applied)` in the report and never become a primary key - a guessed key can be wrong. Tables without a key are replaced by each new snapshot (see Step 06).
 
 ```bash
 # Standard discovery and inventory mapping
@@ -116,13 +145,17 @@ python3 sweep.py vsam inventory --s3 "s3://your-migration-bucket/vsam-flat-files
 # Restrict discovery to a specific source company (e.g. FDIC or AGILETIC)
 python3 sweep.py vsam inventory --company FDIC
 
+# Name the table columns after the copybook instead of the S3 headers (default: --tbl-col headers)
+python3 sweep.py vsam inventory --tbl-col copybook
+
 # Standalone module equivalent (run from the repository root):
 python3 -m vsam.vsam_02_inventory --company FDIC
 ```
 
 * **Outputs Generated**:
   - `vsam/outputs/vsam_02_inventory.csv`, `vsam_02_load_matrix.csv`, `vsam_02_latest_file_headers.csv` (unprefixed legacy copies are also written).
-  - `vsam/reports/<db>_vsam_02_inventory_report_<timestamp>.xlsx`: sheets `Summary`, `FileInventory`, `LatestFileHeaders`.
+  - `vsam/outputs/vsam_02_column_map.csv`: one row per header (and per unused copybook column) - see the `ColumnMapping` sheet below.
+  - `vsam/reports/<db>_vsam_02_inventory_report_<timestamp>.xlsx`: sheets `Summary`, `FileInventory` (adds `key source`, `candidate key (not applied)`, `mapped / review / unmapped columns`), `LatestFileHeaders` and **`ColumnMapping`** (`source_company`, `source_filename`, `latest_filename`, `copybook_name`, `header_position`, `header`, `table_column`, `copybook_field`, `copybook_col`, `pic`, `usage`, `copybook_type`, `pg_type`, `is_key`, `score`, `confidence`, `status`, `method`, `tbl_col_mode`).
 
 > `--latest-only` is available on the standalone module (`python3 -m vsam.vsam_02_inventory --latest-only`); `sweep.py vsam inventory` exposes `--s3` and `--company`.
 
@@ -160,6 +193,8 @@ python3 -m vsam.vsam_03_type_gate --workers 4 --latest-only
   - `vsam/outputs/vsam_03_type_gate.json` and `vsam_03_type_gate_status.csv`: type profiling results, PK candidates, schema routing metadata and column definitions.
   - `vsam/reports/<db>_vsam_03_type_gate_report_<timestamp>.xlsx`: sheets `TypeGateSummary` (11 columns: `S3 file name`, `source key`, `schema`, `copybook`, `table`, `has PK?`, `PK Columns`, `is PK valid`, `has schema_col?`, `schema_col`, `Full S3 URI`), `GateSummary`, `PKVerification`, `SchemaColumnDetect`, `TypeIssues`.
   - A source that fails to profile is recorded as `BLOCKED` with the error text; the step itself still completes.
+  - Types come from the Step 02 column map. A column whose values do not fit its copybook type (for example a header matched to the wrong numeric column) is loaded as `text` instead of turning the values into NULL; the report lists `TYPE_FALLBACK_TEXT`.
+  - Keys found by positional discovery are reported as `KEY_CANDIDATE_NOT_APPLIED` and are never applied.
 
 ---
 
@@ -226,27 +261,32 @@ Streams VSAM flat files directly from S3 into PostgreSQL with live database cons
 - **Default Mode (`python3 sweep.py vsam load-data` or `--mode default`)**:
   * **Fresh Table**: Applies PK constraints from `gen_ddl/<schema>_pk.sql` to available tables in PostgreSQL *before* loading data, validates every record against the PK constraint (`record_passes_pk_validation`), and inserts only valid records.
   * **Existing Table with PK**: Upserts incoming data using the PK constraint (`ON CONFLICT (pk_cols) DO UPDATE SET ...`).
-  * **Existing Table without PK**: **Refuses to touch the table unless `--force-truncate` is given** (see below).
+  * **Existing Table without PK**: replaced by the new snapshot (see *Snapshot replace* below).
 - **Data Mode (`python3 sweep.py vsam load-data --mode data`)**:
   * **Fresh Table**: Does NOT apply PK constraints. Performs direct bulk load.
   * **Existing Table with PK**: Upserts incoming data using the PK constraint.
-  * **Existing Table without PK**: **Refuses to touch the table unless `--force-truncate` is given** (see below).
+  * **Existing Table without PK**: replaced by the new snapshot (see *Snapshot replace* below).
 
-#### Truncation Safety (`--force-truncate`)
-Several source files can feed the same destination table (for example different companies routed to the shared `bcs` schema). SWEEP therefore:
-- never truncates implicitly: a table that already contains rows and has **no primary key** makes the file fail with *"Refusing to TRUNCATE ... without --force-truncate"*;
-- with `--force-truncate`, truncates each such table **once per run** - the first file to reach the table "claims" it, and every later file mapped to the same table **appends** (so earlier files are never wiped);
-- fails the file if the `TRUNCATE` itself fails (it is never ignored).
+#### Snapshot replace for tables without a primary key
+VSAM files are **full snapshots**. A table without a primary key cannot be upserted, so each new snapshot **replaces** it - atomically and automatically:
+1. every file that feeds the table is loaded into one staging table `<table>__sweep_stg` (several files, e.g. different companies into the shared `bcs` schema, share it, so none wipes another);
+2. when the run finishes and **every** file of that table succeeded, one transaction does `TRUNCATE` + `INSERT ... SELECT` from the staging table + the `sweep_ctl.load_log` rows, then drops the staging table;
+3. if any file of the table failed, the staging table is dropped and the table keeps its old data (the sibling files are reported `FAILED: staged data discarded`).
+
+Other rules:
+- Tables **with** a primary key are upserted in place; rows that are missing from a newer snapshot are **not** deleted.
+- A file older than a snapshot of the same source that is already loaded is `SKIPPED`.
+- In a **partial run** (`--company`, `--tables`, `--limit-files`) other source files of a shared table may be missing, so replacing a table that already holds rows needs `--force-truncate`. Full runs need no flag.
 
 ```bash
-# Re-load tables that already contain data and have no PK (truncate once, then load every file)
-python3 sweep.py vsam load-data --mode data --force-truncate --workers 4
+# Replace a populated keyless table from a filtered (partial) run - only when you know no other source feeds it
+python3 sweep.py vsam load-data --company FDIC --force-truncate --workers 4
 
 # Preview which files would be loaded, without touching the database
 python3 sweep.py vsam load-data --dry-run
 ```
 
-> VSAM Step 06 loads in 10,000-row `INSERT` batches (not one transaction per file) and does **not** skip files that were loaded earlier; re-running is idempotent for tables with a PK (upsert) and needs `--force-truncate` for tables without one. Load results are logged per destination schema in `sweep_ctl.load_log` (keyed `<uri>#<schema>`); if that log write fails the file is reported `FAILED`.
+> VSAM Step 06 loads in 10,000-row `INSERT` batches. Keyed tables are written in place (a file that fails part-way can be partially loaded; re-running upserts); keyless tables are atomic thanks to the staging swap. Files that were loaded earlier are processed again (idempotent for both kinds). Load results are logged per destination schema in `sweep_ctl.load_log` (keyed `<uri>#<schema>`); if that log write fails the file is reported `FAILED`.
 
 #### Schema Routing Rules:
 - **No copybook and no korg column**: Loaded **directly into the `bcs` schema**.
@@ -352,10 +392,9 @@ python3 sweep.py status
 python3 sweep.py stop --kill-db
 
 # 3. Resume ingestion:
-# VSAM re-processes every file in the load matrix: tables with a PK are upserted (idempotent);
-# tables without a PK need --force-truncate so rows from the interrupted run are not duplicated.
+# VSAM re-processes every file in the load matrix: tables with a PK are upserted, tables without a PK are
+# replaced by the snapshot (the interrupted run never touched them, thanks to the staging swap).
 python3 sweep.py vsam load-data --workers 4 --bg
-python3 sweep.py vsam load-data --mode data --force-truncate --workers 4 --bg   # PK-less tables
 ```
 
 ### Recipe 2: Initial Fresh Load without Constraints followed by Constrained Upsert

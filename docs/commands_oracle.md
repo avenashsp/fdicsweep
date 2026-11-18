@@ -1,4 +1,4 @@
-# SWEEP CLI Command Reference - Oracle Migration Track (v5.1)
+# SWEEP CLI Command Reference - Oracle Migration Track (v5.2)
 
 Complete command reference for the **Oracle Migration Track** of the SWEEP Unified Data Migration Framework.
 

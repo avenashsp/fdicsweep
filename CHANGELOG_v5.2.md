@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [5.2.0] - 2026-11-18
+
+VSAM column handling and loading release. The Oracle track is unchanged.
+
+### Added
+- **Header-to-copybook column mapping in VSAM Step 02** (`vsam/common_colmap.py`). VSAM files always have a header row whose names and order differ from the copybook, so every S3 header is matched to a copybook column:
+  - precedence: `column_overrides` sheet (new, in `vsam_master_overrides.xlsx`) -> previous run ("sticky", so new file versions cannot re-shuffle columns) -> exact name -> similarity score + **Kuhn-Munkres / Hungarian optimal one-to-one assignment** over what is left (numpy solver, 500x500 in ~0.2 s; verified optimal against brute force);
+  - adapted from the supplied column-mapper prototype: mainframe abbreviation lexicon, name segmentation, acronym and `PREV`/`TODAY`/`FEE`/`DIV`/`STM` guards, occurrence-index checks; **stricter acronym rule** (the whole name must be the acronym, so `FIRST_NAME` no longer matches `FN-ADDR` at 0.98), optional single-letter prefixes on both sides (`b_korg` = `KORG`), cached canonical forms and an exact-match pass before the global assignment;
+  - result per header: score, confidence (`EXACT`/`HIGH`/`MEDIUM`), status `ACCEPTED` (>= 0.70) / `REVIEW` (0.35-0.70) / `UNMAPPED`, plus `COPYBOOK_ONLY` rows for copybook columns that are not in the file (thresholds `VSAM_MAP_ACCEPT` / `VSAM_MAP_MIN`);
+  - **new `ColumnMapping` sheet** in the Step 02 Excel report and `vsam/outputs/vsam_02_column_map.csv`; `FileInventory` gains `key source`, `candidate key (not applied)`, `mapped / review / unmapped columns`.
+- **`--tbl-col {headers,copybook}`** (`sweep.py vsam inventory`, `vsam run-all`, `run-all`, `VSAM_TBL_COL`): table columns are named after the **S3 headers** (default) or after the mapped **copybook columns**; the datatype always comes from the mapped copybook column (unmapped headers become `text`, refined by data profiling). The choice is stored in the column map, which Steps 03, 04, 06 and 07 read, so they cannot disagree.
+- **Snapshot replace for VSAM tables without a primary key.** VSAM files are full snapshots, so a keyless table is replaced by the newest snapshot automatically: all files of the table load into a staging table (`<table>__sweep_stg`) and one transaction truncates, copies and writes the `load_log` rows when every file succeeded; if any file fails the table keeps its old data. A file older than a snapshot already loaded is `SKIPPED`. Tables with a primary key still upsert (rows missing from a newer snapshot are not deleted).
+- Shared tables: when several sources feed one table, columns matched to the same copybook column are named alike and Step 04 creates the union of their columns.
+- `vsam/common_cobol.py`, tests for the four reported copybook layouts (`tests/data/copybooks/`), the mapping (Hungarian optimality, precedence, keys, overrides), snapshot replace (unit + PostgreSQL) and an end-to-end Steps 01-07 run on a throw-away copy of the repository (headers differing from the copybook, `--tbl-col copybook`, snapshot replacement). 214 tests.
+
+### Fixed
+- **Copybooks that Step 01 could not parse** (0 fields or a crash): fixed-format sequence areas in columns 1-6 and 73-80 (`00040001`, change tags such as `106618`), sequence numbers glued to the closing period (`VALUE SPACE.00050001`), `*` comment lines with change tags (`154130****`), `====` banners, `COPY ... REPLACING` names such as `:USA090:-KORG` / `:NEXT-MODEL:-KEY`, multi-line `VALUE LOW-VALUES.`, fields that start with digits, quoted literals containing periods. The two duplicate parsers now share one reader.
+- **Headers that did not match the copybook were loaded as NULL** (rows were keyed by header name, columns came from the copybook, and `row.get()` found nothing). Rows are now keyed through the column map.
+- **Values that do not fit a numeric/date copybook type were silently turned into NULL at load time.** Step 03 now loads such columns as `text` and reports `TYPE_FALLBACK_TEXT`.
+- **File names with other timestamp formats were rejected as `UNPARSEABLE_FILENAME`.** `FDICSWP_<CO>_<SOURCE>_FLAT_<timestamp>` now accepts `MMDDYYYY`, `YYYYMMDD`, `YYMMDD`, `YYYYMMDDHHMMSS`, `YYYYMMDD_HHMMSS` and ISO dates; `parse_filename` previously read every 8-digit stamp as `MMDDYYYY` and returned no date for `YYYYMMDD`.
+- **Auto-discovered keys were applied as primary keys.** A guessed key can be wrong or unstable (a too-narrow key makes upserts merge different records). Positional discovery now only reports a *candidate* (`KEY_CANDIDATE_NOT_APPLIED`); keys come from the copybook (every key column must be an ACCEPTED match) or from `korg_overrides`. Without a copybook the mapping-sheet `korg` column is no longer used as a key either (it is a schema discriminator).
+- `VSAM_COPYBOOK_DIR` is now honoured by Step 01 (it was documented but ignored).
+
+### Changed
+- **`--force-truncate` semantics:** keyless tables are replaced automatically in a full run. The flag is now only needed to replace a populated table in a **partial** run (`--company`, `--tables`, `--limit-files`), where other source files of a shared table might be missing. (In 5.1 it was required for every keyless table that already held rows.)
+- Docs (`docs/`, README) updated for all of the above; version 5.2.0; changelog renamed to `CHANGELOG_v5.2.md`.
+
+### Known limitations
+- Changing `--tbl-col` later means re-running Steps 02-05 on fresh tables; existing tables are not renamed.
+- VSAM loads into keyed tables are still batched `INSERT`s (not one transaction per file).
+- The mapping lexicon is domain-specific; unknown abbreviations score as `REVIEW`/`UNMAPPED` and are corrected through the `column_overrides` sheet.
+- AGILETIC sources keep their v5.0 behaviour (columns and types inferred from the data, no copybook mapping).
+
+---
+
 ## [5.1.0] - 2026-11-18
 
 Reliability, safety and maintainability release. No change to the migration rules (schema routing, `bcs` / KORG

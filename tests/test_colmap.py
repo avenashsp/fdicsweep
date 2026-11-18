@@ -169,3 +169,22 @@ def test_unparseable_filename_is_still_rejected():
 def test_pandas_is_not_needed_for_mapping_itself():
     # map_columns works on plain dicts; DataFrame input is only used for I/O helpers
     assert isinstance(pd.DataFrame(cm.map_columns(["a"], [field("A")])), pd.DataFrame)
+
+
+def test_column_overrides_sheet_is_read(tmp_path, monkeypatch):
+    import openpyxl
+    wbp = tmp_path / "ov.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "column_overrides"
+    ws.append(["sourcecompany", "filename", "header", "copybook_column"])
+    ws.append(["FDIC", "ACHFILE", "Weird Name", "ACH-STATUS-CD"])
+    ws.append(["", "FDICSWP_FDIC_ACHFILE_FLAT_20240101.csv", "amount", ""])
+    wb.save(wbp)
+    monkeypatch.setattr(cm, "MASTER_OVERRIDES_FILE", wbp)
+    ov = cm.load_column_overrides()
+    merged = cm.overrides_for(ov, "FDIC", "ACHFILE", "FDICSWP_FDIC_ACHFILE_FLAT_20240101.csv")
+    assert merged == {"weird_name": "ach_status_cd", "amount": ""}
+    assert cm.overrides_for(ov, "OTHER", "ACHFILE", "x.csv") == {}
+    monkeypatch.setattr(cm, "MASTER_OVERRIDES_FILE", tmp_path / "missing.xlsx")
+    assert cm.load_column_overrides() == {}

@@ -36,7 +36,7 @@ def test_cli_version_and_help_run():
     for args in (["--version"], ["oracle", "--help"], ["vsam", "load-data", "--help"], ["run-all", "--help"]):
         r = subprocess.run([sys.executable, "sweep.py", *args], cwd=sweep.BASE_DIR, capture_output=True, text=True)
         assert r.returncode == 0, (args, r.stderr)
-    assert "5.1" in subprocess.run([sys.executable, "sweep.py", "--version"], cwd=sweep.BASE_DIR,
+    assert "5.2" in subprocess.run([sys.executable, "sweep.py", "--version"], cwd=sweep.BASE_DIR,
                                    capture_output=True, text=True).stdout
 
 
