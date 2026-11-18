@@ -21,18 +21,11 @@ from pathlib import Path
 from collections import defaultdict
 import pandas as pd
 
-_ROOT = Path(__file__).resolve().parent.parent
-_TRACK = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-if str(_TRACK) not in sys.path:
-    sys.path.insert(0, str(_TRACK))
-
 from sweep_common import (
     VSAM_REPORTS_DIR, VSAM_S3_BUCKET, AWS_REGION,
     get_logger, get_timestamp, get_db_name, generate_excel_report
 )
-from vsam_common import (
+from vsam.vsam_common import (
     BASE, get_vsam_folders, COPYBOOK_DIR, OUT,
     ref_tables, copybook_overrides,
     copybook_ref, find_copybook_files, match_source, parse_filename,
@@ -313,7 +306,7 @@ def main():
 
             if not cb_cols and files_found:
                 try:
-                    from vsam_01_extract_copybooks import parse_copybook_with_keys
+                    from vsam.vsam_01_extract_copybooks import parse_copybook_with_keys
                     target_cb_file = next((f for f in files_found if f.exists()), None)
                     if target_cb_file:
                         fields = parse_copybook_with_keys(target_cb_file)
@@ -675,4 +668,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(0 if main() is not False else 1)

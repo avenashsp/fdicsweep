@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-import sys
-from pathlib import Path
-_ROOT = Path(__file__).resolve().parent.parent
-_TRACK = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-if str(_TRACK) not in sys.path:
-    sys.path.insert(0, str(_TRACK))
-
 """
 04_generateDDL.py - Target DDL Generator (Bare Tables & Partitions) + View/Trigger Translation
 Enforces migration rules:
@@ -947,4 +938,5 @@ if __name__ == "__main__":
     owners = {o.strip().upper() for o in args.owners.split(",")} if args.owners else None
     tables = {t.strip().upper() for t in args.tables.split(",")} if args.tables else None
 
-    generate_ddl(owners_filter=owners, tables_filter=tables)
+    ok = generate_ddl(owners_filter=owners, tables_filter=tables)
+    sys.exit(0 if ok else 1)

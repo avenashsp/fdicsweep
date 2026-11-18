@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-import sys
-from pathlib import Path
-_ROOT = Path(__file__).resolve().parent.parent
-_TRACK = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-if str(_TRACK) not in sys.path:
-    sys.path.insert(0, str(_TRACK))
-
 """
 01_extractMetadata.py - Stream Extract Metadata from Master Oracle SQL Dump
 Parses an Oracle SQL dump file (Data Pump SQLFILE or DBMS_METADATA export) placed in:
@@ -833,4 +824,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     owners = {o.strip().upper() for o in args.owners.split(",")} if args.owners else None
-    extract_metadata_from_master(sql_file_path=args.file, owners_filter=owners)
+    ok = extract_metadata_from_master(sql_file_path=args.file, owners_filter=owners)
+    sys.exit(0 if ok else 1)

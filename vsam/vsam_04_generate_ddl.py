@@ -30,18 +30,11 @@ import argparse
 from pathlib import Path
 import pandas as pd
 
-_ROOT = Path(__file__).resolve().parent.parent
-_TRACK = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-if str(_TRACK) not in sys.path:
-    sys.path.insert(0, str(_TRACK))
-
 from sweep_common import (
     VSAM_OUTPUTS_DIR, VSAM_GEN_DDL_DIR, VSAM_REPORTS_DIR,
     get_logger, get_timestamp, get_db_name, generate_excel_report, run_psql
 )
-from vsam_common import (
+from vsam.vsam_common import (
     OUT, q, norm_col, load_csv_safe, get_korg_override_pkey,
     get_all_active_schemas
 )
@@ -357,4 +350,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(0 if main() is not False else 1)

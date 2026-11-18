@@ -39,25 +39,19 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 
-_ROOT = Path(__file__).resolve().parent.parent
-_TRACK = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-if str(_TRACK) not in sys.path:
-    sys.path.insert(0, str(_TRACK))
-
 from sweep_common import (
     VSAM_GEN_DDL_DIR,
     VSAM_LOGS_DIR, VSAM_REPORTS_DIR, DEFAULT_WORKERS,
-    STREAM_SCRIPT, AWS_REGION, CTL_SCHEMA,
+    CTL_SCHEMA,
     get_logger, get_timestamp, get_db_name, generate_excel_report,
     run_psql, q, lit
 )
+from sweep_platform import atomic_write_json
 from collections import defaultdict
-from vsam_common import (
-    OUT, read_json, delim_for, pg_delim, pg_quote,
+from vsam.vsam_common import (
+    OUT, read_json, delim_for,
     norm_col, load_csv_safe, filter_latest_versions,
-    is_blank_record, match_schema_by_last3,
+    match_schema_by_last3,
     AUDIT_COL_NAMES, build_table_ddl, check_table_exists,
     get_all_active_schemas, _opener,
     record_passes_pk_validation, get_pk_validation_failure_reason
@@ -78,10 +72,9 @@ def _flush_active_streams():
             item = dict(w)
             item["seconds"] = max(1, int(now - item.get("start_time", now)))
             items.append(item)
-        with open(ACTIVE_WORKERS_FILE, "w", encoding="utf-8") as fp:
-            json.dump(items, fp)
-    except Exception:
-        pass
+        atomic_write_json(ACTIVE_WORKERS_FILE, items)
+    except OSError as e:
+        logger.debug(f"Could not write active worker state: {e}")
 
 
 def record_stream_start(worker_id, schema, table, full_path, filename, size_mb=0):
@@ -115,171 +108,59 @@ def record_stream_end(worker_id):
         _flush_active_streams()
 
 
-def _is_schema_match(val, target_val):
-    """Dynamically matches column value to target schema discriminator value."""
-    if val is None or target_val is None:
+# -----------------------------------------------------------------------------
+# Truncate-once-per-run bookkeeping
+# -----------------------------------------------------------------------------
+# Several source files (e.g. different companies routed to the shared 'bcs' schema) can map to the
+# SAME target table. A table is therefore "claimed" by the first file that touches it in this run;
+# only that first claim may TRUNCATE (and only with --force-truncate). Later files always append /
+# upsert, so they can never wipe rows loaded earlier in the same run.
+FORCE_TRUNCATE = False
+_CLAIM_LOCK = threading.Lock()
+_CLAIMED_TABLES = set()
+
+
+def claim_table(dest_schema, table, strategy):
+    """
+    Called once per (file, destination table). Truncates the table at most once per run and only
+    when the operator opted in. Raises RuntimeError when truncation is needed but not permitted,
+    or when the TRUNCATE itself fails (a failed truncate must never be ignored: it would leave old
+    rows in place and silently duplicate data).
+    Returns True when this call truncated the table.
+    """
+    key = (dest_schema.lower(), table.lower())
+    with _CLAIM_LOCK:
+        if key in _CLAIMED_TABLES:
+            return False
+        if strategy["action"] == "TRUNCATE_AND_LOAD":
+            if not FORCE_TRUNCATE:
+                raise RuntimeError(
+                    f"{dest_schema}.{table} already contains rows and has no primary key. Refusing to TRUNCATE it "
+                    f"without --force-truncate (re-run with that flag to truncate once and reload)."
+                )
+            run_psql(f"TRUNCATE TABLE {q(dest_schema)}.{q(table)};")
+            _CLAIMED_TABLES.add(key)
+            return True
+        _CLAIMED_TABLES.add(key)
         return False
-    v = str(val).strip()
-    tv = str(target_val).strip()
-    if not v or not tv:
-        return False
-    if v == tv or v.lower() == tv.lower():
-        return True
-    if len(v) >= len(tv) and v[-len(tv):] == tv:
-        return True
-    if (v.lstrip("0") or "0") == (tv.lstrip("0") or "0"):
-        return True
-    return False
 
 
-def _load_via_pipe(full_path, schema, table, cols, stg_def, qcols, sel,
-                   key_cols, conflict, has_header, d, worker_id, t0, size_bytes):
-    """Load full file via COPY FROM PROGRAM bash pipe with upsert on PK conflict."""
-    h_str = "true" if has_header else "false"
-    dl = pg_delim(d) + pg_quote(full_path)
-    opts = f"FORMAT csv, HEADER {h_str}, DELIMITER {dl}, ENCODING 'UTF8'"
-    tgt = f"{q(schema)}.{q(table)}"
-    pipe_cmd = f"bash {STREAM_SCRIPT} {full_path} {AWS_REGION}"
-
-    # Filter out blank records (where all columns are NULL or whitespace or literal null)
-    non_blank_clause = " OR ".join(
-        f"(NULLIF(btrim({q(c)}), '') IS NOT NULL AND lower(btrim({q(c)})) NOT IN ('nan', 'none', 'null'))"
-        for c in cols
+def write_load_log(full_path, dest_schema, table, size_bytes, rows, seconds, worker_id, status="SUCCESS", message=None):
+    """
+    Records a per-destination-schema load in sweep_ctl.load_log (keyed `<uri>#<schema>`, which Step 07
+    strips). Errors propagate: a lost log row would cause the file to be reloaded.
+    """
+    msg_cols = ", message" if message else ""
+    msg_val = f", {lit(message)}" if message else ""
+    msg_upd = f", message={lit(message)}" if message else ""
+    run_psql(
+        f"INSERT INTO {CTL_SCHEMA}.load_log "
+        f"(uri, target_schema, target_table, size_bytes, loaded_rows, seconds, worker_id, status{msg_cols}, loaded_at) "
+        f"VALUES ({lit(f'{full_path}#{dest_schema}')}, {lit(dest_schema)}, {lit(table)}, {size_bytes}, "
+        f"{int(rows)}, {seconds}, {worker_id}, {lit(status)}{msg_val}, now()) "
+        f"ON CONFLICT (uri) DO UPDATE SET status={lit(status)}, loaded_rows={int(rows)}, "
+        f"seconds={seconds}, loaded_at=now(){msg_upd};"
     )
-    where_filter = f"WHERE ({non_blank_clause})"
-
-    # Intra-file deduplication for ON CONFLICT DO UPDATE
-    if key_cols:
-        select_src = f"SELECT DISTINCT ON ({', '.join(q(k) for k in key_cols)}) {sel} FROM _stg {where_filter}"
-    else:
-        select_src = f"SELECT {sel} FROM _stg {where_filter}"
-
-    sql = f"""\\set ON_ERROR_STOP on
-BEGIN;
-CREATE TEMP TABLE _stg ({stg_def}) ON COMMIT DROP;
-\\copy _stg ({qcols}) FROM PROGRAM '{pipe_cmd}' WITH ({opts});
-INSERT INTO {tgt} ({qcols})
-  {select_src}{conflict};
-INSERT INTO {CTL_SCHEMA}.load_log (uri, target_schema, target_table, size_bytes, loaded_rows, seconds, worker_id, status, loaded_at)
-  VALUES ({lit(full_path)}, {lit(schema)}, {lit(table)}, {size_bytes},
-    (SELECT count(*) FROM _stg {where_filter}), {time.time() - t0:.2f}, {worker_id}, 'SUCCESS', now())
-  ON CONFLICT (uri) DO UPDATE SET status='SUCCESS', size_bytes={size_bytes}, loaded_rows=(SELECT count(*) FROM _stg {where_filter}), loaded_at=now();
-COMMIT;
-"""
-    run_psql(sql)
-    try:
-        cnt_res = run_psql(f"SELECT loaded_rows FROM {CTL_SCHEMA}.load_log WHERE uri = {lit(full_path)};", tuples_only=True)
-        return int(cnt_res.strip())
-    except Exception:
-        return -1
-
-
-def _load_filtered(full_path, schema, table, cols, type_map, key_cols,
-                   schema_col, target_val, has_header, d, worker_id, t0, size_bytes):
-    """
-    Read file in-process, dynamically filter rows matching target_val for this schema,
-    deduplicate intra-batch keys, and execute UPSERT batches via psql.
-    """
-    total_rows = 0
-    tgt = f"{q(schema)}.{q(table)}"
-    qcols = ", ".join(q(c) for c in cols)
-
-    def cast_val(col_name, val):
-        t = type_map.get(col_name, "text")
-        if val is None or str(val).strip() == "":
-            return "NULL"
-        v = str(val).strip().replace("'", "''")
-        if t.startswith(("varchar", "text", "char")):
-            return f"'{v}'"
-        if t == "date":
-            if re.match(r"^\d{4}-\d{2}-\d{2}$", v) and not v.startswith("9999"):
-                return f"'{v}'::date"
-            return "NULL"
-        return f"'{v}'::{t}"
-
-    BATCH = 10000
-    batch_rows = []
-
-    # Build upsert conflict clause
-    if key_cols:
-        upd_cols = [c for c in cols if c not in key_cols]
-        if upd_cols:
-            upd = ", ".join(f"{q(c)} = EXCLUDED.{q(c)}" for c in upd_cols)
-            upd += ', "modifiedby" = CURRENT_USER, "modifieddate" = CURRENT_TIMESTAMP'
-            conflict_clause = f' ON CONFLICT ({", ".join(q(k) for k in key_cols)}) DO UPDATE SET {upd}'
-        else:
-            conflict_clause = f' ON CONFLICT ({", ".join(q(k) for k in key_cols)}) DO NOTHING'
-    else:
-        conflict_clause = ""
-
-    def flush_batch():
-        nonlocal total_rows
-        if not batch_rows:
-            return
-
-        # Deduplicate within batch on key_cols to avoid PostgreSQL conflict error
-        if key_cols:
-            dedup = {}
-            for r in batch_rows:
-                k = tuple(r.get(kc) for kc in key_cols)
-                dedup[k] = r
-            to_insert = list(dedup.values())
-        else:
-            to_insert = batch_rows
-
-        vals = ",\n".join(
-            "(" + ", ".join(cast_val(c, row.get(c)) for c in cols) + ")"
-            for row in to_insert
-        )
-        sql = f"INSERT INTO {tgt} ({qcols}) VALUES\n{vals}{conflict_clause};\n"
-        run_psql(sql)
-        total_rows += len(to_insert)
-        record_stream_progress(worker_id, len(to_insert))
-        batch_rows.clear()
-
-    # Open file (local or S3)
-    with _opener(full_path) as f:
-        if not has_header:
-            reader = csv.reader(f, delimiter=d)
-            for raw_row in reader:
-                # Ignore record completely if all columns are NULL, empty, or whitespace
-                if is_blank_record(raw_row):
-                    continue
-                row = dict(zip(cols, raw_row))
-                sc_val = row.get(schema_col, "")
-                if _is_schema_match(sc_val, target_val):
-                    batch_rows.append(row)
-                    if len(batch_rows) >= BATCH:
-                        flush_batch()
-        else:
-            reader = csv.DictReader(f, delimiter=d)
-            for raw_row in reader:
-                # Ignore record completely if all columns are NULL, empty, or whitespace
-                if is_blank_record(raw_row.values()):
-                    continue
-                row = {norm_col(k): v for k, v in raw_row.items()}
-                sc_val = row.get(schema_col, "")
-                if _is_schema_match(sc_val, target_val):
-                    batch_rows.append(row)
-                    if len(batch_rows) >= BATCH:
-                        flush_batch()
-
-    flush_batch()
-
-    # Log to control table
-    try:
-        log_sql = (
-            f"INSERT INTO {CTL_SCHEMA}.load_log "
-            f"(uri, target_schema, target_table, size_bytes, loaded_rows, seconds, worker_id, status, loaded_at) "
-            f"VALUES ({lit(full_path)}, {lit(schema)}, {lit(table)}, {size_bytes}, "
-            f"{total_rows}, {time.time() - t0:.2f}, {worker_id}, 'SUCCESS', now()) "
-            f"ON CONFLICT (uri) DO UPDATE SET status='SUCCESS', loaded_rows={total_rows}, loaded_at=now();"
-        )
-        run_psql(log_sql)
-    except Exception:
-        pass
-
-    return total_rows
 
 
 def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
@@ -372,9 +253,8 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
         type_map = {c["col_name"]: type_overrides.get(c["col_name"], c.get("sql_type", "text")) for c in columns_meta if c.get("is_filler") != "YES"}
 
         # Dynamic strategy per destination schema (inspects PostgreSQL live)
-        from vsam_common import check_table_load_strategy
+        from vsam.vsam_common import check_table_load_strategy
         schema_strategies = {}
-        truncated_schemas = set()
 
         def get_schema_strategy(dest_s):
             if dest_s not in schema_strategies:
@@ -384,8 +264,9 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
                         pre_sql, _ = build_table_ddl(dest_s, table, columns_meta, [])
                         run_psql(f"CREATE SCHEMA IF NOT EXISTS {q(dest_s)};\n{pre_sql}")
                         logger.info(f"[Worker {worker_id}] Provisioned table {dest_s}.{table} on the fly.")
-                    except Exception as pe:
-                        logger.debug(f"Could not provision {dest_s}.{table} on the fly: {pe}")
+                    except RuntimeError as pe:
+                        # The load below will fail with the real database error if the table is truly missing.
+                        logger.warning(f"Could not provision {dest_s}.{table} on the fly: {pe}")
 
                 strat = check_table_load_strategy(
                     dest_s, table,
@@ -393,13 +274,10 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
                     mode=mode
                 )
                 schema_strategies[dest_s] = strat
-                if strat["action"] == "TRUNCATE_AND_LOAD" and dest_s not in truncated_schemas:
-                    logger.info(f"[Worker {worker_id}] Table {dest_s}.{table} has existing data and NO PK constraints. Truncating mapped table before load...")
-                    try:
-                        run_psql(f"TRUNCATE TABLE {q(dest_s)}.{q(table)};")
-                    except Exception as te:
-                        logger.debug(f"Could not truncate {dest_s}.{table} ({te})")
-                    truncated_schemas.add(dest_s)
+                if claim_table(dest_s, table, strat):
+                    logger.info(f"[Worker {worker_id}] Table {dest_s}.{table} had existing data and NO PK constraints. Truncated once (--force-truncate) before load.")
+                elif strat["action"] == "TRUNCATE_AND_LOAD":
+                    logger.info(f"[Worker {worker_id}] Table {dest_s}.{table} already loaded earlier in this run (no PK). Appending.")
                 elif strat["action"] == "UPSERT":
                     logger.info(f"[Worker {worker_id}] Table {dest_s}.{table} has existing data and active PK ({', '.join(strat['pk_cols'])}). Upsert enabled.")
                 elif strat["action"] == "INSERT_FRESH":
@@ -474,71 +352,42 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
         skipped_records = []
         total_rows_read = 0
 
+        def route_row(row_idx, row):
+            """Routes one parsed record to its destination schema batch (or the skipped list)."""
+            if not has_schema_col or not schema_col or schema_col not in row or schema_col == "NO_KORG":
+                dest_s = "bcs"
+            else:
+                dest_s = match_schema_by_last3(row.get(schema_col), target_schemas)
+
+            strat = get_schema_strategy(dest_s)
+            if strat["has_pk"] and not record_passes_pk_validation(row, strat["pk_cols"]):
+                # Table has a PK constraint: load only records that pass PK validation
+                skipped_records.append({
+                    "s3_filename": filename,
+                    "table": table,
+                    "row_num": row_idx,
+                    "dest_schema_attempted": dest_s,
+                    "skipped_reason": get_pk_validation_failure_reason(row, strat["pk_cols"]),
+                    "pk_cols": ", ".join(strat["pk_cols"]),
+                    "pk_values": json.dumps({k: row.get(k) for k in strat["pk_cols"]}),
+                    "record_sample": json.dumps(row),
+                    "full_path": full_path
+                })
+                return
+            # Table has NO PK constraint -> load ALL records (NULL / blank / sentinel values are kept)
+            dest_batches[dest_s].append(row)
+            if len(dest_batches[dest_s]) >= BATCH:
+                flush_batch(dest_s)
+
         with _opener(full_path) as f:
             if not has_header:
-                reader = csv.reader(f, delimiter=d)
-                for row_idx, raw_row in enumerate(reader, start=1):
+                for row_idx, raw_row in enumerate(csv.reader(f, delimiter=d), start=1):
                     total_rows_read += 1
-                    row = dict(zip(cols, raw_row))
-                    if not has_schema_col or not schema_col or schema_col not in row or schema_col == "NO_KORG":
-                        dest_s = "bcs"
-                    else:
-                        dest_s = match_schema_by_last3(row.get(schema_col), target_schemas)
-
-                    strat = get_schema_strategy(dest_s)
-                    if strat["has_pk"]:
-                        # Table has PK constraint: load only records that pass PK validation
-                        if not record_passes_pk_validation(row, strat["pk_cols"]):
-                            reason = get_pk_validation_failure_reason(row, strat["pk_cols"])
-                            skipped_records.append({
-                                "s3_filename": filename,
-                                "table": table,
-                                "row_num": row_idx,
-                                "dest_schema_attempted": dest_s,
-                                "skipped_reason": reason,
-                                "pk_cols": ", ".join(strat["pk_cols"]),
-                                "pk_values": json.dumps({k: row.get(k) for k in strat["pk_cols"]}),
-                                "record_sample": json.dumps(row),
-                                "full_path": full_path
-                            })
-                            continue
-                    # Else: Table has NO PK constraint -> load ALL records (do not remove/ignore NULL, blank, empty whitespace, or sentinel values)
-
-                    dest_batches[dest_s].append(row)
-                    if len(dest_batches[dest_s]) >= BATCH:
-                        flush_batch(dest_s)
+                    route_row(row_idx, dict(zip(cols, raw_row)))
             else:
-                reader = csv.DictReader(f, delimiter=d)
-                for row_idx, raw_row in enumerate(reader, start=2):
+                for row_idx, raw_row in enumerate(csv.DictReader(f, delimiter=d), start=2):
                     total_rows_read += 1
-                    row = {norm_col(k): v for k, v in raw_row.items()}
-                    if not has_schema_col or not schema_col or schema_col not in row or schema_col == "NO_KORG":
-                        dest_s = "bcs"
-                    else:
-                        dest_s = match_schema_by_last3(row.get(schema_col), target_schemas)
-
-                    strat = get_schema_strategy(dest_s)
-                    if strat["has_pk"]:
-                        # Table has PK constraint: load only records that pass PK validation
-                        if not record_passes_pk_validation(row, strat["pk_cols"]):
-                            reason = get_pk_validation_failure_reason(row, strat["pk_cols"])
-                            skipped_records.append({
-                                "s3_filename": filename,
-                                "table": table,
-                                "row_num": row_idx,
-                                "dest_schema_attempted": dest_s,
-                                "skipped_reason": reason,
-                                "pk_cols": ", ".join(strat["pk_cols"]),
-                                "pk_values": json.dumps({k: row.get(k) for k in strat["pk_cols"]}),
-                                "record_sample": json.dumps(row),
-                                "full_path": full_path
-                            })
-                            continue
-                    # Else: Table has NO PK constraint -> load ALL records (do not remove/ignore NULL, blank, empty whitespace, or sentinel values)
-
-                    dest_batches[dest_s].append(row)
-                    if len(dest_batches[dest_s]) >= BATCH:
-                        flush_batch(dest_s)
+                    route_row(row_idx, {norm_col(k): v for k, v in raw_row.items()})
 
         for dest_s in list(dest_batches.keys()):
             flush_batch(dest_s)
@@ -565,29 +414,9 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
         else:
             skipped_summary = "None (0 skipped)" if has_pk_flag else "None (table has no PK constraint; 100% rows loaded)"
 
-        # Log load for each schema
+        # Log load for each schema (errors propagate -> the file is reported FAILED, never silently unlogged)
         for dest_s, cnt in dest_loaded.items():
-            try:
-                log_sql = (
-                    f"INSERT INTO {CTL_SCHEMA}.load_log "
-                    f"(uri, target_schema, target_table, size_bytes, loaded_rows, seconds, worker_id, status, loaded_at) "
-                    f"VALUES ({lit(full_path)}, {lit(dest_s)}, {lit(table)}, {size_bytes}, "
-                    f"{cnt}, {dur}, {worker_id}, 'SUCCESS', now()) "
-                    f"ON CONFLICT (uri, target_schema) DO UPDATE SET status='SUCCESS', loaded_rows={cnt}, loaded_at=now();"
-                )
-                run_psql(log_sql)
-            except Exception:
-                try:
-                    log_sql = (
-                        f"INSERT INTO {CTL_SCHEMA}.load_log "
-                        f"(uri, target_schema, target_table, size_bytes, loaded_rows, seconds, worker_id, status, loaded_at) "
-                        f"VALUES ({lit(f'{full_path}#{dest_s}')}, {lit(dest_s)}, {lit(table)}, {size_bytes}, "
-                        f"{cnt}, {dur}, {worker_id}, 'SUCCESS', now()) "
-                        f"ON CONFLICT (uri) DO UPDATE SET status='SUCCESS', loaded_rows={cnt}, loaded_at=now();"
-                    )
-                    run_psql(log_sql)
-                except Exception:
-                    pass
+            write_load_log(full_path, dest_s, table, size_bytes, cnt, dur, worker_id)
 
         bcs_loaded = dest_loaded.get("bcs", 0)
         if mapped_schemas_set == {"bcs"}:
@@ -638,9 +467,10 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
             "error": ""
         }
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - worker boundary: report any failure for this file, never kill the pool
         dur = round(time.time() - t0, 2)
         err = str(e)[:300]
+        logger.error(f"[Worker {worker_id}] Load failed for {filename}: {e}")
         schema_str = ",".join(target_schemas)
         try:
             fail_sql = (
@@ -650,8 +480,8 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
                 f"ON CONFLICT (uri) DO UPDATE SET status='FAILED', message={lit(err)}, loaded_at=now();"
             )
             run_psql(fail_sql)
-        except Exception:
-            pass
+        except RuntimeError as log_err:
+            logger.error(f"[Worker {worker_id}] Could not record FAILED status for {filename}: {log_err}")
         return {
             "s3_filename": filename,
             "filename": filename,
@@ -686,135 +516,8 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
         record_stream_end(worker_id)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Step 06: Stream VSAM data from S3 to PostgreSQL with dynamic upsert and schema segregation.")
-    parser.add_argument("--mode", choices=["default", "data"], default="default", help="Ingestion mode: default (apply PK to fresh tables, validate records, upsert) or data (no PK on fresh tables, direct load)")
-    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
-    parser.add_argument("--company", help="Comma-separated company filter")
-    parser.add_argument("--tables", help="Comma-separated tables to load")
-    parser.add_argument("--limit-files", type=int, help="Limit number of files loaded")
-    parser.add_argument("--latest-only", "--latest-version-only", action="store_true", help="Load only the latest file version per table (based on timestamp in filename)")
-    parser.add_argument("--bg", action="store_true", help="Run in background daemon mode")
-    args = parser.parse_args()
-
-    run_id = get_timestamp()
-    logger.info("=" * 75)
-    logger.info(f"SWEEP VSAM MIGRATION - STEP 06: S3 STREAMING INGESTION (Run: {run_id})")
-    logger.info(f"Workers: {args.workers}")
-    logger.info("Strategy: Live Database Inspection (Direct load for fresh tables; Dynamic Upsert if PK exists; Truncate & load if no PK)")
-    if args.latest_only:
-        logger.info("Version Filter: LATEST FILE VERSION ONLY (--latest-only active)")
-    else:
-        logger.info("Version Filter: LATEST FILE VERSION (Preserving all mapped destination schemas)")
-    logger.info("=" * 75)
-
-    # Load Step 02 load matrix
-    lm_file = OUT / "vsam_02_load_matrix.csv" if (OUT / "vsam_02_load_matrix.csv").exists() else OUT / "load_matrix.csv"
-    lm = load_csv_safe(lm_file)
-
-    if args.company:
-        cos = [c.strip().upper() for c in args.company.split(",")]
-        lm = lm[lm["source_company"].isin(cos)]
-    if args.tables:
-        tbls = [t.strip().lower() for t in args.tables.split(",")]
-        lm = lm[lm["target_table"].isin(tbls)]
-
-    if lm.empty:
-        logger.warning("Load matrix is empty. Nothing to load.")
-        sys.exit(0)
-
-    # MAJOR CHANGE: Only consider the single latest version for each file
-    orig_count = len(lm)
-    src_col = "source_filename" if "source_filename" in lm.columns else "source_file"
-    lm = filter_latest_versions(lm, ["source_company", src_col])
-
-    # Sort files based on file size (small to large)
-    lm["_size_mb"] = pd.to_numeric(lm["size_mb"], errors="coerce").fillna(0.0)
-    lm = lm.sort_values(by="_size_mb", ascending=True).reset_index(drop=True)
-    lm = lm.drop(columns=["_size_mb"])
-    logger.info(f"Filtered to latest file versions and sorted small to large: {len(lm)} tasks (was {orig_count})")
-
-    if args.limit_files:
-        lm = lm.head(args.limit_files)
-
-    # Load copybook metadata from Step 01
-    cb_csv = OUT / "vsam_01_copybook_extracts.csv"
-    cb_meta = {}
-    if cb_csv.exists():
-        cb_df = pd.read_csv(cb_csv, dtype=str).fillna("")
-        for cb_name, grp in cb_df.groupby("copybook_file"):
-            cb_key = cb_name.upper().split(".")[0]
-            cb_meta[cb_key] = grp.to_dict(orient="records")
-
-    # Load type-gate profile from Step 03
-    tg_file = OUT / "vsam_03_type_gate.json"
-    tg_prof = read_json(tg_file, default={})
-
-    tasks = []
-    skipped = 0
-
-    # Group by file so each unique file is streamed once and segregated to target schemas + bcs
-    for (co, src, fp, tbl), grp in lm.groupby(["source_company", src_col, "full_path", "target_table"], sort=False):
-        target_schemas = list(grp["target_schema"].dropna().unique())
-        rec = grp.iloc[0].to_dict()
-        rec["target_schemas"] = target_schemas
-        tasks.append(rec)
-
-    logger.info(f"Total tasks: {len(lm)} | Already loaded (skipping): {skipped} | Pending: {len(tasks)}")
-
-    if not tasks:
-        logger.info("All files already loaded successfully. Nothing to do.")
-        sys.exit(0)
-
-    # In Default Mode: Apply PK constraints to available tables before streaming
-    if args.mode == "default":
-        pk_file = VSAM_GEN_DDL_DIR / "all_pk.sql"
-        if pk_file.exists():
-            logger.info(f"[Default Mode] Applying PK constraints to available tables before loading data: {pk_file}")
-            try:
-                run_psql(pk_file, is_file=True)
-                logger.info("[+] PK constraints applied to available tables.")
-            except Exception as pe:
-                logger.debug(f"Note during pre-applying PK constraints: {pe}")
-
-    results = []
-    max_workers = min(args.workers, max(1, len(tasks)))
-    logger.info(f"Starting ingestion with {max_workers} worker threads...")
-
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        future_map = {
-            pool.submit(load_segregated, task, i % max_workers + 1, run_id, tg_prof, cb_meta, args.mode): task
-            for i, task in enumerate(tasks)
-        }
-        for fut in as_completed(future_map):
-            task = future_map[fut]
-            try:
-                res = fut.result()
-                results.append(res)
-                st = res.get("status", "UNKNOWN")
-                rows = res.get("rows_loaded", 0)
-                sec = res.get("seconds", 0)
-                logger.info(f"[{st}] {res.get('schema')}.{res.get('table')} <- {res.get('filename')} ({rows} rows, {sec}s)")
-            except Exception as e:
-                logger.error(f"[ERROR] Task failed for {task.get('s3_filename')}: {e}")
-                results.append({
-                    "schema": task.get("target_schema"), "table": task.get("target_table"),
-                    "uri": task.get("full_path"), "filename": task.get("s3_filename"),
-                    "s3_filename": task.get("s3_filename"),
-                    "copybook_display": task.get("copybook_map") or "NO_COPYBOOK",
-                    "korg_display": task.get("korg_map") or "NO_KORG",
-                    "total_records": 0, "records_loaded": 0, "skipped_count": 0,
-                    "records_loaded_mapped": 0, "records_loaded_unmapped": 0, "records_loaded_bcs": 0,
-                    "load_pct": "0%", "status": "FAILED", "seconds": 0, "worker_id": 0, "rows_loaded": 0,
-                    "error": str(e)[:300], "schema_counts": {}
-                })
-
-    record_stream_end(None)
-
-    # Save outputs and report
-    ts = get_timestamp()
-    log_csv = OUT / f"vsam_06_load_log_{run_id}.csv"
-
+def build_load_summary(results):
+    """Flattens per-file load results into the LoadSummary rows and the skipped-record rows."""
     load_summary_rows = []
     all_skipped_rows = []
 
@@ -857,6 +560,11 @@ def main():
                 "Full S3 URI": sk.get("full_path", "")
             })
 
+    return load_summary_rows, all_skipped_rows
+
+
+def build_schema_breakdown(results):
+    """Pivot: one row per file/table, one column per schema, loaded-record counts at the intersections."""
     # SchemaBreakdown sheet: list the s3 filenames and tablenames as rows and list the schema names as columns and put the loaded record counts on the intersection (file/table - schema).
     active_schemas = get_all_active_schemas()
     discovered_schemas = set()
@@ -903,6 +611,155 @@ def main():
             dummy_row[s] = 0
         dummy_row["Total"] = 0
         schema_breakdown_rows.append(dummy_row)
+
+    return schema_breakdown_rows
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Step 06: Stream VSAM data from S3 to PostgreSQL with dynamic upsert and schema segregation.")
+    parser.add_argument("--mode", choices=["default", "data"], default="default", help="Ingestion mode: default (apply PK to fresh tables, validate records, upsert) or data (no PK on fresh tables, direct load)")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    parser.add_argument("--company", help="Comma-separated company filter")
+    parser.add_argument("--tables", help="Comma-separated tables to load")
+    parser.add_argument("--limit-files", type=int, help="Limit number of files loaded")
+    parser.add_argument("--latest-only", "--latest-version-only", action="store_true", help="Load only the latest file version per table (based on timestamp in filename)")
+    parser.add_argument("--force-truncate", action="store_true",
+                        help="Allow TRUNCATE of existing tables that have rows but no primary key (once per table per run). "
+                             "Without it such tables make the file fail instead of being wiped.")
+    parser.add_argument("--dry-run", action="store_true", help="List the files and tables that would be loaded, then exit without writing")
+    parser.add_argument("--bg", action="store_true", help="Run in background daemon mode")
+    args = parser.parse_args()
+
+    global FORCE_TRUNCATE
+    FORCE_TRUNCATE = args.force_truncate
+
+    run_id = get_timestamp()
+    logger.info("=" * 75)
+    logger.info(f"SWEEP VSAM MIGRATION - STEP 06: S3 STREAMING INGESTION (Run: {run_id})")
+    logger.info(f"Workers: {args.workers}")
+    logger.info("Strategy: Live Database Inspection (Direct load for fresh tables; Dynamic Upsert if PK exists; Truncate & load if no PK)")
+    if args.latest_only:
+        logger.info("Version Filter: LATEST FILE VERSION ONLY (--latest-only active)")
+    else:
+        logger.info("Version Filter: LATEST FILE VERSION (Preserving all mapped destination schemas)")
+    logger.info("=" * 75)
+
+    # Load Step 02 load matrix
+    lm_file = OUT / "vsam_02_load_matrix.csv" if (OUT / "vsam_02_load_matrix.csv").exists() else OUT / "load_matrix.csv"
+    lm = load_csv_safe(lm_file)
+
+    if args.company:
+        cos = [c.strip().upper() for c in args.company.split(",")]
+        lm = lm[lm["source_company"].isin(cos)]
+    if args.tables:
+        tbls = [t.strip().lower() for t in args.tables.split(",")]
+        lm = lm[lm["target_table"].isin(tbls)]
+
+    if lm.empty:
+        logger.warning("Load matrix is empty. Nothing to load.")
+        return True
+
+    # MAJOR CHANGE: Only consider the single latest version for each file
+    orig_count = len(lm)
+    src_col = "source_filename" if "source_filename" in lm.columns else "source_file"
+    lm = filter_latest_versions(lm, ["source_company", src_col])
+
+    # Sort files based on file size (small to large)
+    lm["_size_mb"] = pd.to_numeric(lm["size_mb"], errors="coerce").fillna(0.0)
+    lm = lm.sort_values(by="_size_mb", ascending=True).reset_index(drop=True)
+    lm = lm.drop(columns=["_size_mb"])
+    logger.info(f"Filtered to latest file versions and sorted small to large: {len(lm)} tasks (was {orig_count})")
+
+    if args.limit_files:
+        lm = lm.head(args.limit_files)
+
+    # Load copybook metadata from Step 01
+    cb_csv = OUT / "vsam_01_copybook_extracts.csv"
+    cb_meta = {}
+    if cb_csv.exists():
+        cb_df = pd.read_csv(cb_csv, dtype=str).fillna("")
+        for cb_name, grp in cb_df.groupby("copybook_file"):
+            cb_key = cb_name.upper().split(".")[0]
+            cb_meta[cb_key] = grp.to_dict(orient="records")
+
+    # Load type-gate profile from Step 03
+    tg_file = OUT / "vsam_03_type_gate.json"
+    tg_prof = read_json(tg_file, default={})
+
+    tasks = []
+    skipped = 0
+
+    # Group by file so each unique file is streamed once and segregated to target schemas + bcs
+    for (co, src, fp, tbl), grp in lm.groupby(["source_company", src_col, "full_path", "target_table"], sort=False):
+        target_schemas = list(grp["target_schema"].dropna().unique())
+        rec = grp.iloc[0].to_dict()
+        rec["target_schemas"] = target_schemas
+        tasks.append(rec)
+
+    logger.info(f"Total tasks: {len(lm)} | Already loaded (skipping): {skipped} | Pending: {len(tasks)}")
+
+    if not tasks:
+        logger.info("All files already loaded successfully. Nothing to do.")
+        return True
+
+    if args.dry_run:
+        for t in tasks:
+            logger.info(f"[DRY-RUN] {t.get('s3_filename') or Path(t['full_path']).name} -> "
+                        f"{','.join(t.get('target_schemas') or [])}.{t['target_table']} ({t.get('size_mb', 0)} MB)")
+        logger.info(f"[DRY-RUN] {len(tasks)} file(s) would be loaded. No database changes made.")
+        return True
+
+    # In Default Mode: Apply PK constraints to available tables before streaming
+    if args.mode == "default":
+        pk_file = VSAM_GEN_DDL_DIR / "all_pk.sql"
+        if pk_file.exists():
+            logger.info(f"[Default Mode] Applying PK constraints to available tables before loading data: {pk_file}")
+            try:
+                run_psql(pk_file, is_file=True)
+                logger.info("[+] PK constraints applied to available tables.")
+            except RuntimeError as pe:
+                logger.warning(f"Could not pre-apply PK constraints (tables keep their current constraints): {pe}")
+
+    results = []
+    max_workers = min(args.workers, max(1, len(tasks)))
+    logger.info(f"Starting ingestion with {max_workers} worker threads...")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {
+            pool.submit(load_segregated, task, i % max_workers + 1, run_id, tg_prof, cb_meta, args.mode): task
+            for i, task in enumerate(tasks)
+        }
+        for fut in as_completed(future_map):
+            task = future_map[fut]
+            try:
+                res = fut.result()
+                results.append(res)
+                st = res.get("status", "UNKNOWN")
+                rows = res.get("rows_loaded", 0)
+                sec = res.get("seconds", 0)
+                logger.info(f"[{st}] {res.get('schema')}.{res.get('table')} <- {res.get('filename')} ({rows} rows, {sec}s)")
+            except Exception as e:
+                logger.error(f"[ERROR] Task failed for {task.get('s3_filename')}: {e}")
+                results.append({
+                    "schema": task.get("target_schema"), "table": task.get("target_table"),
+                    "uri": task.get("full_path"), "filename": task.get("s3_filename"),
+                    "s3_filename": task.get("s3_filename"),
+                    "copybook_display": task.get("copybook_map") or "NO_COPYBOOK",
+                    "korg_display": task.get("korg_map") or "NO_KORG",
+                    "total_records": 0, "records_loaded": 0, "skipped_count": 0,
+                    "records_loaded_mapped": 0, "records_loaded_unmapped": 0, "records_loaded_bcs": 0,
+                    "load_pct": "0%", "status": "FAILED", "seconds": 0, "worker_id": 0, "rows_loaded": 0,
+                    "error": str(e)[:300], "schema_counts": {}
+                })
+
+    record_stream_end(None)
+
+    # Save outputs and report
+    ts = get_timestamp()
+    log_csv = OUT / f"vsam_06_load_log_{run_id}.csv"
+
+    load_summary_rows, all_skipped_rows = build_load_summary(results)
+    schema_breakdown_rows = build_schema_breakdown(results)
 
     pd.DataFrame(load_summary_rows).to_csv(log_csv, index=False)
     logger.info(f"Load log saved: {log_csv}")
@@ -960,6 +817,8 @@ def main():
     for line in summary_lines:
         logger.info(line)
 
+    return failed_count == 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(0 if main() is not False else 1)

@@ -16,13 +16,6 @@ import sys
 import argparse
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent.parent
-_TRACK = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-if str(_TRACK) not in sys.path:
-    sys.path.insert(0, str(_TRACK))
-
 from sweep_common import (
     VSAM_OUTPUTS_DIR, VSAM_GEN_DDL_DIR, VSAM_PRE_LOAD_DIR, VSAM_REPORTS_DIR, SWEEP_META_SQL,
     get_logger, get_timestamp, get_db_name, generate_excel_report, run_psql, query_db_rows
@@ -105,4 +98,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(0 if main() is not False else 1)

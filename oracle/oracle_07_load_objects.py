@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-import sys
-from pathlib import Path
-_ROOT = Path(__file__).resolve().parent.parent
-_TRACK = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-if str(_TRACK) not in sys.path:
-    sys.path.insert(0, str(_TRACK))
-
 """
 07_loadObjects.py - Post-Ingestion Keys, Constraints, Indexes, Views, and Triggers Enforcement
 Enforces intelligent, idempotent object creation:
@@ -1001,4 +992,5 @@ if __name__ == "__main__":
     stages = [args.stage] if args.stage != "all" else None
     schemas = {s.strip().lower() for s in args.schemas.split(",")} if args.schemas else None
 
-    apply_post_load(stages_to_run=stages, schemas_filter=schemas, only_loaded=args.only_loaded)
+    ok = apply_post_load(stages_to_run=stages, schemas_filter=schemas, only_loaded=args.only_loaded)
+    sys.exit(0 if ok else 1)

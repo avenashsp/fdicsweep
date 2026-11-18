@@ -30,18 +30,11 @@ from pathlib import Path
 
 import pandas as pd
 
-_ROOT = Path(__file__).resolve().parent.parent
-_TRACK = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-if str(_TRACK) not in sys.path:
-    sys.path.insert(0, str(_TRACK))
-
 from sweep_common import (
     VSAM_REPORTS_DIR, AWS_REGION,
     get_logger, get_timestamp, get_db_name, generate_excel_report
 )
-from vsam_common import (
+from vsam.vsam_common import (
     OUT, norm_col, write_json, delim_for,
     _opener, load_csv_safe, filter_latest_versions,
     get_korg_override_pkey, extract_version_key,
@@ -920,4 +913,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(0 if main() is not False else 1)

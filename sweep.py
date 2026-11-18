@@ -29,17 +29,12 @@ import argparse
 import subprocess
 from pathlib import Path
 
-# Ensure root is in sys.path
-BASE_DIR = Path(__file__).resolve().parent
-if str(BASE_DIR) not in sys.path:
-    sys.path.insert(0, str(BASE_DIR))
-
 from sweep_common import (
     __version__,
     BASE_DIR, ORACLE_LOGS_DIR, VSAM_LOGS_DIR,
-    ORACLE_DIR, ORACLE_INPUTS_DIR, ORACLE_OUTPUTS_DIR, ORACLE_REPORTS_DIR,
-    VSAM_DIR, VSAM_INPUTS_DIR, VSAM_OUTPUTS_DIR, VSAM_COPYBOOK_DIR, VSAM_REPORTS_DIR,
-    PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD, AWS_REGION, S3_BUCKET, ORACLE_S3_BUCKET, VSAM_S3_BUCKET,
+    ORACLE_INPUTS_DIR, ORACLE_OUTPUTS_DIR, ORACLE_REPORTS_DIR,
+    VSAM_INPUTS_DIR, VSAM_OUTPUTS_DIR, VSAM_COPYBOOK_DIR, VSAM_REPORTS_DIR,
+    PGHOST, PGPORT, PGDATABASE, PGUSER, has_db_auth, AWS_REGION, S3_BUCKET, ORACLE_S3_BUCKET, VSAM_S3_BUCKET,
     DEFAULT_WORKERS, PSQL_BIN, get_logger, run_psql
 )
 import sweep_bg
@@ -102,15 +97,18 @@ def cmd_check(args):
         print(fmt_line("Target Database", "MISSING (PGDATABASE not set in sweep.env)"))
 
     # Connection Test
-    if not PGPASSWORD:
-        print(fmt_line("Connection", "FAILED (PGPASSWORD is not set in sweep.env)"))
+    check_ok = bool(psql_path)
+    if not has_db_auth():
+        print(fmt_line("Connection", "FAILED (no credentials: set PGPASSWORD in sweep.env, or use ~/.pgpass / PGSERVICE)"))
+        check_ok = False
     else:
         try:
             run_psql("SELECT 1;")
             print(fmt_line("Connection", "SUCCESS"))
-        except Exception as e:
+        except RuntimeError as e:
             err_line = str(e).splitlines()[0] if str(e) else "Connection failed"
             print(fmt_line("Connection", f"FAILED ({err_line[:60]})"))
+            check_ok = False
     print()
 
     # 3. AWS S3 Access
@@ -141,19 +139,19 @@ def cmd_check(args):
             s3_client = boto3.client("s3", region_name=AWS_REGION)
             s3_client.head_bucket(Bucket=b_name)
             print(fmt_line("Boto3 SDK Check", "SUCCESS"))
-        except Exception as be:
-            err_clean = str(be).splitlines()[0]
+        except Exception as be:  # noqa: BLE001 - botocore raises many unrelated error types; this is a diagnostic
+            err_clean = (str(be).splitlines() or ["check failed"])[0]
             print(fmt_line("Boto3 SDK Check", f"WARNING ({err_clean[:50]})"))
 
         try:
             res = subprocess.run(["aws", "s3api", "head-bucket", "--bucket", b_name, "--region", AWS_REGION],
-                                 capture_output=True, text=True)
+                                 capture_output=True, text=True, timeout=60)
             if res.returncode == 0:
                 print(fmt_line("AWS CLI Check", "SUCCESS"))
             else:
                 err_clean = res.stderr.strip().splitlines()[0] if res.stderr else "HeadBucket failed"
                 print(fmt_line("AWS CLI Check", f"WARNING ({err_clean[:50]})"))
-        except Exception as e:
+        except (OSError, subprocess.SubprocessError) as e:
             print(fmt_line("AWS CLI Check", f"WARNING ({str(e)[:50]})"))
     else:
         print(fmt_line("Boto3 SDK Check", "SKIPPED (No S3 bucket configured)"))
@@ -258,19 +256,67 @@ def cmd_check(args):
         print(itm)
 
     print("=" * 75)
+    return check_ok
 
 
 # -----------------------------------------------------------------------------
 # Dispatch Execution Helper
 # -----------------------------------------------------------------------------
+ORACLE_STEPS = [
+    "oracle_01_extract_mtd", "oracle_02_inventory", "oracle_03_type_gate", "oracle_04_generate_ddl",
+    "oracle_05_apply_ddl", "oracle_06_load_data", "oracle_07_load_objects", "oracle_08_validate",
+]
+VSAM_STEPS = [
+    "vsam_01_extract_copybooks", "vsam_02_inventory", "vsam_03_type_gate", "vsam_04_generate_ddl",
+    "vsam_05_apply_ddl", "vsam_06_load_data", "vsam_07_validate",
+]
+
+
+def step(track, module, *args):
+    """
+    Command line for one pipeline step. Steps run as modules from the repository root
+    (`python -m oracle.oracle_05_apply_ddl`), so imports resolve without any sys.path patching.
+    """
+    return [sys.executable, "-m", f"{track}.{module}", *[str(a) for a in args]]
+
+
+def child_env():
+    """Environment for step subprocesses: repository root first on PYTHONPATH."""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(BASE_DIR), env.get("PYTHONPATH", "")]))
+    return env
+
+
 def run_or_bg(job_name, cmd_args, run_in_bg=False):
-    """Executes command synchronously or spawns background daemon supervisor."""
+    """Executes a command synchronously (exit code propagated) or spawns a background daemon supervisor."""
     if run_in_bg:
         sweep_bg.start_background_job(job_name, cmd_args)
     else:
-        res = subprocess.run(cmd_args)
+        res = subprocess.run(cmd_args, cwd=str(BASE_DIR), env=child_env())
         if res.returncode != 0:
             sys.exit(res.returncode)
+
+
+def run_pipeline(label, commands):
+    """Runs step commands in order, stopping at the first failure. Returns the exit code."""
+    for cmd in commands:
+        print(f"\n=== EXECUTING: {' '.join(cmd)} ===")
+        res = subprocess.run(cmd, cwd=str(BASE_DIR), env=child_env())
+        if res.returncode != 0:
+            print(f"Step failed with code {res.returncode}. Aborting pipeline.")
+            return res.returncode
+    print(f"\n[+] {label} Pipeline Completed Successfully!")
+    return 0
+
+
+def pipeline_or_bg(job_name, label, commands, bg_command, run_in_bg):
+    """Runs a full pipeline in the foreground (exiting non-zero on failure) or as one background job."""
+    if run_in_bg:
+        sweep_bg.start_background_job(job_name, bg_command)
+        return
+    code = run_pipeline(label, commands)
+    if code != 0:
+        sys.exit(code)
 
 
 # -----------------------------------------------------------------------------
@@ -284,38 +330,38 @@ def handle_oracle(args):
         sys.exit(0)
 
     if cmd == "extract":
-        c = [sys.executable, str(ORACLE_DIR / "oracle_01_extract_mtd.py")]
+        c = step("oracle", "oracle_01_extract_mtd")
         if getattr(args, "file", None): c.extend(["--file", args.file])
         if getattr(args, "owners", None): c.extend(["--owners", args.owners])
         run_or_bg("oracle_01_extract_mtd", c, getattr(args, "bg", False))
 
     elif cmd == "inventory":
-        c = [sys.executable, str(ORACLE_DIR / "oracle_02_inventory.py")]
+        c = step("oracle", "oracle_02_inventory")
         if getattr(args, "s3", None): c.extend(["--s3", args.s3])
         if getattr(args, "owners", None): c.extend(["--owners", args.owners])
         if getattr(args, "tables", None): c.extend(["--tables", args.tables])
         run_or_bg("oracle_02_inventory", c, getattr(args, "bg", False))
 
     elif cmd == "gate":
-        c = [sys.executable, str(ORACLE_DIR / "oracle_03_type_gate.py"), "--rows", str(getattr(args, "rows", 1000))]
+        c = step("oracle", "oracle_03_type_gate", "--rows", str(getattr(args, "rows", 1000)))
         if getattr(args, "tables", None): c.extend(["--tables", args.tables])
         if getattr(args, "max_tables", None): c.extend(["--max-tables", str(args.max_tables)])
         run_or_bg("oracle_03_type_gate", c, getattr(args, "bg", False))
 
     elif cmd in ("gen-ddl", "ddl"):
-        c = [sys.executable, str(ORACLE_DIR / "oracle_04_generate_ddl.py")]
+        c = step("oracle", "oracle_04_generate_ddl")
         if getattr(args, "owners", None): c.extend(["--owners", args.owners])
         if getattr(args, "tables", None): c.extend(["--tables", args.tables])
         run_or_bg("oracle_04_generate_ddl", c, getattr(args, "bg", False))
 
     elif cmd == "apply-ddl":
-        c = [sys.executable, str(ORACLE_DIR / "oracle_05_apply_ddl.py")]
+        c = step("oracle", "oracle_05_apply_ddl")
         if getattr(args, "schemas", None): c.extend(["--schemas", args.schemas])
         if getattr(args, "skip_meta", False): c.append("--skip-meta")
         run_or_bg("oracle_05_apply_ddl", c, getattr(args, "bg", False))
 
     elif cmd in ("load-data", "load"):
-        c = [sys.executable, str(ORACLE_DIR / "oracle_06_load_data.py"), "--workers", str(getattr(args, "workers", DEFAULT_WORKERS))]
+        c = step("oracle", "oracle_06_load_data", "--workers", str(getattr(args, "workers", DEFAULT_WORKERS)))
         if getattr(args, "tables", None): c.extend(["--tables", args.tables])
         if getattr(args, "exclude_tables", None): c.extend(["--exclude-tables", args.exclude_tables])
         if getattr(args, "file", None): c.extend(["--file", args.file])
@@ -329,65 +375,24 @@ def handle_oracle(args):
         run_or_bg("oracle_06_load_data", c, getattr(args, "bg", False))
 
     elif cmd in ("load-obj", "post-load"):
-        c = [sys.executable, str(ORACLE_DIR / "oracle_07_load_objects.py"), "--stage", getattr(args, "stage", "all")]
+        c = step("oracle", "oracle_07_load_objects", "--stage", getattr(args, "stage", "all"))
         if getattr(args, "schemas", None): c.extend(["--schemas", args.schemas])
         if getattr(args, "only_loaded", False): c.append("--only-loaded")
         run_or_bg("oracle_07_load_objects", c, getattr(args, "bg", False))
 
     elif cmd in ("validate", "verify"):
-        c = [sys.executable, str(ORACLE_DIR / "oracle_08_validate.py")]
+        c = step("oracle", "oracle_08_validate")
         if getattr(args, "exact_counts", False): c.append("--exact-counts")
         if getattr(args, "tables", None): c.extend(["--tables", args.tables])
         if getattr(args, "schemas", None): c.extend(["--schemas", args.schemas])
         if getattr(args, "file", None): c.extend(["--file", args.file])
         run_or_bg("oracle_08_validate", c, getattr(args, "bg", False))
 
-    elif cmd in ("patch-identity", "patch"):
-        c = [sys.executable, str(ORACLE_DIR / "oracle_patch_identity.py")]
-        if getattr(args, "dump", None): c.extend(["--dump", args.dump])
-        if getattr(args, "dry_run", False): c.append("--dry-run")
-        if getattr(args, "schemas", None): c.extend(["--schemas", args.schemas])
-        if getattr(args, "tables", None): c.extend(["--tables", args.tables])
-        run_or_bg("oracle_patch_identity", c, getattr(args, "bg", False))
-
-    elif cmd in ("patch-audit", "audit"):
-        c = [sys.executable, str(ORACLE_DIR / "oracle_patch_audit_columns.py")]
-        if getattr(args, "dry_run", False): c.append("--dry-run")
-        if getattr(args, "schemas", None): c.extend(["--schemas", args.schemas])
-        if getattr(args, "tables", None): c.extend(["--tables", args.tables])
-        run_or_bg("oracle_patch_audit_columns", c, getattr(args, "bg", False))
-
-    elif cmd in ("patch-fk", "patch-partition-fk"):
-        c = [sys.executable, str(ORACLE_DIR / "oracle_patch_partition_fk.py")]
-        if getattr(args, "dry_run", False): c.append("--dry-run")
-        if getattr(args, "schemas", None): c.extend(["--schemas", args.schemas])
-        if getattr(args, "tables", None): c.extend(["--tables", args.tables])
-        run_or_bg("oracle_patch_partition_fk", c, getattr(args, "bg", False))
-
     elif cmd == "run-all":
-        steps = [
-            [sys.executable, str(ORACLE_DIR / "oracle_01_extract_mtd.py")],
-            [sys.executable, str(ORACLE_DIR / "oracle_02_inventory.py")],
-            [sys.executable, str(ORACLE_DIR / "oracle_03_type_gate.py")],
-            [sys.executable, str(ORACLE_DIR / "oracle_04_generate_ddl.py")],
-            [sys.executable, str(ORACLE_DIR / "oracle_05_apply_ddl.py")],
-            [sys.executable, str(ORACLE_DIR / "oracle_06_load_data.py"), "--workers", str(getattr(args, "workers", DEFAULT_WORKERS))],
-            [sys.executable, str(ORACLE_DIR / "oracle_07_load_objects.py")],
-            [sys.executable, str(ORACLE_DIR / "oracle_08_validate.py")]
-        ]
-        runner_file = BASE_DIR / "run_oracle_all.py"
-        with open(runner_file, "w", encoding="utf-8") as f:
-            f.write("import subprocess, sys\n")
-            f.write(f"steps = {steps}\n")
-            f.write("""for s in steps:
-    print(f"\\n=== EXECUTING: {' '.join(s)} ===")
-    res = subprocess.run(s)
-    if res.returncode != 0:
-        print(f"Step failed with code {res.returncode}. Aborting pipeline.")
-        sys.exit(res.returncode)
-print("\\n[+] Oracle Full Pipeline Completed Successfully!")
-""")
-        run_or_bg("oracle_full_pipeline", [sys.executable, str(runner_file)], getattr(args, "bg", False))
+        workers = getattr(args, "workers", DEFAULT_WORKERS)
+        commands = [step("oracle", m, *(["--workers", workers] if m == "oracle_06_load_data" else [])) for m in ORACLE_STEPS]
+        bg_cmd = [sys.executable, str(BASE_DIR / "sweep.py"), "oracle", "run-all", "--workers", str(workers)]
+        pipeline_or_bg("oracle_full_pipeline", "Oracle Full", commands, bg_cmd, getattr(args, "bg", False))
 
 
 # -----------------------------------------------------------------------------
@@ -402,77 +407,62 @@ def handle_vsam(args):
 
     # Step 01: Extract copybook metadata
     if cmd in ("extract", "extract-copybooks"):
-        c = [sys.executable, str(VSAM_DIR / "vsam_01_extract_copybooks.py")]
+        c = step("vsam", "vsam_01_extract_copybooks")
         run_or_bg("vsam_01_extract_copybooks", c, getattr(args, "bg", False))
 
     # Step 02: Inventory & S3 mapping
     elif cmd == "inventory":
-        c = [sys.executable, str(VSAM_DIR / "vsam_02_inventory.py")]
+        c = step("vsam", "vsam_02_inventory")
         if getattr(args, "s3", None): c.extend(["--s3", args.s3])
         if getattr(args, "company", None): c.extend(["--company", args.company])
         run_or_bg("vsam_02_inventory", c, getattr(args, "bg", False))
 
     # Step 03: Type Gate - PK verification & schema col detection
     elif cmd in ("type-gate", "gate"):
-        c = [sys.executable, str(VSAM_DIR / "vsam_03_type_gate.py")]
+        c = step("vsam", "vsam_03_type_gate")
         if getattr(args, "workers", None): c.extend(["--workers", str(args.workers)])
         if getattr(args, "company", None): c.extend(["--company", args.company])
         run_or_bg("vsam_03_type_gate", c, getattr(args, "bg", False))
 
     # Step 04: Generate DDL (pre_load + post_load)
     elif cmd in ("gen-ddl", "ddl"):
-        c = [sys.executable, str(VSAM_DIR / "vsam_04_generate_ddl.py")]
+        c = step("vsam", "vsam_04_generate_ddl")
         if getattr(args, "company", None): c.extend(["--company", args.company])
         if getattr(args, "execute", False): c.append("--execute")
         run_or_bg("vsam_04_generate_ddl", c, getattr(args, "bg", False))
 
     # Step 05: Apply pre-load DDL (tables only, no PK)
     elif cmd == "apply-ddl":
-        c = [sys.executable, str(VSAM_DIR / "vsam_05_apply_ddl.py")]
+        c = step("vsam", "vsam_05_apply_ddl")
         if getattr(args, "skip_meta", False): c.append("--skip-meta")
         run_or_bg("vsam_05_apply_ddl", c, getattr(args, "bg", False))
 
     # Step 06: Load data with dynamic upsert and schema segregation (includes PK application in default mode)
     elif cmd in ("load-data", "load", "load-obj", "load-objects", "post-load"):
-        c = [sys.executable, str(VSAM_DIR / "vsam_06_load_data.py"), "--workers", str(getattr(args, "workers", DEFAULT_WORKERS))]
+        c = step("vsam", "vsam_06_load_data", "--workers", str(getattr(args, "workers", DEFAULT_WORKERS)))
         if getattr(args, "mode", None): c.extend(["--mode", args.mode])
         if getattr(args, "company", None): c.extend(["--company", args.company])
         if getattr(args, "tables", None): c.extend(["--tables", args.tables])
         if getattr(args, "limit_files", None): c.extend(["--limit-files", str(args.limit_files)])
         if getattr(args, "latest_only", False): c.append("--latest-only")
+        if getattr(args, "force_truncate", False): c.append("--force-truncate")
+        if getattr(args, "dry_run", False): c.append("--dry-run")
         run_or_bg("vsam_06_load_data", c, getattr(args, "bg", False))
 
     # Step 07: Validate
     elif cmd in ("validate", "verify"):
-        c = [sys.executable, str(VSAM_DIR / "vsam_07_validate.py")]
+        c = step("vsam", "vsam_07_validate")
         if getattr(args, "exact_counts", False): c.append("--exact-counts")
         if getattr(args, "tables", None): c.extend(["--tables", args.tables])
         if getattr(args, "schema", None): c.extend(["--schema", args.schema])
         run_or_bg("vsam_07_validate", c, getattr(args, "bg", False))
 
     elif cmd == "run-all":
-        steps = [
-            [sys.executable, str(VSAM_DIR / "vsam_01_extract_copybooks.py")],
-            [sys.executable, str(VSAM_DIR / "vsam_02_inventory.py")],
-            [sys.executable, str(VSAM_DIR / "vsam_03_type_gate.py")],
-            [sys.executable, str(VSAM_DIR / "vsam_04_generate_ddl.py")],
-            [sys.executable, str(VSAM_DIR / "vsam_05_apply_ddl.py")],
-            [sys.executable, str(VSAM_DIR / "vsam_06_load_data.py"), "--workers", str(getattr(args, "workers", DEFAULT_WORKERS))],
-            [sys.executable, str(VSAM_DIR / "vsam_07_validate.py")]
-        ]
-        runner_file = BASE_DIR / "run_vsam_all.py"
-        with open(runner_file, "w", encoding="utf-8") as f:
-            f.write("import subprocess, sys\n")
-            f.write(f"steps = {steps}\n")
-            f.write("""for s in steps:
-    print(f"\\n=== EXECUTING: {' '.join(s)} ===")
-    res = subprocess.run(s)
-    if res.returncode != 0:
-        print(f"Step failed with code {res.returncode}. Aborting pipeline.")
-        sys.exit(res.returncode)
-print("\\n[+] VSAM Full Pipeline Completed Successfully!")
-""")
-        run_or_bg("vsam_full_pipeline", [sys.executable, str(runner_file)], getattr(args, "bg", False))
+        workers = getattr(args, "workers", DEFAULT_WORKERS)
+        extra = ["--force-truncate"] if getattr(args, "force_truncate", False) else []
+        commands = [step("vsam", m, *(["--workers", workers, *extra] if m == "vsam_06_load_data" else [])) for m in VSAM_STEPS]
+        bg_cmd = [sys.executable, str(BASE_DIR / "sweep.py"), "vsam", "run-all", "--workers", str(workers), *extra]
+        pipeline_or_bg("vsam_full_pipeline", "VSAM Full", commands, bg_cmd, getattr(args, "bg", False))
 
 
 # -----------------------------------------------------------------------------
@@ -480,6 +470,7 @@ print("\\n[+] VSAM Full Pipeline Completed Successfully!")
 # -----------------------------------------------------------------------------
 def cmd_run_all(args):
     track = getattr(args, "track", "all").lower()
+    workers = getattr(args, "workers", DEFAULT_WORKERS)
     if track == "oracle":
         args.oracle_cmd = "run-all"
         handle_oracle(args)
@@ -488,24 +479,11 @@ def cmd_run_all(args):
         handle_vsam(args)
     else:
         logger.info("Executing End-to-End Migration for BOTH Oracle and VSAM tracks...")
-        runner_file = BASE_DIR / "run_all_tracks.py"
-        with open(runner_file, "w", encoding="utf-8") as f:
-            f.write(f"""import subprocess, sys
-print("=== TRACK 1: ORACLE MIGRATION ===")
-res1 = subprocess.run([sys.executable, "sweep.py", "oracle", "run-all", "--workers", "{getattr(args, 'workers', DEFAULT_WORKERS)}"])
-if res1.returncode != 0:
-    print("Oracle pipeline failed. Halting.")
-    sys.exit(res1.returncode)
-
-print("\\n=== TRACK 2: VSAM MIGRATION ===")
-res2 = subprocess.run([sys.executable, "sweep.py", "vsam", "run-all", "--workers", "{getattr(args, 'workers', DEFAULT_WORKERS)}"])
-if res2.returncode != 0:
-    print("VSAM pipeline failed. Halting.")
-    sys.exit(res2.returncode)
-
-print("\\n[+] ALL MIGRATION PIPELINES COMPLETED SUCCESSFULLY!")
-""")
-        run_or_bg("sweep_all_tracks", [sys.executable, str(runner_file)], getattr(args, "bg", False))
+        extra = ["--force-truncate"] if getattr(args, "force_truncate", False) else []
+        oracle_cmds = [step("oracle", m, *(["--workers", workers] if m == "oracle_06_load_data" else [])) for m in ORACLE_STEPS]
+        vsam_cmds = [step("vsam", m, *(["--workers", workers, *extra] if m == "vsam_06_load_data" else [])) for m in VSAM_STEPS]
+        bg_cmd = [sys.executable, str(BASE_DIR / "sweep.py"), "run-all", "--track", "all", "--workers", str(workers), *extra]
+        pipeline_or_bg("sweep_all_tracks", "Oracle + VSAM", oracle_cmds + vsam_cmds, bg_cmd, getattr(args, "bg", False))
 
 
 # -----------------------------------------------------------------------------
@@ -528,6 +506,7 @@ def main():
     p_all = subparsers.add_parser("run-all", help="Execute complete pipeline end-to-end")
     p_all.add_argument("--track", choices=["oracle", "vsam", "all"], default="all", help="Migration track to execute (default: all)")
     p_all.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Parallel workers (default: {DEFAULT_WORKERS})")
+    p_all.add_argument("--force-truncate", action="store_true", help="Pass --force-truncate to the VSAM load step")
     p_all.add_argument("--bg", action="store_true", help="Run full pipeline as detached background daemon")
 
     # Background operations
@@ -546,7 +525,7 @@ def main():
 
     p_stop = subparsers.add_parser("stop", help="Stop running migration jobs")
     p_stop.add_argument("--name", help="Specific job name to stop")
-    p_stop.add_argument("--kill-db", action="store_true", help="Also terminate in-flight PostgreSQL COPY sessions")
+    p_stop.add_argument("--kill-db", action="store_true", help="Also terminate in-flight PostgreSQL sessions opened by SWEEP (application_name 'sweep')")
 
     # -------------------------------------------------------------------------
     # Track: ORACLE
@@ -608,25 +587,6 @@ def main():
     o_val.add_argument("--file", help="Specific master Oracle SQL dump file path")
     o_val.add_argument("--bg", action="store_true", help="Run in background")
 
-    o_patch = o_sub.add_parser("patch-identity", aliases=["patch"], help="Detect auto-increment columns from Oracle dump and patch PostgreSQL database")
-    o_patch.add_argument("--dump", help="Path to Oracle Master SQL dump file")
-    o_patch.add_argument("--dry-run", action="store_true", help="Simulate execution without modifying database")
-    o_patch.add_argument("--schemas", help="Comma-separated schemas")
-    o_patch.add_argument("--tables", help="Comma-separated tables")
-    o_patch.add_argument("--bg", action="store_true", help="Run in background")
-
-    o_patch_audit = o_sub.add_parser("patch-audit", aliases=["audit"], help="Add 4 audit columns and update triggers to all PostgreSQL tables")
-    o_patch_audit.add_argument("--dry-run", action="store_true", help="Simulate execution without modifying database")
-    o_patch_audit.add_argument("--schemas", help="Comma-separated schemas")
-    o_patch_audit.add_argument("--tables", help="Comma-separated tables")
-    o_patch_audit.add_argument("--bg", action="store_true", help="Run in background")
-
-    o_patch_fk = o_sub.add_parser("patch-fk", aliases=["patch-partition-fk"], help="Apply staged low-lock Foreign Keys on partitioned tables")
-    o_patch_fk.add_argument("--dry-run", action="store_true", help="Simulate execution without modifying database")
-    o_patch_fk.add_argument("--schemas", help="Comma-separated schemas")
-    o_patch_fk.add_argument("--tables", help="Comma-separated tables")
-    o_patch_fk.add_argument("--bg", action="store_true", help="Run in background")
-
     o_run_all = o_sub.add_parser("run-all", help="Execute complete Oracle pipeline end-to-end")
     o_run_all.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Parallel workers")
     o_run_all.add_argument("--bg", action="store_true", help="Run full Oracle pipeline in background daemon")
@@ -666,6 +626,8 @@ def main():
     v_load.add_argument("--tables", help="Comma-separated tables")
     v_load.add_argument("--limit-files", type=int, help="Limit files loaded")
     v_load.add_argument("--latest-only", "--latest-version-only", action="store_true", help="Load only latest file version per table based on timestamp in filename")
+    v_load.add_argument("--force-truncate", action="store_true", help="Allow TRUNCATE of existing tables that have rows but no primary key (once per table per run)")
+    v_load.add_argument("--dry-run", action="store_true", help="List the files that would be loaded without writing to the database")
     v_load.add_argument("--bg", action="store_true", help="Run in background daemon")
 
     v_lobj = v_sub.add_parser("load-obj", aliases=["load-objects", "post-load"], help="Legacy alias: Merged into Step 06 (load-data)")
@@ -680,6 +642,7 @@ def main():
 
     v_runall = v_sub.add_parser("run-all", help="Execute complete VSAM 7-step pipeline end-to-end")
     v_runall.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Parallel workers")
+    v_runall.add_argument("--force-truncate", action="store_true", help="Pass --force-truncate to the VSAM load step")
     v_runall.add_argument("--bg", action="store_true", help="Run full pipeline in background")
 
     args = parser.parse_args()
@@ -689,7 +652,7 @@ def main():
         sys.exit(0)
 
     if args.command == "check":
-        cmd_check(args)
+        sys.exit(0 if cmd_check(args) else 1)
     elif args.command == "oracle":
         handle_oracle(args)
     elif args.command == "vsam":

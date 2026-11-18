@@ -9,12 +9,16 @@ import os
 import re
 import sys
 import csv
+import io
 import logging
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "5.0"
+from sweep_platform import make_symlink, group_popen_kwargs, kill_process_group
+
+__version__ = "5.1"
 
 def get_next_version(current_ver: str) -> str:
     """
@@ -113,36 +117,50 @@ for d in ALL_DIRS:
     d.mkdir(parents=True, exist_ok=True)
 
 
+# Environment-file names probed (in order) under BASE_DIR. The first one found wins.
+ENV_FILE_NAMES = ("sweep.env", "sweep.env.txt", "sweep_env.sh", "qa.env", ".env")
+
+
+def parse_env_line(line):
+    """
+    Parses one `[export ]KEY=VALUE` line. Returns (key, value) or None for blanks, comments
+    and lines without '='. Surrounding single/double quotes around VALUE are removed.
+    """
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if line.startswith("export "):
+        line = line[7:].strip()
+    if "=" not in line:
+        return None
+    key, val = line.split("=", 1)
+    key, val = key.strip(), val.strip()
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+        val = val[1:-1]
+    return (key, val) if key else None
+
+
 def load_env_file(filepath=None):
-    """Loads environment variables from sweep.env or sweep_env.sh if present."""
-    global PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD, PGSSLMODE
-    paths_to_check = [
-        filepath,
-        BASE_DIR / "sweep.env",
-        BASE_DIR / "sweep.env.txt",
-        BASE_DIR / "sweep_env.sh",
-        BASE_DIR / "qa.env",
-        BASE_DIR / ".env"
-    ]
+    """
+    Loads KEY=VALUE pairs from sweep.env (or sweep_env.sh, qa.env, .env) into os.environ.
+    Variables ALREADY present in the real process environment win over the file, so an operator
+    can always override a setting with `export VAR=...` or `VAR=... python3 sweep.py ...`.
+    """
+    paths_to_check = [filepath] + [BASE_DIR / n for n in ENV_FILE_NAMES]
     for p in paths_to_check:
         if p and Path(p).exists():
             with open(p, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if line.startswith("export "):
-                        line = line[7:].strip()
-                    if "=" in line:
-                        k, v = line.split("=", 1)
-                        k = k.strip()
-                        v = v.strip()
-                        if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
-                            v = v[1:-1]
-                        os.environ[k] = v
+                for raw in f:
+                    kv = parse_env_line(raw)
+                    if kv:
+                        os.environ.setdefault(kv[0], kv[1])
             break
+    refresh_db_settings()
 
-    # Refresh module-level database settings
+
+def refresh_db_settings():
+    """(Re)reads the PostgreSQL connection settings from os.environ into module globals."""
+    global PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD, PGSSLMODE
     PGHOST = os.getenv("PGHOST", "localhost")
     PGPORT = os.getenv("PGPORT", "5432")
     PGDATABASE = os.getenv("PGDATABASE", "sweep")
@@ -153,19 +171,9 @@ def load_env_file(filepath=None):
         os.environ["PGPASSWORD"] = PGPASSWORD
 
 
-# Initial load
+# Initial load (also defines the PG* module globals)
+PGHOST = PGPORT = PGDATABASE = PGUSER = PGPASSWORD = PGSSLMODE = None
 load_env_file()
-
-# PostgreSQL & AWS Settings
-PGHOST = os.getenv("PGHOST", "localhost")
-PGPORT = os.getenv("PGPORT", "5432")
-PGDATABASE = os.getenv("PGDATABASE", "sweep")
-PGUSER = os.getenv("PGUSER", "postgres")
-PGPASSWORD = os.getenv("PGPASSWORD") or os.getenv("PG_PASSWORD") or os.getenv("DB_PASSWORD") or ""
-PGSSLMODE = os.getenv("PGSSLMODE", "prefer")
-
-if PGPASSWORD:
-    os.environ["PGPASSWORD"] = PGPASSWORD
 
 
 def get_db_name():
@@ -174,20 +182,35 @@ def get_db_name():
     return db.strip().lower()
 
 
+def has_db_auth():
+    """
+    True when psql can authenticate non-interactively: a password is configured, or a
+    ~/.pgpass / PGPASSFILE / PGSERVICE is available.
+    Set SWEEP_ALLOW_NO_PASSWORD=1 for trust/peer authentication setups.
+    """
+    if PGPASSWORD:
+        return True
+    if os.getenv("SWEEP_ALLOW_NO_PASSWORD") == "1" or os.getenv("PGSERVICE"):
+        return True
+    passfile = os.getenv("PGPASSFILE") or str(Path.home() / ".pgpass")
+    return Path(passfile).is_file()
+
+
+AUTH_HELP = (
+    "No database credentials found. Set PGPASSWORD in sweep.env (export PGPASSWORD=...), "
+    "or provide ~/.pgpass / PGPASSFILE / PGSERVICE, or set SWEEP_ALLOW_NO_PASSWORD=1 for trust auth."
+)
+
+
 def check_db_credentials(logger=None):
-    """
-    Validates that database credentials, specifically PGPASSWORD, are set in sweep.env.
-    Returns True if configured, raises RuntimeError if missing.
-    """
-    if not PGPASSWORD:
-        msg = (
-            "Database password is not configured: PGPASSWORD is missing from sweep.env. "
-            "Please add 'export PGPASSWORD=your_password' to sweep.env."
-        )
+    """Returns True if non-interactive DB authentication is configured, else logs and raises RuntimeError."""
+    if not has_db_auth():
         if logger:
-            logger.error(msg)
-        raise RuntimeError(msg)
+            logger.error(AUTH_HELP)
+        raise RuntimeError(AUTH_HELP)
     return True
+
+
 AWS_REGION = os.getenv("AWS_DEFAULT_REGION", os.getenv("AWS_REGION", "us-east-2"))
 ORACLE_S3_BUCKET = os.getenv("ORACLE_S3_BUCKET", os.getenv("SWEEP_S3_BUCKET", ""))
 S3_BUCKET = ORACLE_S3_BUCKET or os.getenv("VSAM_S3_BUCKET", "")
@@ -289,17 +312,9 @@ def get_logger(name, step_name=None, to_file=None, track=None):
         fh.setFormatter(fmt)
         logger.addHandler(fh)
 
-        # Maintain latest symlink or pointer on Unix
-        latest_link = target_log_dir / "latest.log"
-        global_latest = BASE_DIR / "sweep_latest.log"
-        try:
-            if os.name != "nt":
-                for link in [latest_link, global_latest]:
-                    if link.is_symlink() or link.exists():
-                        link.unlink()
-                    link.symlink_to(log_file)
-        except Exception:
-            pass
+        # Maintain latest-log pointers on POSIX
+        for link in (target_log_dir / "latest.log", BASE_DIR / "sweep_latest.log"):
+            make_symlink(link, log_file)
 
     return logger
 
@@ -404,41 +419,141 @@ def generate_excel_report(report_path, sheets_data):
 # -----------------------------------------------------------------------------
 # Database Utilities
 # -----------------------------------------------------------------------------
-def run_psql(cmd_or_sql, is_file=False, capture=True, extra_env=None, tuples_only=False, unaligned=False, dbname=None):
-    """Executes SQL via standard psql CLI."""
-    if not PGPASSWORD:
-        raise RuntimeError(
-            "Database password is not set: PGPASSWORD is missing from sweep.env. "
-            "Please configure 'export PGPASSWORD=your-password' in sweep.env"
-        )
-    env = os.environ.copy()
-    env["PGPASSWORD"] = PGPASSWORD
-    if extra_env:
-        env.update(extra_env)
+PSQL_APP_NAME = "sweep"
+# Applied to every psql session: literals are escaped the standard way (backslash is a plain
+# character), which the hand-built SQL in the loaders relies on.
+BASE_PGOPTIONS = "-c standard_conforming_strings=on"
+DEFAULT_PSQL_TIMEOUT = int(os.getenv("SWEEP_PSQL_TIMEOUT", "7200"))
+CONNECT_RETRIES = int(os.getenv("SWEEP_CONNECT_RETRIES", "3"))
 
-    target_db = dbname or PGDATABASE
-    args = [PSQL_BIN, "-X", "-w", "-h", PGHOST, "-p", str(PGPORT), "-U", PGUSER, "-d", target_db]
+# psql failures where the statement provably never ran, so retrying is always safe.
+_TRANSIENT_CONNECT_ERRORS = (
+    "could not connect to server",
+    "could not translate host name",
+    "connection refused",
+    "timeout expired",
+    "the database system is starting up",
+    "too many connections",
+    "remaining connection slots are reserved",
+    "connection timed out",
+)
+
+
+def psql_env(extra_env=None, options=None):
+    """
+    Environment for a psql child process: password (if any), application_name for session
+    tagging, and PGOPTIONS merged from BASE_PGOPTIONS + `options` + extra_env['PGOPTIONS'].
+    """
+    env = os.environ.copy()
+    if PGPASSWORD:
+        env["PGPASSWORD"] = PGPASSWORD
+    env.setdefault("PGAPPNAME", PSQL_APP_NAME)
+    if PGSSLMODE:
+        env.setdefault("PGSSLMODE", PGSSLMODE)
+    opts = [BASE_PGOPTIONS]
+    if options:
+        opts.append(options)
+    if extra_env:
+        extra = dict(extra_env)
+        if extra.get("PGOPTIONS"):
+            opts.append(extra.pop("PGOPTIONS"))
+        env.update(extra)
+    env["PGOPTIONS"] = " ".join(opts)
+    return env
+
+
+def psql_base_args(dbname=None):
+    return [PSQL_BIN, "-X", "-w", "-h", PGHOST, "-p", str(PGPORT), "-U", PGUSER, "-d", dbname or PGDATABASE]
+
+
+def _is_transient_connect_error(text):
+    low = (text or "").lower()
+    return any(m in low for m in _TRANSIENT_CONNECT_ERRORS)
+
+
+def run_subprocess_checked(args, *, input_text=None, env=None, capture=True, timeout=DEFAULT_PSQL_TIMEOUT,
+                           retries=CONNECT_RETRIES, what="psql"):
+    """
+    Runs `args` with a timeout. Connection-establishment failures (statement never executed) are
+    retried with exponential backoff; everything else fails immediately.
+    Returns the CompletedProcess; raises RuntimeError on non-zero exit or timeout.
+    """
+    attempt = 0
+    while True:
+        try:
+            res = subprocess.run(args, input=input_text, capture_output=capture, text=True,
+                                 env=env, timeout=timeout or None)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"{what} timed out after {timeout}s")
+        if res.returncode == 0:
+            return res
+        err = (res.stderr or res.stdout or "").strip()
+        if attempt < retries and _is_transient_connect_error(err):
+            time.sleep(min(2 ** attempt, 30))
+            attempt += 1
+            continue
+        raise RuntimeError(f"{what} execution failed (code {res.returncode}): {err}")
+
+
+LOAD_TIMEOUT = int(os.getenv("SWEEP_LOAD_TIMEOUT", "21600"))  # 6h per file; 0 disables
+
+
+def run_psql_script(script_text, *, options=None, timeout=None, retries=CONNECT_RETRIES, dbname=None):
+    """
+    Runs a multi-statement psql script from stdin (used for transactional file loads whose
+    `\\copy ... FROM PROGRAM` spawns child processes). The psql process is started in its own
+    process group so a timeout kills psql AND the S3/gzip pipeline it launched.
+
+    Returns subprocess.CompletedProcess (stdout/stderr text). Never raises for a non-zero exit;
+    raises RuntimeError only on timeout. Connection-establishment failures are retried.
+    """
+    if not has_db_auth():
+        raise RuntimeError(AUTH_HELP)
+    timeout = LOAD_TIMEOUT if timeout is None else timeout
+    args = psql_base_args(dbname) + ["-v", "ON_ERROR_STOP=1", "-f", "-"]
+    env = psql_env(options=options)
+    attempt = 0
+    while True:
+        proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=env, **group_popen_kwargs())
+        try:
+            out, err = proc.communicate(script_text, timeout=timeout or None)
+        except subprocess.TimeoutExpired:
+            kill_process_group(proc)
+            proc.communicate()
+            raise RuntimeError(f"psql load timed out after {timeout}s")
+        if proc.returncode != 0 and attempt < retries and _is_transient_connect_error(err or out):
+            time.sleep(min(2 ** attempt, 30))
+            attempt += 1
+            continue
+        return subprocess.CompletedProcess(args, proc.returncode, out, err)
+
+
+def run_psql(cmd_or_sql, is_file=False, capture=True, extra_env=None, tuples_only=False, unaligned=False,
+             dbname=None, timeout=None):
+    """Executes SQL (or a .sql file when is_file=True) via the psql CLI and returns stripped stdout."""
+    if not has_db_auth():
+        raise RuntimeError(AUTH_HELP)
+    env = psql_env(extra_env)
+    args = psql_base_args(dbname)
     if tuples_only:
         args.append("-t")
     if unaligned:
         args.append("-A")
 
+    input_text = None
     if is_file:
         args.extend(["-v", "ON_ERROR_STOP=1", "-f", str(cmd_or_sql)])
-        res = subprocess.run(args, capture_output=capture, text=True, env=env)
+    elif "\n" in cmd_or_sql or cmd_or_sql.strip().startswith("\\"):
+        # Multi-line statements or scripts containing backslash directives go through stdin
+        args.extend(["-v", "ON_ERROR_STOP=1", "-f", "-"])
+        input_text = cmd_or_sql
     else:
-        # Multi-line statements or scripts containing backslash directives are passed via stdin (-f -)
-        if "\n" in cmd_or_sql or cmd_or_sql.strip().startswith("\\"):
-            args.extend(["-v", "ON_ERROR_STOP=1", "-f", "-"])
-            res = subprocess.run(args, input=cmd_or_sql, capture_output=capture, text=True, env=env)
-        else:
-            args.extend(["-v", "ON_ERROR_STOP=1", "-c", cmd_or_sql])
-            res = subprocess.run(args, capture_output=capture, text=True, env=env)
+        args.extend(["-v", "ON_ERROR_STOP=1", "-c", cmd_or_sql])
 
-    if res.returncode != 0:
-        err_msg = res.stderr.strip() if res.stderr else res.stdout.strip()
-        raise RuntimeError(f"psql execution failed (code {res.returncode}): {err_msg}")
-    return res.stdout.strip()
+    res = run_subprocess_checked(args, input_text=input_text, env=env, capture=capture,
+                                 timeout=DEFAULT_PSQL_TIMEOUT if timeout is None else timeout)
+    return (res.stdout or "").strip()
 
 
 def query_db_rows(sql, dbname=None):
@@ -448,30 +563,18 @@ def query_db_rows(sql, dbname=None):
 
 
 def query_db_dicts(sql, dbname=None):
-    """Executes query exclusively via psql \\copy and parses CSV output into list of dicts."""
-    lines = []
-    for line in sql.strip().rstrip(";").splitlines():
-        line_clean = line.strip()
-        if not line_clean or line_clean.startswith("--"):
-            continue
-        lines.append(line_clean)
-    clean_sql = " ".join(lines)
-    if not PGPASSWORD:
-        raise RuntimeError(
-            "Database password is not set: PGPASSWORD is missing from sweep.env. "
-            "Please configure 'export PGPASSWORD=your-password' in sweep.env"
-        )
-    cmd = f"\\copy ({clean_sql}) TO STDOUT WITH (FORMAT csv, HEADER true)"
-    env = os.environ.copy()
-    env["PGPASSWORD"] = PGPASSWORD
-    target_db = dbname or PGDATABASE
-    args = [PSQL_BIN, "-X", "-w", "-h", PGHOST, "-p", str(PGPORT), "-U", PGUSER, "-d", target_db, "-c", cmd]
-    res = subprocess.run(args, capture_output=True, text=True, env=env)
-    if res.returncode != 0:
-        err_clean = res.stderr.strip() if res.stderr else res.stdout.strip()
-        raise RuntimeError(f"psql query failed: {err_clean}")
-    reader = csv.DictReader(res.stdout.splitlines())
-    return list(reader)
+    """
+    Runs a SELECT and returns its rows as a list of dicts (column name -> text).
+    Uses `COPY (<query>) TO STDOUT WITH CSV HEADER`, so multi-line queries, `--` comments and
+    embedded newlines in values are all preserved.
+    """
+    if not has_db_auth():
+        raise RuntimeError(AUTH_HELP)
+    inner = sql.strip().rstrip(";").rstrip()
+    copy_sql = f"COPY (\n{inner}\n) TO STDOUT WITH (FORMAT csv, HEADER true)"
+    args = psql_base_args(dbname) + ["-v", "ON_ERROR_STOP=1", "-c", copy_sql]
+    res = run_subprocess_checked(args, env=psql_env(), what="psql query")
+    return list(csv.DictReader(io.StringIO(res.stdout, newline="")))
 
 # -----------------------------------------------------------------------------
 # String, Type, and Identifier Mappers

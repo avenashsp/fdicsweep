@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-import sys
-from pathlib import Path
-_ROOT = Path(__file__).resolve().parent.parent
-_TRACK = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-if str(_TRACK) not in sys.path:
-    sys.path.insert(0, str(_TRACK))
-
 """
 03_typeGateway.py - Pre-Flight Structure & Data Type Quality Gate
 Reads sampled records directly from S3 files and validates them against the target
@@ -397,4 +388,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     tables = {t.strip().upper() for t in args.tables.split(",")} if args.tables else None
-    run_type_gate(sample_rows=args.rows, max_tables=args.max_tables, tables_filter=tables)
+    ok = run_type_gate(sample_rows=args.rows, max_tables=args.max_tables, tables_filter=tables)
+    sys.exit(0 if ok else 1)

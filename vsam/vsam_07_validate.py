@@ -23,18 +23,11 @@ import argparse
 from pathlib import Path
 import pandas as pd
 
-_ROOT = Path(__file__).resolve().parent.parent
-_TRACK = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-if str(_TRACK) not in sys.path:
-    sys.path.insert(0, str(_TRACK))
-
 from sweep_common import (
     VSAM_REPORTS_DIR, CTL_SCHEMA,
     get_logger, get_timestamp, get_db_name, generate_excel_report, run_psql, query_db_rows, q
 )
-from vsam_common import OUT, load_csv_safe, read_json
+from vsam.vsam_common import OUT, load_csv_safe, read_json
 
 logger = get_logger("vsam_07_validate", "vsam_07_validate")
 
@@ -120,9 +113,9 @@ def main():
                     "schema": parts[1], "table": parts[2],
                     "status": parts[3], "rows": parts[4]
                 }
-    except Exception as e:
-        logger.warning(f"Could not query load_log ({e}); empty.")
-        loaded_map = {}
+    except RuntimeError as e:
+        logger.error(f"Cannot validate: failed to query {CTL_SCHEMA}.load_log: {e}")
+        return False
 
     fname_col = "s3_filename" if "s3_filename" in lm.columns else "csv_filename"
     recon = []
@@ -166,11 +159,11 @@ def main():
     WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema')
     ORDER BY c.table_schema, c.table_name, c.ordinal_position;
     """
-    catalog_rows = []
     try:
         catalog_rows = query_db_rows(catalog_sql)
-    except Exception as e:
-        logger.warning(f"Could not query database catalog (check credentials/sweep.env): {e}")
+    except RuntimeError as e:
+        logger.error(f"Cannot validate: failed to query the database catalog (check credentials/sweep.env): {e}")
+        return False
     db_cols = {}  # (schema, table) -> {col_name: {type, len, prec, scale, nullable}}
     for r in catalog_rows:
         parts = r.split("|")
@@ -198,11 +191,11 @@ def main():
       AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')
     GROUP BY tc.table_schema, tc.table_name;
     """
-    pk_rows_raw = []
     try:
         pk_rows_raw = query_db_rows(pk_sql)
-    except Exception as e:
-        logger.warning(f"Could not query database PK constraints: {e}")
+    except RuntimeError as e:
+        logger.error(f"Cannot validate: failed to query database PK constraints: {e}")
+        return False
     db_pks = {}  # (schema, table) -> pk_cols_csv
     for r in pk_rows_raw:
         parts = r.split("|")
@@ -223,7 +216,8 @@ def main():
             try:
                 cnt_str = run_psql(f"SELECT count(*) FROM {tgt};", tuples_only=True)
                 cnt = int(cnt_str.strip())
-            except Exception:
+            except (RuntimeError, ValueError) as e:
+                logger.warning(f"Exact count failed for {tgt}: {e}")
                 cnt = -1
 
         db_col_map = db_cols.get(tbl_key, {})
@@ -359,6 +353,9 @@ def main():
     for line in summary_lines:
         logger.info(line)
 
+    # Parity verdict: every mapped file loaded, no missing columns, no type mismatches.
+    return not_loaded == 0 and missing_cols == 0 and type_mismatches == 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(0 if main() is not False else 1)

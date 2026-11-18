@@ -20,19 +20,12 @@ import sys
 import re
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent.parent
-_TRACK = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-if str(_TRACK) not in sys.path:
-    sys.path.insert(0, str(_TRACK))
-
 import pandas as pd
 from sweep_common import (
     VSAM_COPYBOOK_DIR, VSAM_REPORTS_DIR,
     get_logger, get_timestamp, get_db_name, generate_excel_report
 )
-from vsam_common import (
+from vsam.vsam_common import (
     OUT, norm_col, sql_type, field_lengths, norm_usage,
     is_key_group_or_field
 )
@@ -182,7 +175,7 @@ def main():
                 "status": "OK" if fields else "EMPTY"
             })
             logger.info(f"  [OK] {cb.name}: {len(fields)} fields, key={key_type} ({key_col_names or 'none'})")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - one bad copybook must not stop the rest; reported + exit code
             logger.warning(f"  [ERROR] {cb.name}: {e}")
             summary_rows.append({
                 "copybook_file": cb.name,
@@ -220,6 +213,12 @@ def main():
     for line in summary_lines:
         logger.info(line)
 
+    # Any copybook that failed to parse leaves downstream DDL/type mapping incomplete.
+    failed = [r["copybook_file"] for r in summary_rows if r["key_type"] == "ERROR"]
+    if failed:
+        logger.error(f"{len(failed)} copybook(s) failed to parse: {', '.join(failed[:10])}")
+    return not failed
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(0 if main() is not False else 1)

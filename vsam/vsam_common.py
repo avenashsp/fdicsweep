@@ -21,14 +21,6 @@ import sys
 import pandas as pd
 import numpy as np
 
-# Ensure parent directory is on sys.path
-_ROOT = Path(__file__).resolve().parent.parent
-_TRACK = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-if str(_TRACK) not in sys.path:
-    sys.path.insert(0, str(_TRACK))
-
 from sweep_common import (
     BASE_DIR, VSAM_INPUTS_DIR, VSAM_COPYBOOK_DIR, VSAM_OUTPUTS_DIR,
     AWS_REGION, STREAM_SCRIPT, CTL_SCHEMA, META_SCHEMA,

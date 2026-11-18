@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-import sys
-from pathlib import Path
-_ROOT = Path(__file__).resolve().parent.parent
-_TRACK = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-if str(_TRACK) not in sys.path:
-    sys.path.insert(0, str(_TRACK))
-
 """
 05_applyDDL.py - Target DDL Deployment & Partition Verification
 Applies sweep_meta.sql control schemas and executes outputs/pre_load/*_tables.sql
@@ -145,4 +136,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     schemas = {s.strip().lower() for s in args.schemas.split(",")} if args.schemas else None
-    deploy_ddl(schemas_filter=schemas, skip_meta=args.skip_meta)
+    ok = deploy_ddl(schemas_filter=schemas, skip_meta=args.skip_meta)
+    sys.exit(0 if ok else 1)

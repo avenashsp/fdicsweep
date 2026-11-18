@@ -63,13 +63,6 @@ import importlib
 from pathlib import Path
 from collections import defaultdict
 
-_ROOT = Path(__file__).resolve().parent.parent
-_TRACK = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-if str(_TRACK) not in sys.path:
-    sys.path.insert(0, str(_TRACK))
-
 from sweep_common import (
     ORACLE_INPUTS_DIR, ORACLE_DUMP_DIR, ORACLE_OUTPUTS_DIR,
     ORACLE_REPORTS_DIR, LOAD_LOG_TABLE,
@@ -1421,9 +1414,10 @@ if __name__ == "__main__":
     tables = {t.strip().lower() for t in args.tables.split(",")} if args.tables else None
     schemas = {s.strip().lower() for s in args.schemas.split(",")} if args.schemas else None
 
-    run_full_parity_audit(
+    ok = run_full_parity_audit(
         exact_counts=args.exact_counts,
         tables_filter=tables,
         schemas_filter=schemas,
         dump_file=args.file
     )
+    sys.exit(0 if ok else 1)
