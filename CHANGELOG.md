@@ -36,7 +36,7 @@ and no longer build shell commands from file names.
 - **VSAM load flags:** `--force-truncate` and `--dry-run` (also `sweep.py vsam load-data`, `vsam run-all --force-truncate`, `run-all --force-truncate`).
 - **Pipeline stops on failure** in the foreground (`run-all` exits with the failing step's code) and as a background job (job ends `ERRORED`).
 - **Locked, atomic job registry** (`registry_transaction`, `atomic_write_json`) shared by the CLI, the monitor and the supervisors.
-- **Test suite** (`tests/`, 127 tests): unit tests for helpers, process/lock/atomic-write behaviour, shell-quoting round-trips, truncate-once logic, job control, exit codes, module/facade imports, and PostgreSQL integration tests (hostile file names, atomic load of a truncated gzip, `--kill-db` isolation, timeouts, load-log keys). Integration tests skip automatically when no PostgreSQL is reachable.
+- **Test suite** (`tests/`, 128 tests): unit tests for helpers, process/lock/atomic-write behaviour, shell-quoting round-trips, truncate-once logic, job control, exit codes, module/facade imports, and PostgreSQL integration tests (hostile file names, atomic load of a truncated gzip, `--kill-db` isolation, timeouts, load-log keys). Integration tests skip automatically when no PostgreSQL is reachable.
 - **CI** (`.github/workflows/ci.yml`): compile + pyflakes + pytest on Python 3.9 and 3.12 against PostgreSQL 16.
 - **Packaging:** `pyproject.toml` (`pip install -e .`, `sweep` console script), `requirements.txt`, `requirements-dev.txt`.
 - `README.md` and `.gitignore` (secrets, logs, reports, outputs, caches, `.sweep_bg_jobs.json`).
