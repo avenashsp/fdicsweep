@@ -17,6 +17,7 @@ import argparse
 from pathlib import Path
 
 from sweep_common import (
+    log_summary,
     VSAM_OUTPUTS_DIR, VSAM_GEN_DDL_DIR, VSAM_PRE_LOAD_DIR, VSAM_REPORTS_DIR, SWEEP_META_SQL,
     get_logger, get_timestamp, get_db_name, generate_excel_report, run_psql, query_db_rows
 )
@@ -85,16 +86,10 @@ def main():
     logger.info(f"Target Provisioning Complete: {len(res)} tables verified in catalog.")
     logger.info(f"Excel Report: {report_file}")
 
-    summary_lines = [
-        "=" * 65,
-        f" EXECUTION SUMMARY: {Path(__file__).name}",
-        "=" * 65,
-        f"  tables provisioned in db   : {len(res):>10,}",
-        f"  note                       : {'PK constraints added in Step 07':>10}",
-        "=" * 65
-    ]
-    for line in summary_lines:
-        logger.info(line)
+    log_summary(logger, Path(__file__).name, [
+        ('tables provisioned in db', len(res)),
+        ('note', 'PK constraints added in Step 07'),
+    ])
 
 
 if __name__ == "__main__":

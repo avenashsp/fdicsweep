@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pandas as pd
 from sweep_common import (
+    log_summary,
     clip_error,
     generate_excel_report,
     get_db_name,
@@ -173,18 +174,12 @@ def main():
     })
     logger.info(f"Excel Report: {report_file}")
 
-    summary_lines = [
-        "=" * 65,
-        f" EXECUTION SUMMARY: {Path(__file__).name}",
-        "=" * 65,
-        f"  copybooks processed        : {len(summary_rows):>10,}",
-        f"  total fields extracted     : {len(all_rows):>10,}",
-        f"  copybooks with keys        : {sum(1 for r in summary_rows if r['key_type'] not in ('NONE','ERROR')):>10,}",
-        f"  composite keys             : {sum(1 for r in summary_rows if 'COMPOSITE' in r['key_type']):>10,}",
-        "=" * 65
-    ]
-    for line in summary_lines:
-        logger.info(line)
+    log_summary(logger, Path(__file__).name, [
+        ('copybooks processed', len(summary_rows)),
+        ('total fields extracted', len(all_rows)),
+        ('copybooks with keys', sum(1 for r in summary_rows if r['key_type'] not in ('NONE','ERROR'))),
+        ('composite keys', sum(1 for r in summary_rows if 'COMPOSITE' in r['key_type'])),
+    ])
 
     # Any copybook that failed to parse leaves downstream DDL/type mapping incomplete.
     failed = [r["copybook_file"] for r in summary_rows if r["key_type"] == "ERROR"]

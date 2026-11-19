@@ -10,6 +10,7 @@ import sys
 import argparse
 from pathlib import Path
 from sweep_common import (
+    log_summary,
     BASE_DIR,
     SWEEP_META_SQL,
     ORACLE_PRE_LOAD_DIR,
@@ -128,18 +129,12 @@ def deploy_ddl(schemas_filter=None, skip_meta=False):
     generate_excel_report(report_file, sheets)
     logger.info(f"Excel report generated: {report_file}")
     
-    summary_lines = [
-        "=" * 65,
-        f" EXECUTION SUMMARY: {Path(__file__).name}",
-        "=" * 65,
-        f"  ddl scripts executed       : {len(deployed_files):>10,}",
-        f"  tables deployed in postgres: {len(verified_tables):>10,}",
-        f"  declarative partitions     : {total_parts:>10,}",
-        f"  target database            : {PGDATABASE:>10}",
-        "=" * 65
-    ]
-    for line in summary_lines:
-        logger.info(line)
+    log_summary(logger, Path(__file__).name, [
+        ('ddl scripts executed', len(deployed_files)),
+        ('tables deployed in postgres', len(verified_tables)),
+        ('declarative partitions', total_parts),
+        ('target database', PGDATABASE),
+    ])
         
     failed = [d for d in deployed_files if d["status"] != "SUCCESS"]
     if failed:

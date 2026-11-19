@@ -1,4 +1,4 @@
-# SWEEP CLI Command Reference - Oracle Migration Track (v5.3.0)
+# SWEEP CLI Command Reference - Oracle Migration Track (v5.4.0)
 
 Complete command reference for the **Oracle Migration Track** of the SWEEP Unified Data Migration Framework.
 
@@ -247,7 +247,7 @@ python3 sweep.py oracle load-data --exclude-tables AUDITLOG,TRANSACTIONDETAIL
 # Ingest a specific S3 file URI directly
 python3 sweep.py oracle load-data --file "s3://your-migration-bucket/oracle-migration-qa/BSS01001.BROKERACCOUNTDETAIL_001.csv.gz"
 
-# Re-load files that are already recorded in sweep_ctl.load_log (upserts on PK, appends otherwise)
+# Re-load files even though S3 shows no change since the last load (upserts on the key, appends when there is none)
 python3 sweep.py oracle load-data --reload --tables BROKERACCOUNTDETAIL
 
 # Ingest only small reference files (<= 100 MB)
@@ -260,10 +260,15 @@ python3 sweep.py oracle load-data --min-size-mb 1000 --workers 2 --bg
 python3 -m oracle.oracle_06_load_data --workers 4 --bg
 ```
 
-* **Inputs**: S3 CSV files, `oracle/outputs/oracle_02_s3_file_map.csv`, `sweep_stream.sh`
-* **Outputs**: Data committed to Aurora PostgreSQL; audit logged in `sweep_ctl.load_log`
-* **Atomicity**: each file is one transaction (`\copy` + `load_log` insert + `COMMIT`); a failed or truncated stream leaves no rows behind. File names are shell-quoted, so keys with spaces, quotes or `;` are safe.
-* **Safety**: a failed "is the table empty?" / "does it have a PK?" lookup fails the file instead of guessing. Each file is bounded by `SWEEP_LOAD_TIMEOUT` (default 6 h).
+* **Inputs**: S3 CSV files, `oracle/outputs/oracle_02_s3_file_map.csv`, the foreign keys of `oracle/outputs/metadata/oracle_01_metadata_constraints.csv`, `sweep_stream.sh`
+* **Outputs**: Data committed to Aurora PostgreSQL; audit logged in `sweep_ctl.load_log`; rejected rows in `sweep_ctl.load_rejects`
+* **Load order**: parent tables first. The dependency graph comes from the foreign keys extracted in Step 01 (the target tables have none yet on Day-1) plus any live foreign keys in PostgreSQL. Tables are loaded **level by level** (level 0 = tables that reference nobody); all files of a level finish before the next level starts, with parallel workers inside a level. Self-references and cycles share one level. Foreign keys stay enabled and the `FK_MISSING` check stays; the ordering removes the false orphans. With `--fast-bulk` the files are loaded smallest to largest instead.
+* **Which files**: a file counts as already loaded only when `sweep_ctl.load_log` has a `SUCCESS` row whose stored S3 `LastModified`, `ETag` and size (columns `s3_last_modified`, `s3_etag`, `s3_size`) all equal what S3 reports now. Step 02 writes them to the file map; Step 06 re-checks the object (HEAD) right before loading and stores what it saw, so a stale file map does not matter. A re-delivered file (same name and path, different metadata) is loaded again; `--reload`, `--file` and `--filename` force a load. Rows from earlier versions without metadata are treated as loaded (use `--reload` to re-verify them). `load_log` keeps one row per URI.
+* **Triggers**: switched off for the load transaction (`SET LOCAL session_replication_role = replica`, or `DISABLE TRIGGER` / `ENABLE TRIGGER` inside the transaction as a fallback - `--trigger-mode`), so audit columns are set explicitly on updates.
+* **Upsert**: `INSERT ... ON CONFLICT (key) DO UPDATE ... WHERE (target columns) IS DISTINCT FROM (file columns)` - only rows that actually differ are updated. A `modifieddate` / `modifiedby` that comes from the file is source data and counts as a change. Counts: `inserted`, `updated`, `unchanged` (identical rows, not touched), `rejected`, `duplicates` (in-file, last row wins); `read = inserted + updated + unchanged + rejected + duplicates` is checked before the commit.
+* **Bad rows**: `NOT_NULL`, `CHECK`, `BAD_VALUE`, `FK_MISSING` and `ALT_KEY_CONFLICT` rows are rejected, not fatal; they are listed in `sweep_ctl.load_rejects` and the `Reject_Summary` / `Rejected_Rows` sheets. **By default (`--max-rejects 0`) rejected rows never fail a file**; only technical errors (a row-count mismatch, a broken stream) roll it back. `--max-rejects N` fails and rolls back a file at N rejected rows.
+* **Atomicity**: each file is one transaction (staging, validation, upsert, `load_log` row, `COMMIT`); a failed or truncated stream leaves no rows behind. File names are shell-quoted, so keys with spaces, quotes or `;` are safe.
+* **Safety**: a failed "is the table empty?" / "does it have a PK?" lookup fails the file instead of guessing. Each file is bounded by `SWEEP_LOAD_TIMEOUT` (default 6 h). PostgreSQL 16 or later is required (`pg_input_is_valid`).
 * **Exit code**: non-zero if any file failed
 * **Report**: `oracle/reports/<db>_oracle_06_load_data_report_<timestamp>.xlsx`
 * **Log**: `oracle/logs/<db>_oracle_06_load_data_<timestamp>.log`
@@ -360,13 +365,11 @@ python3 sweep.py oracle load-data --min-size-mb 100 --max-size-mb 1000 --workers
 python3 sweep.py oracle load-data --min-size-mb 1000 --workers 2 --bg
 ```
 
-### Step 06 robust load (v5.3.0)
+### Step 06 options (v5.4.0)
 
 ```bash
-python3 sweep.py oracle load-data --max-rejects 10          # default: file fails at 10 rejected rows
-python3 sweep.py oracle load-data --max-rejects 0           # never fail a file for rejected rows
-python3 sweep.py oracle load-data --fast-bulk               # direct COPY for empty, constraint-free tables
+python3 sweep.py oracle load-data                           # default: rejected rows never fail a file (--max-rejects 0)
+python3 sweep.py oracle load-data --max-rejects 10          # fail and roll back a file that reaches 10 rejected rows
+python3 sweep.py oracle load-data --fast-bulk               # direct COPY for empty, constraint-free tables, size order
 python3 sweep.py oracle load-data --trigger-mode disable    # when session_replication_role is not permitted
 ```
-
-Triggers do not fire during loads; bad rows (NOT NULL, CHECK, bad value, missing FK, alternate-key conflict) are written to `sweep_ctl.load_rejects` and to the `Reject_Summary` / `Rejected_Rows` sheets. Every file is loaded in one transaction and reconciled: `read = inserted + updated + unchanged + rejected + duplicates`.

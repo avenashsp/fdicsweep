@@ -1,4 +1,4 @@
-# SWEEP Migration Framework - Complete CLI Flags Reference (v5.3.0)
+# SWEEP Migration Framework - Complete CLI Flags Reference (v5.4.0)
 
 Complete flags reference for all CLI commands and python scripts in the **SWEEP Unified Data Migration Framework** across both **Oracle** and **VSAM** tracks.
 
@@ -37,7 +37,7 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 | **03** | `vsam.vsam_03_type_gate`<br>`python3 sweep.py vsam type-gate` | `'--workers WORKERS'`, `'--company COMPANY'`, `'--bg'`, `'-h, --help'` |
 | **04** | `vsam.vsam_04_generate_ddl`<br>`python3 sweep.py vsam gen-ddl` | `'--company COMPANY'`, `'--execute'`, `'--bg'`, `'-h, --help'` |
 | **05** | `vsam.vsam_05_apply_ddl`<br>`python3 sweep.py vsam apply-ddl` | `'--skip-meta'`, `'--bg'`, `'-h, --help'` |
-| **06** | `vsam.vsam_06_load_data`<br>`python3 sweep.py vsam load-data` | `'--workers WORKERS'`, `'--company COMPANY'`, `'--tables TABLES'`, `'--limit-files LIMIT_FILES'`, `'--force-truncate'`, `'--dry-run'`, `'--bg'`, `'-h, --help'` |
+| **06** | `vsam.vsam_06_load_data`<br>`python3 sweep.py vsam load-data` | `'--workers WORKERS'`, `'--company COMPANY'`, `'--tables TABLES'`, `'--limit-files LIMIT_FILES'`, `'--force-truncate'`, `'--reload'`, `'--max-rejects MAX_REJECTS'`, `'--dry-run'`, `'--bg'`, `'-h, --help'` |
 | **07** | `vsam.vsam_07_validate`<br>`python3 sweep.py vsam validate` | `'--exact-counts'`, `'--tables TABLES'`, `'--schema SCHEMA'`, `'--bg'`, `'-h, --help'` |
 | **All** | `python3 sweep.py vsam run-all` | `'--workers WORKERS'`, `'--force-truncate'`, `'--tbl-col {headers,copybook}'`, `'--bg'`, `'-h, --help'` |
 
@@ -143,9 +143,9 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 | `--max-size-mb MB`| float | none | Only load files with size <= MB | `--max-size-mb 100` |
 | `--min-size-mb MB`| float | none | Only load files with size >= MB | `--min-size-mb 1000` |
 | `--dry-run` | flag | false | List the files that would load without inserting to DB | `--dry-run` |
-| `--reload` | flag | false | Re-load files already recorded as `SUCCESS` in `sweep_ctl.load_log` (upsert on PK, append otherwise) | `--reload` |
-| `--max-rejects` | int | 10 | Oracle Step 06: fail and roll back a file when this many rows are rejected (NOT NULL / CHECK / bad value / FK / alternate-key conflict); `0` = never fail | `--max-rejects 50` |
-| `--fast-bulk` | flag | false | Oracle Step 06: direct COPY into an empty table without constraints (no bad-row isolation) | `--fast-bulk` |
+| `--reload` | flag | false | Load files again even when their S3 LastModified / ETag / size are unchanged since the last load (upsert on the key, append when there is none) | `--reload` |
+| `--max-rejects` | int | 0 | Oracle Step 06: fail and roll back a file when this many rows are rejected (NOT NULL / CHECK / bad value / FK / alternate-key conflict). `0` (default) = rejected rows never fail a file | `--max-rejects 50` |
+| `--fast-bulk` | flag | false | Oracle Step 06: direct COPY into an empty table without constraints (no bad-row isolation); also loads smallest to largest instead of parent tables first | `--fast-bulk` |
 | `--trigger-mode` | choice | auto | Oracle Step 06: how triggers are switched off while loading: `replica` (session_replication_role, no lock), `disable` (ALTER TABLE DISABLE TRIGGER), `auto` | `--trigger-mode disable` |
 | `--bg` | flag | false | Run as detached background daemon *(CLI only)* | `python3 sweep.py oracle load-data --bg` |
 
@@ -257,6 +257,8 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 | `--tables TABLES`| string | all tables | Comma-separated target tables to load | `--tables vsamkorg` |
 | `--limit-files N`| integer | all files | Limit total number of files loaded (testing) | `--limit-files 2` |
 | `--force-truncate` | flag | false | Tables without a PK are replaced by the newest snapshot automatically in a full run. In a PARTIAL run (`--company`, `--tables`, `--limit-files`) replacing a table that already has rows needs this flag, because other source files of the table may be missing | `--force-truncate` |
+| `--reload` | flag | false | VSAM Step 06: load files again even when their S3 LastModified / ETag / size are unchanged | `--reload` |
+| `--max-rejects` | int | 0 | VSAM Step 06: fail and roll back a file when this many rows are rejected (`BAD_VALUE`, `NOT_NULL`, `PK_BLANK`, `PK_SENTINEL`, `ALL_NULL`). `0` (default) = rejected rows never fail a file | `--max-rejects 25` |
 | `--dry-run` | flag | false | List the files that would be loaded; no database changes | `--dry-run` |
 | `--bg` | flag | false | Run in background daemon | `python3 sweep.py vsam load-data --bg` |
 
@@ -356,6 +358,7 @@ All parameters can be pre-configured via `sweep.env` located in the root reposit
 | `SWEEP_ALLOW_NO_PASSWORD` | Set to `1` for trust / peer authentication (no password, no `.pgpass`) | unset |
 | `SWEEP_PSQL_TIMEOUT` | Timeout in seconds for every `psql` call (queries, DDL files) | `7200` |
 | `SWEEP_LOAD_TIMEOUT` | Timeout in seconds for one file load (`\copy` pipeline); `0` disables. The load and its S3/gzip children are killed on expiry | `21600` |
+| `SWEEP_HEAD_THREADS` | Parallel S3 `HEAD` requests used to compare LastModified / ETag / size of already-loaded files before a load | `16` |
 | `SWEEP_CONNECT_RETRIES` | Retries (exponential backoff) for connection-establishment failures only; statements that actually ran are never retried | `3` |
 | `AWS_DEFAULT_REGION` | AWS Region for S3 buckets | `us-east-2` |
 | `ORACLE_S3_BUCKET` | S3 URI for Oracle track flat files | `s3://your-migration-bucket/oracle-migration-qa/` |

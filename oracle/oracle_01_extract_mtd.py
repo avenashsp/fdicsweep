@@ -21,6 +21,7 @@ import csv
 import argparse
 from pathlib import Path
 from sweep_common import (
+    log_summary,
     ORACLE_INPUTS_DIR, ORACLE_DUMP_DIR, ORACLE_REPORTS_DIR,
     META_TABLES_CSV, META_CONSTRAINTS_CSV, META_INDEXES_CSV, META_PARTITIONS_CSV,
     META_TABLE_STATS_CSV, META_SEQUENCES_CSV, META_OBJECTS_CSV,
@@ -797,22 +798,16 @@ def extract_metadata_from_master(sql_file_path=None, owners_filter=None):
     views_count = sum(1 for o in objects_list if o.get("object_type") == "VIEW")
     triggers_count = sum(1 for o in objects_list if o.get("object_type") == "TRIGGER")
     
-    summary_lines = [
-        "=" * 65,
-        f" EXECUTION SUMMARY: {Path(__file__).name}",
-        "=" * 65,
-        f"  tables extracted           : {len(seen_tables):>10,}",
-        f"  partitions extracted       : {len(partitions_list):>10,}",
-        f"  columns extracted          : {len(tables_list):>10,}",
-        f"  constraints extracted      : {len(constraints_list):>10,}",
-        f"  triggers extracted         : {triggers_count:>10,}",
-        f"  views extracted            : {views_count:>10,}",
-        f"  indexes extracted          : {len(indexes_list):>10,}",
-        f"  sequences extracted        : {len(sequences_list):>10,}",
-        "=" * 65
-    ]
-    for line in summary_lines:
-        logger.info(line)
+    log_summary(logger, Path(__file__).name, [
+        ('tables extracted', len(seen_tables)),
+        ('partitions extracted', len(partitions_list)),
+        ('columns extracted', len(tables_list)),
+        ('constraints extracted', len(constraints_list)),
+        ('triggers extracted', triggers_count),
+        ('views extracted', views_count),
+        ('indexes extracted', len(indexes_list)),
+        ('sequences extracted', len(sequences_list)),
+    ])
         
     return True
 

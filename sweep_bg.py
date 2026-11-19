@@ -9,7 +9,7 @@ The implementation lives in focused modules:
   sweep_dashboard.py  live terminal dashboard
 
 This module re-exports their public names (so `import sweep_bg` keeps working) and is also the
-script the detached supervisor runs:  python sweep_bg.py _runner <job> <cmd-json> <log-file>
+script the detached supervisor runs:  python3 sweep_bg.py _runner <job> <cmd-json> <log-file>
 """
 import sys
 

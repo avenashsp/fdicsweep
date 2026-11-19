@@ -21,6 +21,7 @@ from pathlib import Path
 from collections import defaultdict
 from sweep_streaming import read_stream_head
 from sweep_common import (
+    log_summary,
     AWS_REGION,
     generate_excel_report,
     get_db_name,
@@ -359,21 +360,15 @@ def run_type_gate(sample_rows=1000, max_tables=None, tables_filter=None):
     else:
         logger.info(f"Type gateway PASSED: {passed_count}/{len(table_summaries)} table(s) ready for ingestion.")
         
-    summary_lines = [
-        "=" * 65,
-        f" EXECUTION SUMMARY: {Path(__file__).name}",
-        "=" * 65,
-        f"  tables evaluated           : {len(table_summaries):>10,}",
-        f"  tables passed (ready)      : {passed_count:>10,}",
-        f"  tables blocked (failed)    : {failed_count:>10,}",
-        f"  total findings             : {len(all_findings):>10,}",
-        f"    - block findings         : {total_blocks:>10,}",
-        f"    - warn findings          : {total_warns:>10,}",
-        f"  gateway verdict            : {('PASS' if total_blocks == 0 else 'REJECT / FIX REQUIRED'):>10}",
-        "=" * 65
-    ]
-    for line in summary_lines:
-        logger.info(line)
+    log_summary(logger, Path(__file__).name, [
+        ('tables evaluated', len(table_summaries)),
+        ('tables passed (ready)', passed_count),
+        ('tables blocked (failed)', failed_count),
+        ('total findings', len(all_findings)),
+        ('  - block findings', total_blocks),
+        ('  - warn findings', total_warns),
+        ('gateway verdict', ('PASS' if total_blocks == 0 else 'REJECT / FIX REQUIRED')),
+    ])
         
     return True
 

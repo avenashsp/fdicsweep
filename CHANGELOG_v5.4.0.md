@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [5.4.0] - 2026-11-19
+
+Oracle Step 06 refinements, a VSAM Step 06 rewrite on the same workflow, and housekeeping.
+
+### Removed
+- **VSAM `--mode {default,data}`**: only the former `default` behaviour remains (primary keys are always applied before loading). The `DIRECT_INSERT` branch of the load strategy is gone.
+- **`--latest-only` / `--latest-version-only`** (VSAM Steps 02, 03, 06, `sweep.py`, report field `latest_only_mode`): "newest version per (company, source file)" is now **always on** - VSAM files are full snapshots.
+- **`VSAM_VERSION_MODE`, the load-policy code and the `loadpolicy_overrides` sheet** of `vsam_master_overrides.xlsx` (`version_mode_for`, `load_policy`, `load_policy.csv`).
+
+### Changed - Oracle Step 06
+- **`--max-rejects` now defaults to `0`**: valid rows always load; rejected rows never fail a file. Only technical errors (a row-count mismatch, a broken stream) roll a file back. `--max-rejects N` still fails a file that reaches N rejects.
+- **Only rows that differ are updated:** `ON CONFLICT (key) DO UPDATE ... WHERE (target columns) IS DISTINCT FROM (file columns)`. A `modifieddate` / `modifiedby` that comes from the file counts as a change; values the tool sets itself are not compared. `unchanged` = identical rows (not touched); the row-count check still balances. Inserts and updates are now told apart by the keys that existed before the statement, so the counts are also correct on **partitioned tables** (`RETURNING xmax` failed there with "cannot retrieve a system column in this context").
+- **Parent tables first** (`oracle/oracle_06_order.py`): the load order comes from the foreign keys extracted in Step 01 (plus live FKs in PostgreSQL) and runs **level by level** - all files of a level finish before the next level starts, parallel workers inside a level; self-references and cycles share a level. Foreign keys stay on and the `FK_MISSING` check stays. `--fast-bulk` loads smallest to largest instead. New `load_level` column in `File_Execution_Details`.
+- **New / re-delivered S3 files are detected by S3 metadata, not just by URI:** Step 02 writes `s3_last_modified`, `s3_etag`, `s3_size` to the file map; `sweep_ctl.load_log` gets the same three columns (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` in both `sweep_meta.sql` files and the VSAM control DDL); a file is already loaded only if its status is `SUCCESS` and all three values equal what S3 reports now. Step 06 checks the object (HEAD) right before loading and stores what it saw; Step 08 uses the same comparison (`s3_files_current / changed / pending`, parity status `S3_CHANGED_NOT_RELOADED`). `--reload`, `--file`, `--filename` still force a load. `load_log` stays one row per URI. Rows loaded by earlier versions (no metadata) are treated as loaded; use `--reload` to re-verify them.
+
+### Changed - VSAM Step 06 (rewrite, same workflow as Oracle)
+- **Staged, set-based, one transaction per file** (`vsam/vsam_06_pipeline.py`): bulk `\copy` into a raw temp table (columns via the Step 02 column map), validation and routing in SQL, upsert, row-count check (`read = inserted + updated + unchanged + rejected + duplicates`), `load_log` rows, `COMMIT`. No more 10,000-row `INSERT ... VALUES` batches; a failed file leaves no partial data.
+- **Schema routing in SQL:** `korg` last 3 digits -> active schema; unmatched, sentinel or inactive values -> `bcs`; files without copybook and korg go entirely to `bcs`.
+- **Keys:** only the copybook KEY-group key (every key column ACCEPTED) or a `korg_overrides` key is applied - never a guessed one. A key that cannot be applied (duplicates, key columns missing from the file) is an **error**: Step 03 reports `PK_ERROR` (the key stays visible instead of silently becoming "no PK"), Step 06 does not load the source. A file without a copybook is loaded keyless. Step 03's uniqueness check ignores blank / placeholder keys (they are rejected at load).
+- **Keyless tables (snapshot replace):** all files of one keyless table are loaded in a **single transaction on one connection** (several `\copy` into temp tables, `TRUNCATE` + `INSERT`, `load_log` rows, `COMMIT`); if any file fails, the table keeps its old data. The persistent `<table>__sweep_stg` table is gone. An older snapshot never overwrites a newer one; partial runs still need `--force-truncate`.
+- **Bad values are rejected, not NULLed:** `BAD_VALUE` (detail = column and value) goes to `sweep_ctl.load_rejects`. Dates such as `9999-12-31` are valid and kept.
+- **Blank / placeholder key rows are reported:** every skipped row is written to `load_rejects` with `PK_BLANK`, `PK_SENTINEL` or `ALL_NULL` and the row as JSON. New sheets `Reject_Summary` and `Rejected_Rows`; `LoadSummary` gains `inserted`, `updated`, `unchanged`, `rejected by reason`, `duplicates dropped`.
+- **`--max-rejects` (default 0)** and **`--reload`** are available for VSAM. Unchanged files (S3 LastModified + ETag + size) are skipped; a keyless shared table reloads **all** of its files when **any** of them changed, keyed tables load only the changed ones. Keyed tables never delete rows that are missing from a newer snapshot (intentional).
+- Shared building blocks moved to `sweep_loadpipe.py` (reject table, upsert SQL, table metadata, output markers) and `sweep_s3meta.py` (S3 metadata).
+
+### Added
+- **PostgreSQL 16+ start-up check** (`check_postgres_version`) in both Step 06 loaders and `sweep.py check`, with a clear message (`pg_input_is_valid` is required).
+- **Cleaner end-of-step summary:** every step now ends with one compact, aligned summary block (a single log record with dotted leaders, grouped sections for Steps 06) instead of a box of separate log lines.
+- Tests: parent-first ordering, `IS DISTINCT FROM` counts (incl. partitioned tables), S3-metadata change detection, VSAM staged load (one transaction, no partial data), `BAD_VALUE` / `PK_*` / `ALL_NULL` rejects, keyless shared-table replace, SQL ports of the Python PK / routing rules, version check, summary format.
+
+### Fixed
+- User-facing messages and help texts say `python3` (Amazon Linux), e.g. `python3 sweep.py oracle gate`.
+- `python3 sweep.py oracle gate` hint in Step 06 pointed to a non-existent `gate` top-level command.
+
+---
+
 ## [5.3.0] - 2026-11-19
 
 Oracle Step 06 robust load release. The VSAM track is unchanged apart from the shared control-schema DDL.
@@ -25,7 +61,7 @@ Oracle Step 06 robust load release. The VSAM track is unchanged apart from the s
 ### Changed
 - `oracle_06_load_data.load_single_file` returns a `LoadOutcome` (status, rows, seconds, error + counts).
 - Staging temp tables live on instance-local storage, so size ~ file size; use `--fast-bulk` for very large initial loads.
-- Version 5.3.0; changelog renamed `CHANGELOG_v5.3.0.md`.
+- Version 5.3.0; changelog renamed `CHANGELOG_v5.4.0.md`.
 
 ---
 

@@ -265,7 +265,7 @@ def compare_tables(db_connected, discrepancies, meta, pg_cat, schemas_filter, ta
                 "Object_Category": "TABLE", "Target_Schema": s, "Target_Table": t,
                 "Object_Name": t, "Discrepancy_Type": "MISSING_TABLE_IN_PG",
                 "Oracle_Expected": "Present in Dump", "Postgres_Actual": "Missing in DB",
-                "Actionable_Recommendation": "Run Step 05: python sweep.py oracle apply-ddl"
+                "Actionable_Recommendation": "Run Step 05: python3 sweep.py oracle apply-ddl"
             })
         else:
             tbl_status = "EXTRA_IN_PG"
@@ -485,7 +485,7 @@ def compare_constraints(db_connected, discrepancies, meta, pg_cat, schemas_filte
                     "Object_Category": "CONSTRAINT", "Target_Schema": s, "Target_Table": t,
                     "Object_Name": cn, "Discrepancy_Type": "MISSING_CONSTRAINT_IN_PG",
                     "Oracle_Expected": f"{exp_type} on ({cols})", "Postgres_Actual": "Missing in DB",
-                    "Actionable_Recommendation": "Run Step 07: python sweep.py oracle load-obj"
+                    "Actionable_Recommendation": "Run Step 07: python3 sweep.py oracle load-obj"
                 })
             else:
                 status = "EXTRA_IN_PG"

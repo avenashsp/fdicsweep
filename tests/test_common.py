@@ -6,7 +6,7 @@ import sweep_common as c
 
 
 def test_version_is_5_2_1():
-    assert c.__version__ == "5.3.0"
+    assert c.__version__ == "5.4.0"
 
 
 @pytest.mark.parametrize("line,expected", [
@@ -107,3 +107,34 @@ def test_exception_groups_are_tuples_of_exception_types():
     for grp in (c.PARSE_ERRORS, c.DB_ERRORS, c.FILE_READ_ERRORS, c.AWS_ERRORS):
         assert all(issubclass(e, Exception) for e in grp)
     assert RuntimeError in c.DB_ERRORS and OSError in c.FILE_READ_ERRORS
+
+
+def test_postgres_version_check(monkeypatch):
+    monkeypatch.setattr(c, "run_psql", lambda *a, **k: "150004\n")
+    with pytest.raises(RuntimeError, match="PostgreSQL 15 is too old.*16 or later"):
+        c.check_postgres_version()
+    monkeypatch.setattr(c, "run_psql", lambda *a, **k: "170002")
+    assert c.check_postgres_version() == 17
+    monkeypatch.setattr(c, "run_psql", lambda *a, **k: "160000")
+    assert c.check_postgres_version() == 16
+
+
+def test_summary_block_is_one_aligned_record():
+    text = c.format_summary("step.py", ["Files", ("planned", 1234), ("  - failed", 0), "Time", ("elapsed (seconds)", 3.5), ("verdict", "PASS")])
+    lines = text.splitlines()
+    assert lines[0] == "SUMMARY - step.py" and lines[1] == lines[-1] and set(lines[1].strip()) == {"="}
+    value_lines = [ln for ln in lines if " . " in ln or ln.rstrip().endswith(("1,234", "0", "3.5", "PASS"))]
+    assert len({len(ln) for ln in lines[2:-1] if ln.strip() not in ("Files", "Time")}) == 1        # values line up
+    assert any(ln.endswith("1,234") for ln in value_lines)
+
+
+def test_user_facing_text_says_python3_not_python():
+    import re
+    from pathlib import Path
+    root = Path(c.__file__).resolve().parent
+    bad = []
+    for f in list(root.glob("*.py")) + list(root.glob("oracle/*.py")) + list(root.glob("vsam/*.py")):
+        for n, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            if re.search(r"""["'`][^"'`]*\bpython (sweep|sweep_bg|-m|oracle|vsam)\b""", line):
+                bad.append(f"{f.name}:{n}: {line.strip()}")
+    assert not bad, "\n".join(bad)

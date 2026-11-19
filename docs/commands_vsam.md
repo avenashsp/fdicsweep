@@ -1,4 +1,4 @@
-# SWEEP CLI Command Reference - VSAM Migration Track (v5.3.0)
+# SWEEP CLI Command Reference - VSAM Migration Track (v5.4.0)
 
 Complete command reference for the **VSAM Migration Track** of the SWEEP Unified Data Migration Framework.
 
@@ -255,22 +255,36 @@ python3 -m vsam.vsam_05_apply_ddl
 ---
 
 ### Step 06: Schema-Segregated Streaming Ingestion & Dynamic Upsert (`load-data` / `load`)
-Streams VSAM flat files directly from S3 into PostgreSQL with live database constraint inspection. Primary keys are always applied before loading:
-- **Fresh Table**: applies PK constraints from `gen_ddl/<schema>_pk.sql` to available tables in PostgreSQL *before* loading data, validates every record against the PK constraint (`record_passes_pk_validation`), and inserts only valid records.
-- **Existing Table with PK**: upserts incoming data using the PK constraint (`ON CONFLICT (pk_cols) DO UPDATE SET ...`).
-- **Existing Table without PK**: replaced by the new snapshot (see *Snapshot replace* below).
-- Only the newest file version per (company, source file) is loaded (always on).
+Since 5.4.0 the VSAM loader works exactly like the Oracle loader: temp staging tables, bulk `\copy`, set-based validation in SQL and **one transaction per file** (`vsam/vsam_06_pipeline.py`; shared helpers in `sweep_loadpipe.py`). A failed file leaves no partial data.
 
-#### Snapshot replace for tables without a primary key
-VSAM files are **full snapshots**. A table without a primary key cannot be upserted, so each new snapshot **replaces** it - atomically and automatically:
-1. every file that feeds the table is loaded into one staging table `<table>__sweep_stg` (several files, e.g. different companies into the shared `bcs` schema, share it, so none wipes another);
-2. when the run finishes and **every** file of that table succeeded, one transaction does `TRUNCATE` + `INSERT ... SELECT` from the staging table + the `sweep_ctl.load_log` rows, then drops the staging table;
-3. if any file of the table failed, the staging table is dropped and the table keeps its old data (the sibling files are reported `FAILED: staged data discarded`).
+Per file, inside one `BEGIN ... COMMIT`:
+1. `\copy` the file into an all-text temp table (columns named after the table columns, using the Step 02 column map);
+2. each row is routed to its destination schema in SQL (see *Schema Routing Rules*);
+3. bad rows are rejected and recorded (see *Rejected rows*);
+4. typed temp table, then the upsert (keyed tables) or the snapshot replace (tables without a key);
+5. row-count check `read = inserted + updated + unchanged + rejected + duplicates`, otherwise the file rolls back;
+6. rejected rows go to `sweep_ctl.load_rejects`, the `sweep_ctl.load_log` rows (with the S3 metadata) are written, `COMMIT`.
 
-Other rules:
-- Tables **with** a primary key are upserted in place; rows that are missing from a newer snapshot are **not** deleted.
-- A file older than a snapshot of the same source that is already loaded is `SKIPPED`.
-- In a **partial run** (`--company`, `--tables`, `--limit-files`) other source files of a shared table may be missing, so replacing a table that already holds rows needs `--force-truncate`. Full runs need no flag.
+**Keys.** Only a primary key from the copybook KEY group (every key column an ACCEPTED match) or from `korg_overrides` is applied - never a guessed one. The key is applied to the destination tables before the load; if it cannot be applied (for example duplicates in the data, or key columns missing from the file) that is an **error**: the source is not loaded (Step 03 reports `PK_ERROR`, Step 06 fails the file). A file without a copybook is loaded **without** a key.
+
+**Keyed tables** are upserted: `INSERT ... ON CONFLICT (key) DO UPDATE ... WHERE (table columns) IS DISTINCT FROM (file columns)`, so only rows that actually differ are updated (`inserted`, `updated`, `unchanged` are counted separately). Rows missing from a newer snapshot are **never deleted**.
+
+**Tables without a key (snapshot replace).** VSAM files are full snapshots, so a keyless table is **replaced**. All files that feed one keyless table are loaded in a **single transaction on one connection** (one `\copy` per file into temp tables, then `TRUNCATE` + `INSERT`, the load_log rows and `COMMIT`). If any file of the table fails, the whole transaction rolls back and the table keeps its old data (every file of the table is reported `FAILED`).
+
+**Which files are loaded.** Only the newest version per (company, source file). A file counts as already loaded only when `sweep_ctl.load_log` has `SUCCESS` rows for it and the stored S3 `LastModified`, `ETag` and size all equal what S3 reports now (Step 06 checks the object right before loading and stores the values). A changed file is reloaded even with the same name and path; `--reload` forces a reload. A keyless shared table reloads **all** of its files whenever **any** one of them changed; keyed tables load only the changed files. A file older than a snapshot of the same source that is already loaded is `SKIPPED`.
+
+In a **partial run** (`--company`, `--tables`, `--limit-files`) other source files of a shared keyless table may be missing, so replacing a table that already holds rows needs `--force-truncate`. Full runs need no flag.
+
+#### Rejected rows
+| Reason | Meaning |
+|---|---|
+| `BAD_VALUE` | a value does not fit the column type (`pg_input_is_valid`); detail = column and value. Dates such as `9999-12-31` are valid and kept. |
+| `NOT_NULL` | NOT NULL column without a value |
+| `PK_BLANK` | keyed table: a primary key column is NULL / empty / `nan` / `none` / `null` |
+| `PK_SENTINEL` | keyed table: a primary key column is all 9s (`9999`, `9999-99-99`, ...) |
+| `ALL_NULL` | keyed table: every column is empty, blank or a 0s / 9s placeholder |
+
+Tables without a key load every row (nothing is rejected for blank or placeholder values). Rejected rows are stored in `sweep_ctl.load_rejects` (reason, detail, record number, the row as JSON) and shown in the `Reject_Summary` and `Rejected_Rows` sheets. **By default a rejected row never fails the file** (`--max-rejects 0`); `--max-rejects N` fails and rolls back a file that reaches N rejected rows.
 
 ```bash
 # Replace a populated keyless table from a filtered (partial) run - only when you know no other source feeds it
@@ -278,9 +292,13 @@ python3 sweep.py vsam load-data --company FDIC --force-truncate --workers 4
 
 # Preview which files would be loaded, without touching the database
 python3 sweep.py vsam load-data --dry-run
+
+# Load again even though S3 shows no change / fail files that reach 25 rejected rows
+python3 sweep.py vsam load-data --reload
+python3 sweep.py vsam load-data --max-rejects 25
 ```
 
-> VSAM Step 06 loads in 10,000-row `INSERT` batches. Keyed tables are written in place (a file that fails part-way can be partially loaded; re-running upserts); keyless tables are atomic thanks to the staging swap. Files that were loaded earlier are processed again (idempotent for both kinds). Load results are logged per destination schema in `sweep_ctl.load_log` (keyed `<uri>#<schema>`); if that log write fails the file is reported `FAILED`.
+PostgreSQL **16 or later** is required (`pg_input_is_valid`); the loader stops with a clear message otherwise.
 
 #### Schema Routing Rules:
 - **No copybook and no korg column**: Loaded **directly into the `bcs` schema**.
@@ -305,30 +323,23 @@ python3 -m vsam.vsam_06_load_data --workers 4
 ```
 
 #### Generated Excel Workbook (`vsam/reports/<db>_vsam_06_load_data_report_<timestamp>.xlsx`, plus `vsam/outputs/vsam_06_load_log_<run_id>.csv`):
-1. **`LoadSummary` Sheet (17 Columns)**:
-   - `s3 filename`: Source S3 file basename.
-   - `tablename`: Destination table name.
-   - `copybook`: Copybook name or `NO_COPYBOOK`.
-   - `korg column`: Korg column name or `NO_KORG`.
-   - `total recs`: Total raw records in file.
-   - `loaded recs`: Successfully committed records.
-   - `skipped recs`: Skipped records (duplicates/invalid PKs).
-   - `records loaded in mapped schema`: Records per declared mapped schema, as text: `bss01104 = 20, bss01112 = 34` (blank when none).
-   - `records loaded in unmapped schema`: Records per non-mapped target schema, same format (blank when none).
-   - `records loaded in bcs schema`: Records routed to the fallback `bcs` schema.
-   - `load %`: Percentage of records loaded into the mapped schema out of total file records: `(mapped_loaded / total_records) * 100`.
-   - `has PK?`: `YES` or `NO`.
-   - `PK columns`: Primary key column names.
-   - `skipped/failed reason`: The error message or skip reason, up to 1,000 characters per cell (longer text ends with `...[+N chars]`).
-   - `duration`: Execution duration in seconds.
-   - `status`: `SUCCESS`, `SKIPPED`, or `FAILED`.
-   - `full s3 uri`: Complete S3 URI.
-2. **`SchemaBreakdown` Sheet**:
-   - Pivot matrix displaying **S3 filenames** and **tablenames** as rows.
-   - Destination **schemas** as columns (`bcs`, `bss01104`, `bss01105`, `bss01112`, etc.) plus a `Total` column.
-   - Record counts populated at each file/schema intersection.
-   - Grand `TOTAL` summary row at the bottom.
-3. **`RunOverview` Sheet**: run id, task / success / failed counts, rows loaded and skipped, worker count.
+1. **`LoadSummary` Sheet**:
+   - `s3 filename`, `tablename`, `copybook` (name or `NO_COPYBOOK`), `korg column` (name or `NO_KORG`)
+   - `total recs`: records read from the file
+   - `loaded recs`: valid records applied to the tables (`inserted` + `updated` + `unchanged`)
+   - `inserted` / `updated` / `unchanged`: new rows / rows whose values changed / identical rows that were not touched
+   - `skipped recs`: rejected records (all reasons, duplicates not included)
+   - `rejected by reason`: per-reason counts, e.g. `ALL_NULL = 1, BAD_VALUE = 2, PK_BLANK = 3`
+   - `duplicates dropped`: duplicate key rows inside the file (last row wins)
+   - `records loaded in mapped schema` / `records loaded in unmapped schema`: per schema as text, `bss01104 = 20, bss01112 = 34` (blank when none)
+   - `records loaded in bcs schema`, `load %` (`mapped_loaded / total_records * 100`)
+   - `has PK?`, `PK columns`
+   - `skipped/failed reason`: the reject summary or the error message, up to 1,000 characters per cell (longer text ends with `...[+N chars]`)
+   - `duration`, `status` (`SUCCESS`, `SKIPPED` or `FAILED`), `full s3 uri`
+2. **`SchemaBreakdown` Sheet**: pivot of file/table rows by destination schema (`bcs`, `bss01104`, ...) plus `Total`, with a `TOTAL` row.
+3. **`Reject_Summary` Sheet**: one row per file, table and reason with the row count and a sample detail.
+4. **`Rejected_Rows` Sheet**: the rejected rows (file line number, destination schema, reason, detail, row as JSON, up to 10,000 rows; all of them are in `sweep_ctl.load_rejects`).
+5. **`RunOverview` Sheet**: run id, task / success / failed counts, skipped (unchanged / older snapshot), rows loaded, rejected and duplicate counts, reject limit, worker count.
 
 * **Exit code**: non-zero if any file failed to load.
 

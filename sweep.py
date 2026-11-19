@@ -7,8 +7,8 @@ Unified CLI orchestrating multi-terabyte data migration pipelines from
 Oracle dumps and VSAM flat files to AWS RDS Aurora PostgreSQL.
 
 Usage:
-  python sweep.py <track> <command> [options]
-  python sweep.py <command> [options]
+  python3 sweep.py <track> <command> [options]
+  python3 sweep.py <command> [options]
 
 Tracks:
   oracle       Oracle to PostgreSQL migration pipeline (Steps 01 to 08)
@@ -35,7 +35,7 @@ from sweep_common import (
     ORACLE_INPUTS_DIR, ORACLE_OUTPUTS_DIR, ORACLE_REPORTS_DIR,
     VSAM_INPUTS_DIR, VSAM_OUTPUTS_DIR, VSAM_COPYBOOK_DIR, VSAM_REPORTS_DIR,
     PGHOST, PGPORT, PGDATABASE, PGUSER, has_db_auth, AWS_REGION, S3_BUCKET, ORACLE_S3_BUCKET, VSAM_S3_BUCKET,
-    DEFAULT_WORKERS, PSQL_BIN, get_logger, run_psql
+    DEFAULT_WORKERS, PSQL_BIN, check_postgres_version, get_logger, run_psql
 )
 import sweep_bg
 
@@ -105,6 +105,11 @@ def cmd_check(args):
         try:
             run_psql("SELECT 1;")
             print(fmt_line("Connection", "SUCCESS"))
+            try:
+                print(fmt_line("PostgreSQL version", f"SUCCESS (PostgreSQL {check_postgres_version()}; 16 or later required)"))
+            except RuntimeError as e:
+                print(fmt_line("PostgreSQL version", f"FAILED ({str(e)[:90]})"))
+                check_ok = False
         except RuntimeError as e:
             err_line = str(e).splitlines()[0] if str(e) else "Connection failed"
             print(fmt_line("Connection", f"FAILED ({err_line[:60]})"))
@@ -275,7 +280,7 @@ VSAM_STEPS = [
 def step(track, module, *args):
     """
     Command line for one pipeline step. Steps run as modules from the repository root
-    (`python -m oracle.oracle_05_apply_ddl`), so imports resolve without any sys.path patching.
+    (`python3 -m oracle.oracle_05_apply_ddl`), so imports resolve without any sys.path patching.
     """
     return [sys.executable, "-m", f"{track}.{module}", *[str(a) for a in args]]
 
@@ -325,7 +330,7 @@ def pipeline_or_bg(job_name, label, commands, bg_command, run_in_bg):
 def handle_oracle(args):
     cmd = args.oracle_cmd
     if not cmd:
-        print("Usage: python sweep.py oracle <command> [options]")
+        print("Usage: python3 sweep.py oracle <command> [options]")
         print("Commands: extract, inventory, gate, gen-ddl, apply-ddl, load-data, load-obj, validate, run-all")
         sys.exit(0)
 
@@ -404,7 +409,7 @@ def handle_oracle(args):
 def handle_vsam(args):
     cmd = args.vsam_cmd
     if not cmd:
-        print("Usage: python sweep.py vsam <command> [options]")
+        print("Usage: python3 sweep.py vsam <command> [options]")
         print("Commands: extract, inventory, type-gate, gen-ddl, apply-ddl, load-data, load-obj, validate, run-all")
         sys.exit(0)
 

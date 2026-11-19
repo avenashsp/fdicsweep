@@ -80,7 +80,6 @@ def test_older_snapshot_is_detected(pg_db):
 
 
 def _spec(path, i, name):
-    from sweep_streaming import stream_program_literal  # noqa: F401 - imported by run_unit itself
     return {"i": i, "uri": str(path), "name": name, "table": "kk", "task": {"target_schemas": ["bcs"]}, "source_key": f"A|{name}",
             "cb_display": "NO_COPYBOOK", "sc_display": "NO_KORG", "has_schema_col": False, "route_col": None,
             "columns_meta": [{"col_name": "a", "sql_type": "integer"}, {"col_name": "b", "sql_type": "text"}],

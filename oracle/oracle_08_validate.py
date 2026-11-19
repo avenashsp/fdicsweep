@@ -63,6 +63,7 @@ from pathlib import Path
 from collections import defaultdict
 
 from sweep_common import (
+    log_summary,
     generate_excel_report,
     get_db_name,
     get_logger,
@@ -352,25 +353,19 @@ def run_full_parity_audit(exact_counts=False, tables_filter=None, schemas_filter
     generate_excel_report(report_file, sheets)
     logger.info(f"[+] Master Excel validation report created successfully: {report_file}")
     
-    summary_lines = [
-        "=" * 65,
-        f" EXECUTION SUMMARY: {Path(__file__).name}",
-        "=" * 65,
-        f"  schemas audited            : {total_schemas_matched:>10} / {total_schemas_ora}",
-        f"  tables audited             : {total_tables_matched:>10} / {total_tables_ora}",
-        f"  columns audited            : {total_cols_matched:>10} / {total_cols_ora}",
-        f"  constraints audited        : {total_cons_matched:>10} / {total_cons_ora}",
-        f"  indexes audited            : {total_idx_matched:>10} / {total_idx_ora}",
-        f"  sequences audited          : {total_seq_matched:>10} / {total_seq_ora}",
-        f"  views audited              : {total_views_matched:>10} / {total_views_ora}",
-        f"  triggers audited           : {total_trgs_matched:>10} / {total_trgs_ora}",
-        f"  row count parity           : {row_matched_cnt:>10} / {len(row_count_audit)} tables",
-        f"  total discrepancies        : {len(discrepancies):>10,}",
-        f"  overall audit verdict      : {('PASS' if is_overall_pass else 'ACTION REQUIRED'):>10}",
-        "=" * 65
-    ]
-    for line in summary_lines:
-        logger.info(line)
+    log_summary(logger, Path(__file__).name, [
+        ('schemas audited', f"{total_schemas_matched} / {total_schemas_ora}"),
+        ('tables audited', f"{total_tables_matched} / {total_tables_ora}"),
+        ('columns audited', f"{total_cols_matched} / {total_cols_ora}"),
+        ('constraints audited', f"{total_cons_matched} / {total_cons_ora}"),
+        ('indexes audited', f"{total_idx_matched} / {total_idx_ora}"),
+        ('sequences audited', f"{total_seq_matched} / {total_seq_ora}"),
+        ('views audited', f"{total_views_matched} / {total_views_ora}"),
+        ('triggers audited', f"{total_trgs_matched} / {total_trgs_ora}"),
+        ('row count parity', f"{row_matched_cnt} / {len(row_count_audit)} tables"),
+        ('total discrepancies', len(discrepancies)),
+        ('overall audit verdict', ('PASS' if is_overall_pass else 'ACTION REQUIRED')),
+    ])
         
     return is_overall_pass
 

@@ -19,7 +19,7 @@ from pathlib import Path
 
 from sweep_platform import make_symlink, group_popen_kwargs, kill_process_group
 
-__version__ = "5.3.0"
+__version__ = "5.4.0"
 
 def get_next_version(current_ver: str) -> str:
     """
@@ -249,6 +249,33 @@ LOAD_AUDIT_TABLE = f"{CTL_SCHEMA}.load_audit"
 def get_timestamp():
     """Returns standard timestamp string for file naming: YYYYMMDD_HHMMSS."""
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+SUMMARY_WIDTH = 62
+
+
+def format_summary(title, items, width=SUMMARY_WIDTH):
+    """
+    Compact, aligned end-of-step summary: one line per metric with a dotted leader and right-aligned value.
+    `items` is a list of (label, value); a plain string item is a section heading.
+    """
+    rule = "  " + "=" * width
+    out = [f"SUMMARY - {title}", rule]
+    for item in items:
+        if isinstance(item, str):
+            out.append(f"  {item}")
+            continue
+        label, value = item
+        text = f"{value:,}" if isinstance(value, (int, float)) and not isinstance(value, bool) else str(value)
+        dots = "." * max(2, width - len(label) - len(text) - 3)
+        out.append(f"  {label} {dots} {text}")
+    out.append(rule)
+    return "\n".join(out)
+
+
+def log_summary(logger, title, items):
+    """Logs the summary as ONE record (a single timestamp prefix), so the block stays aligned in console and log files."""
+    logger.info(format_summary(title, items))
 
 
 def get_logger(name, step_name=None, to_file=None, track=None):
@@ -590,6 +617,26 @@ def run_psql(cmd_or_sql, is_file=False, capture=True, extra_env=None, tuples_onl
     res = run_subprocess_checked(args, input_text=input_text, env=env, capture=capture,
                                  timeout=DEFAULT_PSQL_TIMEOUT if timeout is None else timeout)
     return (res.stdout or "").strip()
+
+
+MIN_PG_VERSION = 16
+
+
+def check_postgres_version(minimum=MIN_PG_VERSION):
+    """
+    Returns the PostgreSQL major version; raises RuntimeError with a clear message when the server is older than
+    `minimum`. Both Step 06 loaders validate values with pg_input_is_valid(), which needs PostgreSQL 16 or later.
+    """
+    out = run_psql("SHOW server_version_num;", tuples_only=True).strip()
+    try:
+        major = int(out) // 10000
+    except ValueError:
+        raise RuntimeError(f"Could not read the PostgreSQL version (server_version_num = {out!r})")
+    if major < minimum:
+        raise RuntimeError(
+            f"PostgreSQL {major} is too old: SWEEP needs PostgreSQL {minimum} or later (the loaders validate values with "
+            f"pg_input_is_valid, available from version {minimum}). Use an Aurora/RDS PostgreSQL {minimum}+ database.")
+    return major
 
 
 def query_db_rows(sql, dbname=None):

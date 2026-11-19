@@ -27,6 +27,7 @@ from pathlib import Path
 from itertools import groupby
 from collections import defaultdict
 from sweep_common import (
+    log_summary,
     ORACLE_INPUTS_DIR,
     ORACLE_DUMP_DIR,
     ORACLE_PRE_LOAD_DIR,
@@ -927,20 +928,14 @@ $$ LANGUAGE sql IMMUTABLE;
     generate_excel_report(report_file, sheets)
     logger.info(f"Excel report generated: {report_file}")
     
-    summary_lines = [
-        "=" * 65,
-        f" EXECUTION SUMMARY: {Path(__file__).name}",
-        "=" * 65,
-        f"  schemas processed          : {len(file_handles):>10,}",
-        f"  tables generated           : {len(generated_tables_summary):>10,}",
-        f"  partitioned tables         : {len(generated_partitions_summary):>10,}",
-        f"  child partitions generated : {sum(r['partition_count'] for r in generated_partitions_summary):>10,}",
-        f"  views translated           : {len(translated_views_summary):>10,}",
-        f"  triggers translated        : {len(translated_triggers_summary):>10,}",
-        "=" * 65
-    ]
-    for line in summary_lines:
-        logger.info(line)
+    log_summary(logger, Path(__file__).name, [
+        ('schemas processed', len(file_handles)),
+        ('tables generated', len(generated_tables_summary)),
+        ('partitioned tables', len(generated_partitions_summary)),
+        ('child partitions generated', sum(r['partition_count'] for r in generated_partitions_summary)),
+        ('views translated', len(translated_views_summary)),
+        ('triggers translated', len(translated_triggers_summary)),
+    ])
         
     return True
 

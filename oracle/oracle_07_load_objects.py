@@ -20,6 +20,7 @@ import time
 import argparse
 from pathlib import Path
 from sweep_common import (
+    log_summary,
     ORACLE_POST_LOAD_DIR,
     ORACLE_REPORTS_DIR,
     clip_error,
@@ -622,24 +623,18 @@ def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False):
     logger.info(f"Excel report generated: {report_file}")
     logger.info(f"Summary: Applied: {total_applied} | Skipped (Already Exist): {total_skipped_exists} | Skipped (No Data): {total_skipped_no_data} | Failed: {total_failed}")
     
-    summary_lines = [
-        "=" * 65,
-        f" EXECUTION SUMMARY: {Path(__file__).name}",
-        "=" * 65,
-        f"  total objects evaluated    : {len(all_object_actions):>10,}",
-        f"  objects applied (created)  : {total_applied:>10,}",
-        f"    - primary keys & unique  : {sum(1 for a in all_object_actions if a['status'] == 'APPLIED' and a['object_type'] in ('PK', 'UNIQUE')):>10,}",
-        f"    - check & alter stmts    : {sum(1 for a in all_object_actions if a['status'] == 'APPLIED' and a['object_type'] in ('CHECK', 'CHECK_VALIDATE', 'ALTER', 'ALTER_COLUMN', 'CONSTRAINT')):>10,}",
-        f"    - secondary indexes      : {sum(1 for a in all_object_actions if a['status'] == 'APPLIED' and a['object_type'] in ('INDEX', 'INDEX_ATTACH')):>10,}",
-        f"    - foreign keys (valid)   : {sum(1 for a in all_object_actions if a['status'] == 'APPLIED' and a['object_type'] in ('FK', 'FK_VALIDATE')):>10,}",
-        f"    - views & triggers       : {sum(1 for a in all_object_actions if a['status'] == 'APPLIED' and a['object_type'] in ('VIEW', 'TRIGGER')):>10,}",
-        f"  objects skipped (exists)   : {total_skipped_exists:>10,}",
-        f"  objects skipped (no data)  : {total_skipped_no_data:>10,}",
-        f"  objects failed             : {total_failed:>10,}",
-        "=" * 65
-    ]
-    for line in summary_lines:
-        logger.info(line)
+    log_summary(logger, Path(__file__).name, [
+        ('total objects evaluated', len(all_object_actions)),
+        ('objects applied (created)', total_applied),
+        ('  - primary keys & unique', sum(1 for a in all_object_actions if a['status'] == 'APPLIED' and a['object_type'] in ('PK', 'UNIQUE'))),
+        ('  - check & alter stmts', sum(1 for a in all_object_actions if a['status'] == 'APPLIED' and a['object_type'] in ('CHECK', 'CHECK_VALIDATE', 'ALTER', 'ALTER_COLUMN', 'CONSTRAINT'))),
+        ('  - secondary indexes', sum(1 for a in all_object_actions if a['status'] == 'APPLIED' and a['object_type'] in ('INDEX', 'INDEX_ATTACH'))),
+        ('  - foreign keys (valid)', sum(1 for a in all_object_actions if a['status'] == 'APPLIED' and a['object_type'] in ('FK', 'FK_VALIDATE'))),
+        ('  - views & triggers', sum(1 for a in all_object_actions if a['status'] == 'APPLIED' and a['object_type'] in ('VIEW', 'TRIGGER'))),
+        ('objects skipped (exists)', total_skipped_exists),
+        ('objects skipped (no data)', total_skipped_no_data),
+        ('objects failed', total_failed),
+    ])
         
     return total_failed == 0
 

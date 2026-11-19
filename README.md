@@ -1,4 +1,4 @@
-# SWEEP: Unified Data Migration Framework (v5.3.0)
+# SWEEP: Unified Data Migration Framework (v5.4.0)
 
 SWEEP migrates large financial datasets into **AWS RDS Aurora PostgreSQL** from two sources:
 
@@ -11,6 +11,7 @@ Data is streamed from S3 straight into PostgreSQL (`aws s3 cp - | gzip -dc | psq
 
 - Python 3.9+ with `pandas`, `numpy`, `openpyxl`, `boto3`, `python-dateutil` (`pip install -r requirements.txt`)
 - `psql` (PostgreSQL client) and the AWS CLI on `PATH`
+- PostgreSQL **16 or later** on the target (the loaders validate values with `pg_input_is_valid`)
 - Network access to the Aurora cluster and the S3 buckets
 
 ## Setup
@@ -46,8 +47,12 @@ python3 -m vsam.vsam_06_load_data --workers 4      # same thing, without the CLI
 
 Every step exits `0` on success and non-zero on failure.
 
-> **VSAM reloads:** a table that already holds rows but has no primary key is never truncated implicitly. Re-run with
-> `--force-truncate` to truncate it once per run and reload. `--dry-run` lists what would be loaded.
+> **Loads (both tracks):** every file is loaded in one transaction through temp staging tables; bad rows are rejected and
+> reported (`sweep_ctl.load_rejects`, `Reject_Summary` / `Rejected_Rows` sheets) and never fail a file unless
+> `--max-rejects N` is given. A file is loaded again only when its S3 LastModified / ETag / size changed (or with `--reload`).
+> Oracle loads parent tables first. A VSAM table without a primary key is replaced by the newest snapshot; in a *partial*
+> run (`--company` / `--tables` / `--limit-files`) replacing a populated table needs `--force-truncate`. `--dry-run` lists
+> what would be loaded.
 
 ### Pipeline stages
 
@@ -94,4 +99,4 @@ python3 -m pytest                     # PG* env vars (or SWEEP_ALLOW_NO_PASSWORD
 - [VSAM commands](docs/commands_vsam.md)
 - [Flag and environment reference](docs/flag_arguments.md)
 - [Sample outputs](docs/sweep_outputs.md)
-- [Changelog](CHANGELOG_v5.3.0.md)
+- [Changelog](CHANGELOG_v5.4.0.md)

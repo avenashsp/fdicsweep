@@ -26,6 +26,7 @@ from typing import NamedTuple
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from sweep_common import (
+    log_summary,
     ORACLE_OUTPUTS_DIR,
     ORACLE_REPORTS_DIR,
     ORACLE_LOGS_DIR,
@@ -34,6 +35,7 @@ from sweep_common import (
     LOAD_LOG_TABLE,
     has_db_auth,
     AUTH_HELP,
+    check_postgres_version,
     clip_error,
     get_logger,
     get_timestamp,
@@ -383,7 +385,7 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
                     logger.warning(f"Could not read gate report: {e}")
 
         if not passed_tables:
-            logger.error("No passed tables found from type gate! Run 'python sweep.py gate' first.")
+            logger.error("No passed tables found from type gate! Run 'python3 sweep.py oracle gate' first.")
             return False
 
         logger.info(f"Gate-Pass Active: Filtering ingestion to only the {len(passed_tables)} table(s) that PASSED the type gate.")
@@ -472,6 +474,11 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
         return True
 
     if not dry_run:
+        try:
+            check_postgres_version()
+        except RuntimeError as e:
+            logger.error(str(e))
+            return False
         ensure_reject_table()
         if trigger_mode == "auto":
             trigger_mode = probe_trigger_mode()
@@ -597,23 +604,28 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
     logger.info(f"Excel report generated: {report_file}")
     record_stream_end(None)
 
-    summary_lines = [
-        "=" * 65,
-        f" EXECUTION SUMMARY: {Path(__file__).name}",
-        "=" * 65,
-        f"  candidate files planned    : {total_candidates:>10,}",
-        f"  files executed this run    : {len(pending_jobs):>10,}",
-        f"  files successfully loaded  : {success_count:>10,}",
-        f"  files failed               : {failed_count:>10,}",
-        f"  files skipped (completed)  : {skipped_count:>10,}",
-        f"  total rows ingested        : {total_loaded_rows:>10,}",
-        f"  total volume loaded (GB)   : {round(total_loaded_bytes / (1024**3), 2):>10,}",
-        f"  elapsed duration (seconds) : {total_time:>10,}",
-        f"  overall throughput (r/s)   : {round(total_loaded_rows / max(total_time, 0.1)):>10,}",
-        "=" * 65
-    ]
-    for line in summary_lines:
-        logger.info(line)
+    total_inserted = sum(r.get("rows_inserted", 0) for r in results)
+    total_updated = sum(r.get("rows_updated", 0) for r in results)
+    total_unchanged = sum(r.get("rows_unchanged", 0) for r in results)
+    log_summary(logger, Path(__file__).name, [
+        "Files",
+        ("candidate files planned", total_candidates),
+        ("skipped (already loaded, unchanged)", skipped_count),
+        ("executed this run", len(pending_jobs)),
+        ("  - loaded", success_count),
+        ("  - failed", failed_count),
+        "Rows",
+        ("loaded (inserted + updated)", total_loaded_rows),
+        ("  - inserted", total_inserted),
+        ("  - updated (value changed)", total_updated),
+        ("unchanged (identical, not touched)", total_unchanged),
+        ("rejected (see Rejected_Rows sheet)", total_rejected),
+        ("duplicates dropped", total_dups),
+        "Performance",
+        ("volume loaded (GB)", round(total_loaded_bytes / (1024**3), 2)),
+        ("elapsed (seconds)", total_time),
+        ("throughput (rows/sec)", round(total_loaded_rows / max(total_time, 0.1))),
+    ])
 
     return failed_count == 0
 

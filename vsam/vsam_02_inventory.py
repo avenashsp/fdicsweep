@@ -22,6 +22,7 @@ from collections import defaultdict
 import pandas as pd
 
 from sweep_common import (
+    log_summary,
     VSAM_REPORTS_DIR,
     VSAM_S3_BUCKET,
     AWS_REGION,
@@ -826,19 +827,13 @@ def main():
     logger.info(f"Output CSVs : {OUT / 'vsam_02_inventory.csv'}, {OUT / 'vsam_02_load_matrix.csv'}, {OUT / 'vsam_02_latest_file_headers.csv'}")
     logger.info(f"Excel Report: {report_file}")
 
-    summary_lines = [
-        "=" * 65,
-        f" EXECUTION SUMMARY: {Path(__file__).name}",
-        "=" * 65,
-        f"  files discovered           : {len(df):>10,}",
-        f"  ready to load              : {sum(1 for r in inv if r['mapping_status'] == 'READY'):>10,}",
-        f"  review / unmapped          : {sum(1 for r in inv if r['mapping_status'] != 'READY'):>10,}",
-        f"  target table loads planned : {len(lm):>10,}",
-        f"  total volume (MB)          : {round(df['file_size_mb'].sum(), 2) if not df.empty and 'file_size_mb' in df.columns else 0:>10,}",
-        "=" * 65
-    ]
-    for line in summary_lines:
-        logger.info(line)
+    log_summary(logger, Path(__file__).name, [
+        ('files discovered', len(df)),
+        ('ready to load', sum(1 for r in inv if r['mapping_status'] == 'READY')),
+        ('review / unmapped', sum(1 for r in inv if r['mapping_status'] != 'READY')),
+        ('target table loads planned', len(lm)),
+        ('total volume (MB)', round(df['file_size_mb'].sum(), 2) if not df.empty and 'file_size_mb' in df.columns else 0),
+    ])
 
 
 if __name__ == "__main__":

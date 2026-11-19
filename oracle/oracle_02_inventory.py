@@ -19,6 +19,7 @@ from pathlib import Path
 from collections import defaultdict
 from sweep_s3meta import canon_etag, canon_time
 from sweep_common import (
+    log_summary,
     ORACLE_INPUTS_DIR,
     ORACLE_OUTPUTS_DIR,
     ORACLE_REPORTS_DIR,
@@ -618,22 +619,16 @@ def build_inventory(s3_uri=None, mock_files=None, owners_filter=None, tables_fil
     chunk_count = sum(1 for r in file_map_rows if r['file_format'] == 'gzip' and is_chunked_file(r['filename'], r['table_name']))
     csv_count = sum(1 for r in file_map_rows if r['file_format'] == 'csv')
 
-    summary_lines = [
-        "=" * 65,
-        f" EXECUTION SUMMARY: {Path(__file__).name}",
-        "=" * 65,
-        f"  tables identified          : {len(volume_by_table):>10,}",
-        f"  files selected for load    : {len(file_map_rows):>10,}",
-        f"    - consolidated gzip      : {cons_count:>10,}",
-        f"    - chunked gzip           : {chunk_count:>10,}",
-        f"    - uncompressed csv       : {csv_count:>10,}",
-        f"  total volume to load (MB)  : {round(total_bytes / (1024**2), 2):>10,}",
-        f"  total volume to load (GB)  : {total_gb:>10,}",
-        f"  files ignored / skipped    : {len(ignored_files):>10,}",
-        "=" * 65
-    ]
-    for line in summary_lines:
-        logger.info(line)
+    log_summary(logger, Path(__file__).name, [
+        ('tables identified', len(volume_by_table)),
+        ('files selected for load', len(file_map_rows)),
+        ('  - consolidated gzip', cons_count),
+        ('  - chunked gzip', chunk_count),
+        ('  - uncompressed csv', csv_count),
+        ('total volume to load (MB)', round(total_bytes / (1024**2), 2)),
+        ('total volume to load (GB)', total_gb),
+        ('files ignored / skipped', len(ignored_files)),
+    ])
 
     return True
 

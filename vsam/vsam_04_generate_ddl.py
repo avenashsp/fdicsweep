@@ -31,6 +31,7 @@ from pathlib import Path
 import pandas as pd
 
 from sweep_common import (
+    log_summary,
     VSAM_OUTPUTS_DIR,
     VSAM_GEN_DDL_DIR,
     VSAM_REPORTS_DIR,
@@ -354,19 +355,13 @@ def main():
     else:
         logger.info("Dry run complete. Use --execute or 'sweep.py vsam apply-ddl' to provision tables.")
 
-    summary_lines = [
-        "=" * 65,
-        f" EXECUTION SUMMARY: {Path(__file__).name}",
-        "=" * 65,
-        f"  schemas generated          : {len(per_schema_pre):>10,}",
-        f"  tables generated           : {sum(len(v) for v in per_schema_pre.values()):>10,}",
-        f"  tables with PK constraint  : {sum(len(v) for v in per_schema_post.values()):>10,}",
-        f"  tables skipped             : {sum(1 for r in report if r['status'] != 'DDL_OK'):>10,}",
-        f"  execution mode             : {'LIVE EXECUTE' if args.execute else 'DRY RUN':>10}",
-        "=" * 65
-    ]
-    for line in summary_lines:
-        logger.info(line)
+    log_summary(logger, Path(__file__).name, [
+        ('schemas generated', len(per_schema_pre)),
+        ('tables generated', sum(len(v) for v in per_schema_pre.values())),
+        ('tables with PK constraint', sum(len(v) for v in per_schema_post.values())),
+        ('tables skipped', sum(1 for r in report if r['status'] != 'DDL_OK')),
+        ('execution mode', 'LIVE EXECUTE' if args.execute else 'DRY RUN'),
+    ])
 
 
 if __name__ == "__main__":

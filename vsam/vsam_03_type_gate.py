@@ -31,6 +31,7 @@ from pathlib import Path
 import pandas as pd
 
 from sweep_common import (
+    log_summary,
     VSAM_REPORTS_DIR,
     clip_error,
     AWS_REGION,
@@ -935,21 +936,15 @@ def main():
     logger.info(f"Output CSV   : {OUT / 'vsam_03_type_gate_status.csv'}")
     logger.info(f"Excel Report : {report_file}")
 
-    summary_lines = [
-        "=" * 65,
-        f" EXECUTION SUMMARY: {Path(__file__).name}",
-        "=" * 65,
-        f"  source tables profiled     : {total:>10,}",
-        f"  total S3 files analyzed    : {len(gate_rows):>10,}",
-        f"  PK verified (unique) files : {passed:>10,}",
-        f"  PK failed files            : {failed:>10,}",
-        f"  schema col detected files  : {with_schema_col:>10,}",
-        f"  schema col in PK files     : {schema_col_pk:>10,}",
-        f"  type issue columns         : {len(type_issue_rows):>10,}",
-        "=" * 65
-    ]
-    for line in summary_lines:
-        logger.info(line)
+    log_summary(logger, Path(__file__).name, [
+        ('source tables profiled', total),
+        ('total S3 files analyzed', len(gate_rows)),
+        ('PK verified (unique) files', passed),
+        ('PK failed files', failed),
+        ('schema col detected files', with_schema_col),
+        ('schema col in PK files', schema_col_pk),
+        ('type issue columns', len(type_issue_rows)),
+    ])
 
 
 if __name__ == "__main__":

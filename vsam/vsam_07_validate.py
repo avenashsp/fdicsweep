@@ -24,6 +24,7 @@ from pathlib import Path
 import pandas as pd
 
 from sweep_common import (
+    log_summary,
     VSAM_REPORTS_DIR, CTL_SCHEMA,
     get_logger, get_timestamp, get_db_name, generate_excel_report, run_psql, query_db_rows, q
 )
@@ -341,21 +342,15 @@ def main():
     pk_issues = sum(1 for r in pk_audit_rows if r["match"] != "OK")
     not_loaded = sum(1 for r in recon if r["load_status"] == "NOT_LOADED")
 
-    summary_lines = [
-        "=" * 65,
-        f" EXECUTION SUMMARY: {Path(__file__).name}",
-        "=" * 65,
-        f"  files reconciled           : {len(recon):>10,}",
-        f"  files NOT loaded           : {not_loaded:>10,}",
-        f"  tables audited             : {len(row_count_rows):>10,}",
-        f"  columns checked            : {len(col_audit_rows):>10,}",
-        f"  missing columns            : {missing_cols:>10,}",
-        f"  type mismatches            : {type_mismatches:>10,}",
-        f"  PK issues                  : {pk_issues:>10,}",
-        "=" * 65
-    ]
-    for line in summary_lines:
-        logger.info(line)
+    log_summary(logger, Path(__file__).name, [
+        ('files reconciled', len(recon)),
+        ('files NOT loaded', not_loaded),
+        ('tables audited', len(row_count_rows)),
+        ('columns checked', len(col_audit_rows)),
+        ('missing columns', missing_cols),
+        ('type mismatches', type_mismatches),
+        ('PK issues', pk_issues),
+    ])
 
     # Parity verdict: every mapped file loaded, no missing columns, no type mismatches.
     return not_loaded == 0 and missing_cols == 0 and type_mismatches == 0

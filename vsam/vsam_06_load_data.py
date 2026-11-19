@@ -39,11 +39,13 @@ import pandas as pd
 from sweep_common import (
     CTL_SCHEMA,
     DEFAULT_WORKERS,
+    check_postgres_version,
     VSAM_LOGS_DIR,
     VSAM_REPORTS_DIR,
     clip_error,
     generate_excel_report,
     get_db_name,
+    log_summary,
     get_logger,
     get_timestamp,
     lit,
@@ -713,6 +715,11 @@ def main():
         logger.info(f"[DRY-RUN] {len(tasks)} file(s) would be considered. No database changes made.")
         return True
 
+    try:
+        check_postgres_version()
+    except RuntimeError as e:
+        logger.error(str(e))
+        return False
     ensure_reject_table()
     if not args.reload:
         known = get_loaded_log()
@@ -836,14 +843,25 @@ def main():
         "RunOverview": run_overview_rows,
     })
     logger.info(f"Excel Report: {report_file}")
-    logger.info("=" * 65)
-    logger.info(f" EXECUTION SUMMARY: {Path(__file__).name}")
-    logger.info("=" * 65)
-    for label, value in (("files executed", len(results)), ("files loaded", success_count), ("files failed", failed_count),
-                         ("files skipped (unchanged)", skipped), ("rows loaded", total_loaded_rows),
-                         ("rows rejected", total_rejected), ("duplicate rows dropped", total_dups)):
-        logger.info(f"  {label:<28}: {value:>10,}")
-    logger.info("=" * 65)
+    total_inserted = sum(r.get("rows_inserted", 0) for r in results)
+    total_updated = sum(r.get("rows_updated", 0) for r in results)
+    total_unchanged = sum(r.get("rows_unchanged", 0) for r in results)
+    log_summary(logger, Path(__file__).name, [
+        "Files",
+        ("planned (latest version per source)", total_tasks),
+        ("skipped (unchanged since last load)", skipped),
+        ("skipped (older snapshot already loaded)", skipped_stale),
+        ("executed this run", len(results) - skipped_stale),
+        ("  - loaded", success_count),
+        ("  - failed", failed_count),
+        "Rows",
+        ("loaded (inserted + updated + unchanged)", total_loaded_rows),
+        ("  - inserted", total_inserted),
+        ("  - updated (value changed)", total_updated),
+        ("  - unchanged (identical, not touched)", total_unchanged),
+        ("rejected (see Rejected_Rows sheet)", total_rejected),
+        ("duplicate key rows dropped", total_dups),
+    ])
     return failed_count == 0
 
 

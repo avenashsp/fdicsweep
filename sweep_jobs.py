@@ -235,9 +235,9 @@ def start_background_job(job_name, cmd_args, custom_log_name=None, track=None):
     print(f"\n[+] Background job '{job_name}' started successfully.")
     print(f"    PID      : {pid}")
     print(f"    Log File : {log_path}")
-    print("    To view  : python sweep.py status")
-    print("    To tail  : python sweep.py logs -f")
-    print(f"    To stop  : python sweep.py stop --name {job_name}\n")
+    print("    To view  : python3 sweep.py status")
+    print("    To tail  : python3 sweep.py logs -f")
+    print(f"    To stop  : python3 sweep.py stop --name {job_name}\n")
     return pid
 
 
