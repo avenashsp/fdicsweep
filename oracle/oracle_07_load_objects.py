@@ -22,6 +22,7 @@ from pathlib import Path
 from sweep_common import (
     ORACLE_POST_LOAD_DIR,
     ORACLE_REPORTS_DIR,
+    clip_error,
     get_logger,
     get_timestamp,
     get_db_name,
@@ -517,7 +518,7 @@ def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False):
                                 "object_type": b["object_type"],
                                 "object_name": b["object_name"],
                                 "status": "SKIPPED_ALREADY_EXISTS",
-                                "reason": f"Already exists in database: {err_msg[:200]}",
+                                "reason": clip_error(f"Already exists in database: {err_msg}"),
                                 "duration_sec": obj_sec
                             })
                             # Cache in catalog so subsequent checks know it exists
@@ -550,10 +551,10 @@ def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False):
                                 "object_type": b["object_type"],
                                 "object_name": b["object_name"],
                                 "status": "FAILED",
-                                "reason": err_msg[:250],
+                                "reason": clip_error(err_msg),
                                 "duration_sec": obj_sec
                             })
-                            logger.warning(f"  [!] FAILED: {b['raw']} -> {err_msg[:250]}")
+                            logger.warning(f"  [!] FAILED: {b['raw']} -> {clip_error(err_msg)}")
                 if not deferred_queue:
                     break
                 current_queue = deferred_queue

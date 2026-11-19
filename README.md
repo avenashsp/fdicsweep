@@ -1,4 +1,4 @@
-# SWEEP: Unified Data Migration Framework (v5.2)
+# SWEEP: Unified Data Migration Framework (v5.2.1)
 
 SWEEP migrates large financial datasets into **AWS RDS Aurora PostgreSQL** from two sources:
 
@@ -94,4 +94,4 @@ python3 -m pytest                     # PG* env vars (or SWEEP_ALLOW_NO_PASSWORD
 - [VSAM commands](docs/commands_vsam.md)
 - [Flag and environment reference](docs/flag_arguments.md)
 - [Sample outputs](docs/sweep_outputs.md)
-- [Changelog](CHANGELOG_v5.2.md)
+- [Changelog](CHANGELOG_v5.2.1.md)

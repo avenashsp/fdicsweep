@@ -19,7 +19,7 @@ from pathlib import Path
 
 from sweep_platform import make_symlink, group_popen_kwargs, kill_process_group
 
-__version__ = "5.2"
+__version__ = "5.2.1"
 
 def get_next_version(current_ver: str) -> str:
     """
@@ -438,6 +438,23 @@ def generate_excel_report(report_path, sheets_data):
 # -----------------------------------------------------------------------------
 # Database Utilities
 # -----------------------------------------------------------------------------
+ERROR_CELL_LIMIT = 1000
+
+
+def clip_error(message, limit=ERROR_CELL_LIMIT):
+    """
+    Error text for Excel reports: kept whole up to `limit` characters (default 1000), otherwise cut so the
+    result is exactly `limit` long and ends with a marker saying how much was dropped.
+    """
+    text = str(message if message is not None else "").strip()
+    if len(text) <= limit:
+        return text
+    marker = f" ...[+{len(text) - limit + 20} chars]"
+    keep = max(0, limit - len(marker))
+    marker = f" ...[+{len(text) - keep} chars]"
+    return text[:limit - len(marker)] + marker
+
+
 PSQL_APP_NAME = "sweep"
 # Applied to every psql session: literals are escaped the standard way (backslash is a plain
 # character), which the hand-built SQL in the loaders relies on.

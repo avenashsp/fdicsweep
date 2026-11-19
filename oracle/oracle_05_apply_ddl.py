@@ -14,6 +14,7 @@ from sweep_common import (
     SWEEP_META_SQL,
     ORACLE_PRE_LOAD_DIR,
     ORACLE_REPORTS_DIR,
+    clip_error,
     get_logger,
     get_timestamp,
     get_db_name,
@@ -69,7 +70,7 @@ def deploy_ddl(schemas_filter=None, skip_meta=False):
             deployed_files.append({"schema": schema_name, "file": ddl_f.name, "status": "SUCCESS"})
         except RuntimeError as e:
             logger.error(f"Failed to execute {ddl_f.name}: {e}")
-            deployed_files.append({"schema": schema_name, "file": ddl_f.name, "status": f"FAILED: {e}"})
+            deployed_files.append({"schema": schema_name, "file": ddl_f.name, "status": clip_error(f"FAILED: {e}")})
 
     # 3. Verify deployed tables and partitions via PostgreSQL Catalog
     logger.info("Verifying tables and declarative partitions in PostgreSQL...")

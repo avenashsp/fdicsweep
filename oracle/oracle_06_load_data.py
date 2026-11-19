@@ -32,6 +32,7 @@ from sweep_common import (
     LOAD_LOG_TABLE,
     has_db_auth,
     AUTH_HELP,
+    clip_error,
     get_logger,
     get_timestamp,
     get_db_name,
@@ -250,7 +251,8 @@ def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False):
         sec = round(time.time() - t0, 2)
 
         if res.returncode != 0:
-            err = (res.stderr or res.stdout).strip().splitlines()[-1][:300] if (res.stderr or res.stdout) else "psql failed"
+            # the whole psql message (ERROR + DETAIL + CONTEXT lines), clipped only at the report-cell limit
+            err = clip_error(res.stderr or res.stdout or "psql failed")
             return "FAILED", 0, sec, err
 
         # Extract loaded rows from COPY output
@@ -269,7 +271,7 @@ def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False):
     except Exception as e:  # noqa: BLE001 - a worker must report any failure, never crash the pool
         logger.error(f"[Worker {worker_id}] Load failed for {uri}: {e}")
         sec = round(time.time() - t0, 2)
-        return "FAILED", 0, sec, str(e)[:300]
+        return "FAILED", 0, sec, clip_error(e)
     finally:
         record_stream_end(worker_id)
 

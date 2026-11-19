@@ -32,6 +32,7 @@ import pandas as pd
 
 from sweep_common import (
     VSAM_REPORTS_DIR,
+    clip_error,
     AWS_REGION,
     get_logger,
     get_timestamp,
@@ -782,7 +783,7 @@ def main():
         except Exception as e:  # noqa: BLE001 - worker boundary: record the failure for this item and continue
             logger.exception(f"Error profiling {source_key_std}: {e}")
             result = {
-                "source_key": source_key_std, "status": "BLOCKED", "issues": [str(e)[:200]],
+                "source_key": source_key_std, "status": "BLOCKED", "issues": [clip_error(e)],
                 "pk_valid": False, "pk_cols": key_cols, "extracted_pk_cols": key_cols, "pk_type": "ERROR",
                 "schema_col": None, "schema_disc_map": {}, "type_issues": [], "rows_total": 0, "files": len(rows_meta)
             }

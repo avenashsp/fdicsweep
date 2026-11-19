@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pandas as pd
 from sweep_common import (
+    clip_error,
     generate_excel_report,
     get_db_name,
     get_logger,
@@ -152,7 +153,7 @@ def main():
             summary_rows.append({
                 "copybook_file": cb.name,
                 "total_fields": 0, "key_fields": 0, "data_fields": 0, "filler_fields": 0,
-                "key_type": "ERROR", "key_columns": "", "status": str(e)[:100]
+                "key_type": "ERROR", "key_columns": "", "status": clip_error(e)
             })
 
     OUT.mkdir(parents=True, exist_ok=True)

@@ -1,8 +1,8 @@
-# SWEEP Unified Data Migration Framework (v5.2)
+# SWEEP Unified Data Migration Framework (v5.2.1)
 
 ## 1. Executive Summary
 
-**SWEEP** (v5.2) is an enterprise-grade, high-throughput unified database migration framework built to migrate multi-terabyte financial datasets from both **Oracle SQL DDL dumps** and **VSAM flat files (COBOL copybooks)** into **AWS RDS Aurora PostgreSQL** with per-file transactional atomicity on the Oracle track, loud failures instead of silent data loss, and high ingestion velocity.
+**SWEEP** (v5.2.1) is an enterprise-grade, high-throughput unified database migration framework built to migrate multi-terabyte financial datasets from both **Oracle SQL DDL dumps** and **VSAM flat files (COBOL copybooks)** into **AWS RDS Aurora PostgreSQL** with per-file transactional atomicity on the Oracle track, loud failures instead of silent data loss, and high ingestion velocity.
 
 Unlike traditional migration tools that stage gigabytes or terabytes of CSV data onto local bastion disks or perform slow row-by-row ORM inserts, SWEEP uses a **zero-disk streaming pipeline** that pulls compressed data directly from Amazon S3, uncompresses it in memory via Unix pipes, and streams it into PostgreSQL with the CSV `\copy` protocol (Oracle track; the VSAM track routes rows by schema and sends them as batched `INSERT`s - see "Reliability & Safety Guarantees").
 
@@ -72,7 +72,7 @@ VSAM files always have a header row, but its names and column order differ from 
 - **VSAM track:** a `load_log` row is written per destination schema (keyed `<uri>#<schema>`) after the file's batches are loaded. If that write fails the file is reported `FAILED` (it is never silently left unlogged).
 - The primary key of `sweep_ctl.load_log` is `uri`; see `docs/sweep_outputs.md` for the full column list.
 
-### 7. Reliability & Safety Guarantees (v5.2)
+### 7. Reliability & Safety Guarantees (v5.2.1)
 - **Exit codes:** every step exits non-zero when it cannot do its job (missing inputs, failed loads, failed DDL, failed validation), so `run-all` and CI stop at the first failing step.
 - **No shell injection:** S3 keys and file names are never interpolated into shell command lines. Python callers use argument lists; the one `\copy ... FROM PROGRAM '...'` command string is built with `shlex.quote`. Keys containing spaces, quotes, `;` or `$()` load correctly.
 - **Stream errors are visible:** S3 / gzip failures surface as errors (not as "empty file"); header and sample peeks check the pipeline's exit status and stderr.
@@ -92,7 +92,7 @@ VSAM files always have a header row, but its names and column order differ from 
 
 ```
 fdicsweep/
-├── sweep.py                     # Root unified CLI entrypoint (v5.2)
+├── sweep.py                     # Root unified CLI entrypoint (v5.2.1)
 ├── sweep.env                    # Environment variables (RDS endpoint, credentials, S3 buckets) - git-ignored
 ├── sweep.env.sample             # Sample environment template
 ├── sweep_common.py              # Config/env loading, psql helpers (timeouts, retries), logging, Excel, type mapping
@@ -148,13 +148,13 @@ fdicsweep/
 │
 ├── tests/                       # pytest suite (unit + PostgreSQL integration tests)
 ├── .github/workflows/ci.yml     # CI: compile, pyflakes, pytest against PostgreSQL 16
-├── docs/                        # DOCUMENTATION (v5.2)
+├── docs/                        # DOCUMENTATION (v5.2.1)
 │   ├── project_overview.md      # Architecture, executive summary, design principles
 │   ├── commands_oracle.md       # Complete CLI command reference for Oracle track
 │   ├── commands_vsam.md         # Complete CLI command reference for VSAM track
 │   ├── flag_arguments.md        # Comprehensive CLI flags & environment variables reference
 │   └── sweep_outputs.md         # Operational monitoring sample outputs & Excel structures
-└── CHANGELOG_v5.2.md                 # Release changelog and version history (newest first)
+└── CHANGELOG_v5.2.1.md                 # Release changelog and version history (newest first)
 ```
 
 > **How steps are launched.** Steps are modules run from the repository root: `python3 -m oracle.oracle_06_load_data ...`

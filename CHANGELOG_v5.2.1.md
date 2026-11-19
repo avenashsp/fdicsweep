@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [5.2.1] - 2026-11-19
+
+### Changed
+- **VSAM `LoadSummary` sheet:** `records loaded in mapped schema` and `records loaded in unmapped schema` now list the count per schema instead of one total, e.g. `bss01104 = 20, bss01112 = 34` (sorted by schema, blank when nothing was loaded). The `bcs` column, `load %` and the `SchemaBreakdown` sheet are unchanged.
+- **Error messages in the Excel reports are no longer cut at 100-300 characters.** They are kept whole up to **1,000 characters** per cell (`sweep_common.clip_error`; longer text ends with `...[+N chars]`). Fixed in: Oracle Step 06 (was 300 and only the *last line* of psql's output - now the full ERROR/DETAIL/CONTEXT text), Oracle Step 07 (200 / 250), Oracle Step 05, VSAM Step 06 (300 / 200), VSAM Step 03 (200), VSAM Step 01 (100). The VSAM `skipped/failed reason` summary is clipped the same way; the "first 5 skipped rows" sample is unchanged.
+- Version 5.2.1; changelog renamed `CHANGELOG_v5.2.1.md`.
+
+---
+
 ## [5.2.0] - 2026-11-18
 
 VSAM column handling and loading release. The Oracle track is unchanged.
@@ -22,7 +31,7 @@ VSAM column handling and loading release. The Oracle track is unchanged.
 - **`--tbl-col {headers,copybook}`** (`sweep.py vsam inventory`, `vsam run-all`, `run-all`, `VSAM_TBL_COL`): table columns are named after the **S3 headers** (default) or after the mapped **copybook columns**; the datatype always comes from the mapped copybook column (unmapped headers become `text`, refined by data profiling). The choice is stored in the column map, which Steps 03, 04, 06 and 07 read, so they cannot disagree.
 - **Snapshot replace for VSAM tables without a primary key.** VSAM files are full snapshots, so a keyless table is replaced by the newest snapshot automatically: all files of the table load into a staging table (`<table>__sweep_stg`) and one transaction truncates, copies and writes the `load_log` rows when every file succeeded; if any file fails the table keeps its old data. A file older than a snapshot already loaded is `SKIPPED`. Tables with a primary key still upsert (rows missing from a newer snapshot are not deleted).
 - Shared tables: when several sources feed one table, columns matched to the same copybook column are named alike and Step 04 creates the union of their columns.
-- `vsam/common_cobol.py`, tests for the four reported copybook layouts (`tests/data/copybooks/`), the mapping (Hungarian optimality, precedence, keys, overrides), snapshot replace (unit + PostgreSQL) and an end-to-end Steps 01-07 run on a throw-away copy of the repository (headers differing from the copybook, `--tbl-col copybook`, snapshot replacement). 214 tests.
+- `vsam/common_cobol.py`, tests for the four reported copybook layouts (`tests/data/copybooks/`), the mapping (Hungarian optimality, precedence, keys, overrides), snapshot replace (unit + PostgreSQL) and an end-to-end Steps 01-07 run on a throw-away copy of the repository (headers differing from the copybook, `--tbl-col copybook`, snapshot replacement). 214 tests (223 as of 5.2.1).
 
 ### Fixed
 - **Copybooks that Step 01 could not parse** (0 fields or a crash): fixed-format sequence areas in columns 1-6 and 73-80 (`00040001`, change tags such as `106618`), sequence numbers glued to the closing period (`VALUE SPACE.00050001`), `*` comment lines with change tags (`154130****`), `====` banners, `COPY ... REPLACING` names such as `:USA090:-KORG` / `:NEXT-MODEL:-KEY`, multi-line `VALUE LOW-VALUES.`, fields that start with digits, quoted literals containing periods. The two duplicate parsers now share one reader.

@@ -89,6 +89,13 @@ def test_headers_map_to_copybook_types_and_snapshots_replace_keyless_tables(repo
     assert cols == ("status_code:character varying,b_korg:integer,amount:numeric,account_number:integer,"
                     "effective_date:date,extra_note:text")                  # header names, copybook / data types
     assert q("SELECT count(*) FROM bss01104.stg_achfile_v") == "20"
+    import openpyxl
+    report = sorted((repo_dir / "vsam" / "reports").glob("*vsam_06_load_data_report*.xlsx"))[-1]
+    rows = list(openpyxl.load_workbook(report, read_only=True)["LoadSummary"].iter_rows(values_only=True))
+    head = rows[0]
+    ach = next(r for r in rows[1:] if r[head.index("tablename")] == "stg_achfile_v")
+    assert ach[head.index("records loaded in mapped schema")] == "bss01104 = 20, bss01112 = 20"
+    assert ach[head.index("records loaded in unmapped schema")] in (None, "")
     assert q("SELECT string_agg(a.attname, ',' ORDER BY a.attname) FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid "
              "AND a.attnum = ANY(i.indkey) WHERE i.indrelid = 'bss01104.stg_achfile_v'::regclass AND i.indisprimary") == "account_number,b_korg"
     assert q("SELECT count(*) FROM pg_index WHERE indrelid = 'bcs.stg_bcsxref_rec_v'::regclass AND indisprimary") == "0"   # no key known

@@ -1,4 +1,4 @@
-# SWEEP CLI Command Reference - VSAM Migration Track (v5.2)
+# SWEEP CLI Command Reference - VSAM Migration Track (v5.2.1)
 
 Complete command reference for the **VSAM Migration Track** of the SWEEP Unified Data Migration Framework.
 
@@ -328,13 +328,13 @@ python3 -m vsam.vsam_06_load_data --mode default --workers 4
    - `total recs`: Total raw records in file.
    - `loaded recs`: Successfully committed records.
    - `skipped recs`: Skipped records (duplicates/invalid PKs).
-   - `records loaded in mapped schema`: Records routed to declared mapped schemas.
-   - `records loaded in unmapped schema`: Records routed to non-mapped target schemas.
+   - `records loaded in mapped schema`: Records per declared mapped schema, as text: `bss01104 = 20, bss01112 = 34` (blank when none).
+   - `records loaded in unmapped schema`: Records per non-mapped target schema, same format (blank when none).
    - `records loaded in bcs schema`: Records routed to the fallback `bcs` schema.
    - `load %`: Percentage of records loaded into the mapped schema out of total file records: `(mapped_loaded / total_records) * 100`.
    - `has PK?`: `YES` or `NO`.
    - `PK columns`: Primary key column names.
-   - `skipped/failed reason`: Error message or reason if skipped/failed.
+   - `skipped/failed reason`: The error message or skip reason, up to 1,000 characters per cell (longer text ends with `...[+N chars]`).
    - `duration`: Execution duration in seconds.
    - `status`: `SUCCESS`, `SKIPPED`, or `FAILED`.
    - `full s3 uri`: Complete S3 URI.

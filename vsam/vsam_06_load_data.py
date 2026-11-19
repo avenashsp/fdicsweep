@@ -45,6 +45,7 @@ from sweep_common import (
     VSAM_REPORTS_DIR,
     DEFAULT_WORKERS,
     CTL_SCHEMA,
+    clip_error,
     get_logger,
     get_timestamp,
     get_db_name,
@@ -225,7 +226,7 @@ def finalize_replacements(results):
                 logger.info(f"[REPLACE] {schema}.{table} replaced by the new snapshot ({len(st['files'])} file(s))")
                 continue
             except RuntimeError as e:
-                fail(st["files"], f"snapshot swap failed for {schema}.{table}: {str(e)[:200]}")
+                fail(st["files"], clip_error(f"snapshot swap failed for {schema}.{table}: {e}"))
                 logger.error(f"[REPLACE] swap failed for {schema}.{table}: {e}")
         else:
             fail(st["files"], f"staged data discarded: another file for {schema}.{table} failed; table left unchanged")
@@ -509,7 +510,7 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
             samples = [f"Row {sr['row_num']}: {sr['skipped_reason']}" for sr in skipped_records[:5]]
             if len(skipped_records) > 5:
                 samples.append(f"... (+{len(skipped_records) - 5} more)")
-            skipped_summary = f"{len(skipped_records)} skipped [{'; '.join(samples)}]"
+            skipped_summary = clip_error(f"{len(skipped_records)} skipped [{'; '.join(samples)}]")
         else:
             skipped_summary = "None (0 skipped)" if has_pk_flag else "None (table has no PK constraint; 100% rows loaded)"
 
@@ -525,11 +526,13 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
 
         bcs_loaded = dest_loaded.get("bcs", 0)
         if mapped_schemas_set == {"bcs"}:
-            mapped_loaded = bcs_loaded
-            unmapped_loaded = sum(cnt for s, cnt in dest_loaded.items() if s.lower() != "bcs")
+            mapped_by_schema = {"bcs": bcs_loaded}
+            unmapped_by_schema = {s: cnt for s, cnt in dest_loaded.items() if s.lower() != "bcs"}
         else:
-            mapped_loaded = sum(cnt for s, cnt in dest_loaded.items() if s.lower() in mapped_schemas_set and s.lower() != "bcs")
-            unmapped_loaded = sum(cnt for s, cnt in dest_loaded.items() if s.lower() not in mapped_schemas_set and s.lower() != "bcs")
+            mapped_by_schema = {s: cnt for s, cnt in dest_loaded.items() if s.lower() in mapped_schemas_set and s.lower() != "bcs"}
+            unmapped_by_schema = {s: cnt for s, cnt in dest_loaded.items() if s.lower() not in mapped_schemas_set and s.lower() != "bcs"}
+        mapped_loaded = sum(mapped_by_schema.values())
+        unmapped_loaded = sum(unmapped_by_schema.values())
 
         if total_rows_read > 0:
             pct_val = round((mapped_loaded / total_rows_read) * 100.0, 2)
@@ -552,6 +555,8 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
             "skipped_count": skipped_count,
             "records_loaded_mapped": mapped_loaded,
             "records_loaded_unmapped": unmapped_loaded,
+            "records_loaded_mapped_detail": format_schema_counts(mapped_by_schema),
+            "records_loaded_unmapped_detail": format_schema_counts(unmapped_by_schema),
             "records_loaded_bcs": bcs_loaded,
             "load_pct": load_pct_str,
             "schema_breakdown": schema_breakdown_str,
@@ -574,7 +579,7 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
 
     except Exception as e:  # noqa: BLE001 - worker boundary: report any failure for this file, never kill the pool
         dur = round(time.time() - t0, 2)
-        err = str(e)[:300]
+        err = clip_error(e)
         logger.error(f"[Worker {worker_id}] Load failed for {filename}: {e}")
         with _STAGE_LOCK:
             for st_state in locals().get("touched_stages", []):
@@ -624,6 +629,11 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
         record_stream_end(worker_id)
 
 
+def format_schema_counts(counts):
+    """{'bss01112': 34, 'bss01104': 20} -> 'bss01104 = 20, bss01112 = 34' (empty string when nothing was loaded)."""
+    return ", ".join(f"{s} = {n}" for s, n in sorted(counts.items()) if n)
+
+
 def build_load_summary(results):
     """Flattens per-file load results into the LoadSummary rows and the skipped-record rows."""
     load_summary_rows = []
@@ -643,8 +653,8 @@ def build_load_summary(results):
             "total recs": r.get("total_records", 0),
             "loaded recs": r.get("records_loaded", r.get("rows_loaded", 0)),
             "skipped recs": r.get("skipped_count", 0),
-            "records loaded in mapped schema": r.get("records_loaded_mapped", 0),
-            "records loaded in unmapped schema": r.get("records_loaded_unmapped", 0),
+            "records loaded in mapped schema": r.get("records_loaded_mapped_detail", ""),
+            "records loaded in unmapped schema": r.get("records_loaded_unmapped_detail", ""),
             "records loaded in bcs schema": r.get("records_loaded_bcs", 0),
             "load %": r.get("load_pct", "0%"),
             "has PK?": r.get("has_pk", "NO"),
@@ -873,7 +883,7 @@ def main():
                     "total_records": 0, "records_loaded": 0, "skipped_count": 0,
                     "records_loaded_mapped": 0, "records_loaded_unmapped": 0, "records_loaded_bcs": 0,
                     "load_pct": "0%", "status": "FAILED", "seconds": 0, "worker_id": 0, "rows_loaded": 0,
-                    "error": str(e)[:300], "schema_counts": {}
+                    "error": clip_error(e), "schema_counts": {}
                 })
 
     finalize_replacements(results)     # atomic snapshot swap (or discard) for tables without a primary key
