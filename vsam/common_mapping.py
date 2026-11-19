@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 import pandas as pd
 from sweep_common import BASE_DIR, FILE_READ_ERRORS, norm_col, VSAM_INPUTS_DIR
-from vsam.common_config import MASTER_MAPPING_FILE, MASTER_OVERRIDES_FILE, MASTER_REF, OUT, VERSION_MODE, logger, read_excel_safe
+from vsam.common_config import MASTER_MAPPING_FILE, MASTER_OVERRIDES_FILE, MASTER_REF, OUT, logger, read_excel_safe
 
 
 # -----------------------------------------------------------------------------
@@ -391,25 +391,3 @@ def load_type_overrides():
         for r in _side_csv("type_overrides.csv"):
             ov[(r["company"].upper(), r["source_file"].upper(), norm_col(r["column"]))] = r["sql_type"].strip()
     return ov
-
-
-@functools.lru_cache(maxsize=1)
-def load_policy():
-    """Reads loadpolicy_overrides from vsam_master_overrides.xlsx (fallback load_policy.csv)."""
-    if MASTER_OVERRIDES_FILE.exists():
-        try:
-            import pandas as pd
-            df = pd.read_excel(MASTER_OVERRIDES_FILE, sheet_name="loadpolicy_overrides", dtype=str).fillna("")
-            return {
-                (str(r.sourcecompany).strip().upper(), str(r.filename).strip().upper()): str(r.loadpolicy).strip().lower()
-                for r in df.itertuples() if str(getattr(r, "loadpolicy", "")).strip()
-            }
-        except FILE_READ_ERRORS as exc:
-            logger.warning(f"Could not read loadpolicy_overrides: {exc}")
-    return {(r["company"].strip().upper(), r["source_file"].strip().upper()): r["policy"].strip().lower()
-            for r in _side_csv("load_policy.csv") if r.get("policy")}
-
-
-def version_mode_for(p):
-    pol = load_policy().get(((p.get("company") or "").upper(), (p.get("source_file") or "").upper()))
-    return pol if pol in ("snapshot", "upsert") else VERSION_MODE

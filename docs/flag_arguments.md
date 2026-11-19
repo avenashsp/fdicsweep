@@ -33,11 +33,11 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 | Step | Script / Command | Available Flags |
 | :---: | :--- | :--- |
 | **01** | `vsam.vsam_01_extract_copybooks`<br>`python3 sweep.py vsam extract` | `'--bg'`, `'-h, --help'` |
-| **02** | `vsam.vsam_02_inventory`<br>`python3 sweep.py vsam inventory` | `'--s3 S3'`, `'--company COMPANY'`, `'--tbl-col {headers,copybook}'`, `'--latest-only'` *(standalone module only)*, `'--bg'`, `'-h, --help'` |
-| **03** | `vsam.vsam_03_type_gate`<br>`python3 sweep.py vsam type-gate` | `'--workers WORKERS'`, `'--company COMPANY'`, `'--latest-only'` *(standalone module only)*, `'--bg'`, `'-h, --help'` |
+| **02** | `vsam.vsam_02_inventory`<br>`python3 sweep.py vsam inventory` | `'--s3 S3'`, `'--company COMPANY'`, `'--tbl-col {headers,copybook}'`, `'--bg'`, `'-h, --help'` |
+| **03** | `vsam.vsam_03_type_gate`<br>`python3 sweep.py vsam type-gate` | `'--workers WORKERS'`, `'--company COMPANY'`, `'--bg'`, `'-h, --help'` |
 | **04** | `vsam.vsam_04_generate_ddl`<br>`python3 sweep.py vsam gen-ddl` | `'--company COMPANY'`, `'--execute'`, `'--bg'`, `'-h, --help'` |
 | **05** | `vsam.vsam_05_apply_ddl`<br>`python3 sweep.py vsam apply-ddl` | `'--skip-meta'`, `'--bg'`, `'-h, --help'` |
-| **06** | `vsam.vsam_06_load_data`<br>`python3 sweep.py vsam load-data` | `'--mode {default,data}'`, `'--workers WORKERS'`, `'--company COMPANY'`, `'--tables TABLES'`, `'--limit-files LIMIT_FILES'`, `'--latest-only'`, `'--force-truncate'`, `'--dry-run'`, `'--bg'`, `'-h, --help'` |
+| **06** | `vsam.vsam_06_load_data`<br>`python3 sweep.py vsam load-data` | `'--workers WORKERS'`, `'--company COMPANY'`, `'--tables TABLES'`, `'--limit-files LIMIT_FILES'`, `'--force-truncate'`, `'--dry-run'`, `'--bg'`, `'-h, --help'` |
 | **07** | `vsam.vsam_07_validate`<br>`python3 sweep.py vsam validate` | `'--exact-counts'`, `'--tables TABLES'`, `'--schema SCHEMA'`, `'--bg'`, `'-h, --help'` |
 | **All** | `python3 sweep.py vsam run-all` | `'--workers WORKERS'`, `'--force-truncate'`, `'--tbl-col {headers,copybook}'`, `'--bg'`, `'-h, --help'` |
 
@@ -203,7 +203,6 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 | `--s3 S3` | string | `VSAM_S3_BUCKET`| S3 prefix to discover flat files | `--s3 s3://my-bucket/vsam/` |
 | `--company COMPANY`| string | all companies | Comma-separated company tokens to filter | `--company FDIC` |
 | `--tbl-col MODE` | choice: `headers`, `copybook` | `headers` (or `VSAM_TBL_COL`) | Table column names: the S3 file headers, or the mapped copybook column names. Datatypes always come from the mapped copybook column. Stored in `vsam_02_column_map.csv` for Steps 03-07 | `--tbl-col copybook` |
-| `--latest-only` | flag | false | Keep only latest file version per table (based on timestamp). *Standalone module only; `sweep.py vsam inventory` does not forward it* | `--latest-only` |
 | `--bg` | flag | false | Run in background daemon *(CLI only)* | `python3 sweep.py vsam inventory --bg` |
 
 ---
@@ -217,7 +216,6 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 | `-h, --help` | flag | - | Show help message and exit | `python3 sweep.py vsam type-gate -h` |
 | `--workers WORKERS`| integer | `4` | Parallel profiling worker threads | `--workers 8` |
 | `--company COMPANY`| string | all companies | Comma-separated company tokens to filter | `--company FDIC` |
-| `--latest-only` | flag | false | Process only latest file version per table. *Standalone module only; `sweep.py vsam type-gate` does not forward it* | `--latest-only` |
 | `--bg` | flag | false | Run in background daemon *(CLI only)* | `python3 sweep.py vsam type-gate --bg` |
 
 ---
@@ -254,12 +252,10 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 | Flag | Type | Default | Description | Example |
 | :--- | :--- | :--- | :--- | :--- |
 | `-h, --help` | flag | - | Show help message and exit | `python3 sweep.py vsam load-data -h` |
-| `--mode MODE` | choice: `default`, `data` | `default` | Ingestion mode: `default` (apply PK to fresh tables, validate records, upsert) or `data` (no PK on fresh tables, direct load) | `--mode default` / `--mode data` |
 | `--workers WORKERS`| integer | `4` | Parallel ingestion workers | `--workers 8` |
 | `--company COMPANY`| string | all companies | Comma-separated company filter | `--company FDIC` |
 | `--tables TABLES`| string | all tables | Comma-separated target tables to load | `--tables vsamkorg` |
 | `--limit-files N`| integer | all files | Limit total number of files loaded (testing) | `--limit-files 2` |
-| `--latest-only` | flag | false | Load only the latest file version per table (based on timestamp in filename) | `--latest-only` |
 | `--force-truncate` | flag | false | Tables without a PK are replaced by the newest snapshot automatically in a full run. In a PARTIAL run (`--company`, `--tables`, `--limit-files`) replacing a table that already has rows needs this flag, because other source files of the table may be missing | `--force-truncate` |
 | `--dry-run` | flag | false | List the files that would be loaded; no database changes | `--dry-run` |
 | `--bg` | flag | false | Run in background daemon | `python3 sweep.py vsam load-data --bg` |
@@ -366,7 +362,6 @@ All parameters can be pre-configured via `sweep.env` located in the root reposit
 | `VSAM_S3_BUCKET` | S3 URI for VSAM track flat files | `s3://your-migration-bucket/vsam-migration-qa/` |
 | `ORACLE_WORKERS` / `SWEEP_WORKERS` / `VSAM_WORKERS` | Default worker threads (first one set wins, in that order) | `4` |
 | `VSAM_DELIM` / `VSAM_QUOTE` / `VSAM_ENCODING` | Delimiter / quoting / encoding handling for VSAM files | `auto` |
-| `VSAM_VERSION_MODE` | How multiple file versions are handled | `upsert` |
 | `VSAM_TBL_COL` | Default for `--tbl-col`: `headers` (S3 file headers) or `copybook` (copybook column names) | `headers` |
 | `VSAM_MAP_ACCEPT` / `VSAM_MAP_MIN` | Column-mapping thresholds: scores >= ACCEPT are ACCEPTED, >= MIN are REVIEW, below MIN UNMAPPED | `0.70` / `0.35` |
 | `VSAM_COMMON_SCHEMA_CASE` | Case of the shared fallback schema name | `lower` |

@@ -46,10 +46,8 @@ To achieve maximum ingestion velocity, heavy database constraints and indexes ar
 - **Phase B (Streaming Load)**: Raw data streams into the unindexed tables at native Aurora storage speeds (up to 20,000+ rows/sec per worker).
 - **Phase C (Post-Load)**: Secondary indexes, unique constraints, foreign keys, views, and triggers are compiled in parallel across available workers once data ingestion is complete.
 
-### 3. Merged Ingestion Step with `--mode` in VSAM
-In the VSAM pipeline, Step 06 (`vsam load-data`) incorporates primary key constraint management directly into streaming ingestion:
-- **`--mode default` (Quality & Upsert Mode)**: Applies PK constraints to fresh tables before loading data. Every incoming record is validated against PK constraints (`record_passes_pk_validation`). Records passing validation are upserted dynamically via `ON CONFLICT (pk_cols) DO UPDATE SET ...`.
-- **`--mode data` (Data Priority Mode)**: Fresh tables are loaded bare without PK constraints. If an existing table already has PK constraints, it upserts via the PK.
+### 3. Merged Ingestion Step in VSAM
+In the VSAM pipeline, Step 06 (`vsam load-data`) incorporates primary key constraint management directly into streaming ingestion: PK constraints are always applied to fresh tables before loading, every incoming record is validated against them (`record_passes_pk_validation`) and valid records are upserted via `ON CONFLICT (pk_cols) DO UPDATE SET ...`. Only the newest file version per (company, source file) is loaded.
 - **VSAM files are full snapshots.** A table **with** a primary key is upserted in place (rows missing from a newer snapshot are not deleted). A table **without** one is **replaced** by each new snapshot, atomically: all files of the table load into a staging table and one transaction swaps it in when every file succeeded; if any file fails the table keeps its old data. Partial runs (`--company`, `--tables`, `--limit-files`) need `--force-truncate` to replace a populated table, because other source files of a shared table may be missing.
 - **Keys are never guessed.** A primary key comes only from a copybook KEY/KEM group (with every key column reliably mapped) or from a person (`korg_overrides`); positional auto-discovery only produces a *candidate* that is reported, not applied.
 - **VSAM batches into keyed tables are not one transaction** (10,000-row `INSERT` batches), so a file that fails part-way can leave a partial load; re-running upserts.
@@ -130,7 +128,7 @@ fdicsweep/
 │   ├── vsam_03_type_gate.py     # Step 03: Verify PK uniqueness & extract schema_col (korg)
 │   ├── vsam_04_generate_ddl.py  # Step 04: Generate PostgreSQL DDL in gen_ddl/
 │   ├── vsam_05_apply_ddl.py     # Step 05: Provision target schemas and bare tables
-│   ├── vsam_06_load_data.py     # Step 06: Schema-segregated streaming ingestion & upsert (--mode)
+│   ├── vsam_06_load_data.py     # Step 06: Schema-segregated streaming ingestion & upsert
 │   ├── vsam_07_validate.py      # Step 07: Post-migration catalog & parity validation
 │   ├── vsam_common.py           # Compatibility facade re-exporting the modules below
 │   ├── common_cobol.py          #   copybook text -> field tree (sequence areas, :TAG: names, multi-line statements)
@@ -185,5 +183,5 @@ fdicsweep/
 | **03** | `python3 sweep.py vsam type-gate` | PK & KORG validation | `vsam_03_type_gate.json`, 11-column Excel report |
 | **04** | `python3 sweep.py vsam gen-ddl` | Consolidated DDL | `gen_ddl/all_tables.sql`, `all_pk.sql`, per-schema SQL |
 | **05** | `python3 sweep.py vsam apply-ddl`| Provision DB schemas | Schemas & bare tables in PostgreSQL |
-| **06** | `python3 sweep.py vsam load-data` | Stream & upsert (`--mode`)| Data committed; 17-col `LoadSummary` & `SchemaBreakdown` |
+| **06** | `python3 sweep.py vsam load-data` | Stream & upsert| Data committed; 17-col `LoadSummary` & `SchemaBreakdown` |
 | **07** | `python3 sweep.py vsam validate`  | Parity reconciliation | Multi-tab reconciliation audit Excel report |

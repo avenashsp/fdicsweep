@@ -708,7 +708,6 @@ def main():
     parser = argparse.ArgumentParser(description="Step 03: Type Gate, PK verification and schema column detection.")
     parser.add_argument("--workers", type=int, default=int(os.getenv("VSAM_WORKERS", str(min(4, os.cpu_count() or 1)))))
     parser.add_argument("--company", help="Comma-separated company tokens to filter")
-    parser.add_argument("--latest-only", "--latest-version-only", action="store_true", help="Process only latest file version per table")
     parser.add_argument("--bg", action="store_true", help="Run in background")
     args = parser.parse_args()
 
@@ -724,9 +723,9 @@ def main():
         cos = [c.strip().upper() for c in args.company.split(",")]
         lm = lm[lm["source_company"].isin(cos)]
 
-    if args.latest_only and not lm.empty:
+    if not lm.empty:      # always on: VSAM files are full snapshots
         orig_count = len(lm)
-        lm = filter_latest_versions(lm, ["target_schema", "target_table"])
+        lm = filter_latest_versions(lm, ["source_company", "source_filename"])
         logger.info(f"Filtered to latest file versions: {len(lm)} tasks (was {orig_count})")
 
     # Load copybook field metadata from Step 01

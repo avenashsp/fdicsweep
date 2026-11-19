@@ -85,7 +85,6 @@ MAX_ROWS = int(os.getenv("VSAM_ANALYZE_MAX_ROWS", "0")) or None
 COMMON_SCHEMA_CASE = os.getenv("VSAM_COMMON_SCHEMA_CASE", "lower")
 
 
-VERSION_MODE = os.getenv("VSAM_VERSION_MODE", "upsert")
 
 
 def get_vsam_folders(s3_uri=None):

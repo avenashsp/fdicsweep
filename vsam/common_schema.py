@@ -126,33 +126,23 @@ def table_has_existing_data(schema: str, table: str) -> bool:
         return False
 
 
-def check_table_load_strategy(schema: str, table: str, tg_prof_pk: list = None, mode: str = "default") -> dict:
+def check_table_load_strategy(schema: str, table: str, tg_prof_pk: list = None) -> dict:
     """
-    Inspects PostgreSQL live for schema.table to determine load strategy:
-    Mode: 'default'
-      - If table is fresh (no existing data):
-        * If table has PK defined, apply PK constraint to table in PostgreSQL!
-        * Set action = 'INSERT_FRESH', has_pk = True, pk_cols = live_pk_cols
-      - If table has existing data and YES PK constraint -> action = 'UPSERT', has_pk = True
-      - If table has existing data and NO PK constraint -> action = 'TRUNCATE_AND_LOAD', has_pk = False
-
-    Mode: 'data'
-      - If table is fresh (no existing data):
-        * Do NOT apply PK constraints. Load data only.
-        * Set action = 'DIRECT_INSERT', has_pk = False, pk_cols = []
-      - If table has existing data and YES PK constraint -> action = 'UPSERT', has_pk = True
-      - If table has existing data and NO PK constraint -> action = 'TRUNCATE_AND_LOAD', has_pk = False
+    Inspects PostgreSQL live for schema.table to determine the load strategy. Primary keys are always applied
+    before loading:
+      - table is fresh (no rows): when the copybook PK is known and the table has none yet, the PK is applied first
+          * has a PK            -> action = 'INSERT_FRESH', has_pk = True
+          * has no PK           -> action = 'NO_PK_LOAD',  has_pk = False
+      - table has rows and a PK -> action = 'UPSERT',            has_pk = True
+      - table has rows, no PK   -> action = 'TRUNCATE_AND_LOAD', has_pk = False
     """
     has_data = table_has_existing_data(schema, table)
     live_pk_cols = get_table_pk_columns_live(schema, table)
     has_pk = bool(live_pk_cols)
     candidate_pks = [norm_col(c) for c in (tg_prof_pk or []) if c]
-    mode_clean = (mode or "default").lower().strip()
 
     if not has_data:
-        # Table is fresh (0 rows)
-        if mode_clean != "data" and candidate_pks and not has_pk:
-            # Default mode: apply PK constraint to the fresh table before data load
+        if candidate_pks and not has_pk:
             try:
                 pk_name = q(f"pk_{table}")
                 pk_def = ", ".join(q(k) for k in candidate_pks)
@@ -164,16 +154,10 @@ def check_table_load_strategy(schema: str, table: str, tg_prof_pk: list = None, 
             except DB_ERRORS as e:
                 logger.warning(f"Could not apply PK constraint to {schema}.{table}: {e}")
                 has_pk = False
-
-        if has_pk:
-            action = "INSERT_FRESH"
-        else:
-            action = "DIRECT_INSERT"
+        action = "INSERT_FRESH" if has_pk else "NO_PK_LOAD"
     elif has_pk:
-        # Table has existing data and has PK constraint in DB
         action = "UPSERT"
     else:
-        # Table has existing data and NO PK constraint in DB
         action = "TRUNCATE_AND_LOAD"
 
     return {

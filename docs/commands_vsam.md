@@ -157,7 +157,7 @@ python3 -m vsam.vsam_02_inventory --company FDIC
   - `vsam/outputs/vsam_02_column_map.csv`: one row per header (and per unused copybook column) - see the `ColumnMapping` sheet below.
   - `vsam/reports/<db>_vsam_02_inventory_report_<timestamp>.xlsx`: sheets `Summary`, `FileInventory` (adds `key source`, `candidate key (not applied)`, `mapped / review / unmapped columns`), `LatestFileHeaders` and **`ColumnMapping`** (`source_company`, `source_filename`, `latest_filename`, `copybook_name`, `header_position`, `header`, `table_column`, `copybook_field`, `copybook_col`, `pic`, `usage`, `copybook_type`, `pg_type`, `is_key`, `score`, `confidence`, `status`, `method`, `tbl_col_mode`).
 
-> `--latest-only` is available on the standalone module (`python3 -m vsam.vsam_02_inventory --latest-only`); `sweep.py vsam inventory` exposes `--s3` and `--company`.
+> Only the newest file version per (company, source file) is kept, always (VSAM files are full snapshots). `sweep.py vsam inventory` exposes `--s3` and `--company`.
 
 ---
 
@@ -185,8 +185,8 @@ python3 sweep.py vsam type-gate --workers 4 --bg
 # Filter by source company
 python3 sweep.py vsam type-gate --company FDIC
 
-# Standalone module equivalent (adds --latest-only, which the sweep.py wrapper does not expose):
-python3 -m vsam.vsam_03_type_gate --workers 4 --latest-only
+# Standalone module equivalent:
+python3 -m vsam.vsam_03_type_gate --workers 4
 ```
 
 * **Outputs Generated**:
@@ -255,17 +255,11 @@ python3 -m vsam.vsam_05_apply_ddl
 ---
 
 ### Step 06: Schema-Segregated Streaming Ingestion & Dynamic Upsert (`load-data` / `load`)
-Streams VSAM flat files directly from S3 into PostgreSQL with live database constraint inspection and flexible `--mode`:
-
-#### Ingestion Modes (`--mode {default, data}`):
-- **Default Mode (`python3 sweep.py vsam load-data` or `--mode default`)**:
-  * **Fresh Table**: Applies PK constraints from `gen_ddl/<schema>_pk.sql` to available tables in PostgreSQL *before* loading data, validates every record against the PK constraint (`record_passes_pk_validation`), and inserts only valid records.
-  * **Existing Table with PK**: Upserts incoming data using the PK constraint (`ON CONFLICT (pk_cols) DO UPDATE SET ...`).
-  * **Existing Table without PK**: replaced by the new snapshot (see *Snapshot replace* below).
-- **Data Mode (`python3 sweep.py vsam load-data --mode data`)**:
-  * **Fresh Table**: Does NOT apply PK constraints. Performs direct bulk load.
-  * **Existing Table with PK**: Upserts incoming data using the PK constraint.
-  * **Existing Table without PK**: replaced by the new snapshot (see *Snapshot replace* below).
+Streams VSAM flat files directly from S3 into PostgreSQL with live database constraint inspection. Primary keys are always applied before loading:
+- **Fresh Table**: applies PK constraints from `gen_ddl/<schema>_pk.sql` to available tables in PostgreSQL *before* loading data, validates every record against the PK constraint (`record_passes_pk_validation`), and inserts only valid records.
+- **Existing Table with PK**: upserts incoming data using the PK constraint (`ON CONFLICT (pk_cols) DO UPDATE SET ...`).
+- **Existing Table without PK**: replaced by the new snapshot (see *Snapshot replace* below).
+- Only the newest file version per (company, source file) is loaded (always on).
 
 #### Snapshot replace for tables without a primary key
 VSAM files are **full snapshots**. A table without a primary key cannot be upserted, so each new snapshot **replaces** it - atomically and automatically:
@@ -294,17 +288,8 @@ python3 sweep.py vsam load-data --dry-run
 - **With copybook and korg column**: Segregates records and inserts them into mapped schemas based on korg values. Unmapped/inactive schemas are routed to `bcs`.
 
 ```bash
-# Default mode: apply PKs to fresh tables, validate records, dynamic upsert (4 workers, background)
+# Apply PKs to fresh tables, validate records, dynamic upsert (4 workers, background)
 python3 sweep.py vsam load-data --workers 4 --bg
-
-# Explicit default mode
-python3 sweep.py vsam load-data --mode default --workers 4 --bg
-
-# Data mode: direct load for fresh tables without applying PK constraints
-python3 sweep.py vsam load-data --mode data --workers 4 --bg
-
-# Load only the single latest file version per table (based on timestamp in filename)
-python3 sweep.py vsam load-data --latest-only --workers 4
 
 # Smoke test: Ingest only the first 2 files
 python3 sweep.py vsam load-data --limit-files 2
@@ -316,7 +301,7 @@ python3 sweep.py vsam load-data --company FDIC --workers 4
 python3 sweep.py vsam load-data --tables vsamkorg,stg_ftxref_v --workers 4
 
 # Standalone module equivalent (run from the repository root):
-python3 -m vsam.vsam_06_load_data --mode default --workers 4
+python3 -m vsam.vsam_06_load_data --workers 4
 ```
 
 #### Generated Excel Workbook (`vsam/reports/<db>_vsam_06_load_data_report_<timestamp>.xlsx`, plus `vsam/outputs/vsam_06_load_log_<run_id>.csv`):
@@ -343,7 +328,7 @@ python3 -m vsam.vsam_06_load_data --mode default --workers 4
    - Destination **schemas** as columns (`bcs`, `bss01104`, `bss01105`, `bss01112`, etc.) plus a `Total` column.
    - Record counts populated at each file/schema intersection.
    - Grand `TOTAL` summary row at the bottom.
-3. **`RunOverview` Sheet**: run id, task / success / failed counts, rows loaded and skipped, `--latest-only` flag, worker count.
+3. **`RunOverview` Sheet**: run id, task / success / failed counts, rows loaded and skipped, worker count.
 
 * **Exit code**: non-zero if any file failed to load.
 
@@ -397,17 +382,17 @@ python3 sweep.py stop --kill-db
 python3 sweep.py vsam load-data --workers 4 --bg
 ```
 
-### Recipe 2: Initial Fresh Load without Constraints followed by Constrained Upsert
-To load high-volume initial data rapidly without constraint overhead, then enforce constraints on subsequent runs:
+### Recipe 2: Initial Load followed by Delta Loads
+Primary keys are applied before the first load, so later snapshots upsert:
 ```bash
-# Step 1: Initial fast load in data mode (no PK constraints applied to fresh tables)
-python3 sweep.py vsam load-data --mode data --workers 4 --bg
+# Step 1: initial load (PKs applied to fresh tables)
+python3 sweep.py vsam load-data --workers 4 --bg
 
-# Step 2: Validate ingested row counts
+# Step 2: validate ingested row counts
 python3 sweep.py vsam validate --exact-counts
 
-# Step 3: Subsequent delta ingestion in default mode (applies PKs and upserts)
-python3 sweep.py vsam load-data --mode default --workers 4 --bg
+# Step 3: subsequent delta ingestion upserts on the PKs
+python3 sweep.py vsam load-data --workers 4 --bg
 ```
 
 ### Recipe 3: Multi-Track Overnight Ingestion

@@ -11,12 +11,10 @@ KEY FEATURES:
      key constraints active in PostgreSQL. When inserting rows, dynamic UPSERT
      logic (ON CONFLICT (pk) DO UPDATE SET ...) guarantees newer file versions
      or files with duplicate keys update existing records seamlessly.
-  2. Latest File Version Filter:
-     With --latest-only (or --latest-version-only), automatically identifies
-     timestamps in filenames (e.g. MMDDYYYY, YYYYMMDD, YYYYMMDDHHMMSS) and
-     ingests only the newest version per target table.
-     Without --latest-only, loads all versions chronologically (oldest to newest)
-     so the latest version always takes precedence through upsert.
+  2. Latest File Version Filter (always on):
+     Timestamps in filenames (e.g. MMDDYYYY, YYYYMMDD, YYYYMMDDHHMMSS) identify
+     the newest version per (company, source file); only that one is loaded,
+     because VSAM files are full snapshots.
   3. Dynamic Schema Segregation:
      When a source file maps to multiple schemas, filters rows dynamically
      matching the inferred schema discriminator column to route records to their
@@ -252,7 +250,7 @@ def newer_snapshot_loaded(table, source_key, version):
     return any(v > str(version) for v in loaded)
 
 
-def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
+def load_segregated(task, worker_id, run_id, tg_prof, cb_meta):
     """
     Loads a single source file into PostgreSQL:
     - If NO schema_col is identified for the file: the entire file is loaded ONLY into the 'bcs' schema.
@@ -365,8 +363,7 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
 
                 strat = check_table_load_strategy(
                     dest_s, table,
-                    tg_prof_pk=[norm_col(c) for c in tg.get("pk_cols", []) if c] if tg.get("pk_valid") else [],
-                    mode=mode
+                    tg_prof_pk=[norm_col(c) for c in tg.get("pk_cols", []) if c] if tg.get("pk_valid") else []
                 )
                 schema_strategies[dest_s] = strat
                 state = claim_table(dest_s, table, strat)
@@ -382,7 +379,7 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta, mode="default"):
                 elif strat["action"] == "INSERT_FRESH":
                     logger.info(f"[Worker {worker_id}] Table {dest_s}.{table} is fresh. Applied PK ({', '.join(strat['pk_cols'])}). Validated record insert enabled.")
                 else:
-                    logger.info(f"[Worker {worker_id}] Table {dest_s}.{table} is fresh (empty). Direct load enabled (mode={mode}).")
+                    logger.info(f"[Worker {worker_id}] Table {dest_s}.{table} is fresh (empty). Loaded without a primary key.")
             return schema_strategies[dest_s]
 
         # Cast value helper
@@ -735,12 +732,10 @@ def build_schema_breakdown(results):
 
 def main():
     parser = argparse.ArgumentParser(description="Step 06: Stream VSAM data from S3 to PostgreSQL with dynamic upsert and schema segregation.")
-    parser.add_argument("--mode", choices=["default", "data"], default="default", help="Ingestion mode: default (apply PK to fresh tables, validate records, upsert) or data (no PK on fresh tables, direct load)")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     parser.add_argument("--company", help="Comma-separated company filter")
     parser.add_argument("--tables", help="Comma-separated tables to load")
     parser.add_argument("--limit-files", type=int, help="Limit number of files loaded")
-    parser.add_argument("--latest-only", "--latest-version-only", action="store_true", help="Load only the latest file version per table (based on timestamp in filename)")
     parser.add_argument("--force-truncate", action="store_true",
                         help="Tables without a primary key are replaced by the new snapshot automatically in a full run. "
                              "In a PARTIAL run (--company/--tables/--limit-files) replacing a table that already has rows "
@@ -759,10 +754,7 @@ def main():
     logger.info(f"Workers: {args.workers}")
     logger.info("Strategy: Live Database Inspection (Direct load for fresh tables; Dynamic Upsert if PK exists; "
                 "Tables without a PK are replaced atomically by the newest snapshot)")
-    if args.latest_only:
-        logger.info("Version Filter: LATEST FILE VERSION ONLY (--latest-only active)")
-    else:
-        logger.info("Version Filter: LATEST FILE VERSION (Preserving all mapped destination schemas)")
+    logger.info("Version Filter: LATEST FILE VERSION per (company, source file); VSAM files are full snapshots")
     logger.info("=" * 75)
 
     # Load Step 02 load matrix
@@ -830,16 +822,15 @@ def main():
         logger.info(f"[DRY-RUN] {len(tasks)} file(s) would be loaded. No database changes made.")
         return True
 
-    # In Default Mode: Apply PK constraints to available tables before streaming
-    if args.mode == "default":
-        pk_file = VSAM_GEN_DDL_DIR / "all_pk.sql"
-        if pk_file.exists():
-            logger.info(f"[Default Mode] Applying PK constraints to available tables before loading data: {pk_file}")
-            try:
-                run_psql(pk_file, is_file=True)
-                logger.info("[+] PK constraints applied to available tables.")
-            except RuntimeError as pe:
-                logger.warning(f"Could not pre-apply PK constraints (tables keep their current constraints): {pe}")
+    # Primary keys are always applied before loading
+    pk_file = VSAM_GEN_DDL_DIR / "all_pk.sql"
+    if pk_file.exists():
+        logger.info(f"Applying PK constraints to available tables before loading data: {pk_file}")
+        try:
+            run_psql(pk_file, is_file=True)
+            logger.info("[+] PK constraints applied to available tables.")
+        except RuntimeError as pe:
+            logger.warning(f"Could not pre-apply PK constraints (tables keep their current constraints): {pe}")
 
     # A full snapshot must never overwrite a NEWER snapshot of the same source that is already loaded.
     runnable, stale_results = [], []
@@ -860,7 +851,7 @@ def main():
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         future_map = {
-            pool.submit(load_segregated, task, i % max_workers + 1, run_id, tg_prof, cb_meta, args.mode): task
+            pool.submit(load_segregated, task, i % max_workers + 1, run_id, tg_prof, cb_meta): task
             for i, task in enumerate(tasks)
         }
         for fut in as_completed(future_map):
@@ -914,7 +905,6 @@ def main():
         "skipped_already_done": skipped,
         "total_rows_loaded": total_loaded_rows,
         "total_rows_skipped_pk_validation": total_skipped_rows,
-        "latest_only_mode": "YES" if args.latest_only else "NO",
         "workers": max_workers
     }]
 

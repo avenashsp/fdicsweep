@@ -40,8 +40,8 @@ python3 sweep.py stop                           # stop jobs (and their child pro
 Individual steps are modules, run from the repository root:
 
 ```bash
-python3 sweep.py vsam load-data --mode data --workers 4
-python3 -m vsam.vsam_06_load_data --mode data --workers 4      # same thing, without the CLI wrapper
+python3 sweep.py vsam load-data --workers 4
+python3 -m vsam.vsam_06_load_data --workers 4      # same thing, without the CLI wrapper
 ```
 
 Every step exits `0` on success and non-zero on failure.

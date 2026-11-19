@@ -328,7 +328,6 @@ def main():
     parser = argparse.ArgumentParser(description="Step 02: Discover and map VSAM files to PostgreSQL tables.")
     parser.add_argument("--s3", default=VSAM_S3_BUCKET, help="Target S3 URI prefix")
     parser.add_argument("--company", help="Comma-separated company tokens to filter")
-    parser.add_argument("--latest-only", "--latest-version-only", action="store_true", help="Keep only latest file version per table")
     parser.add_argument("--tbl-col", choices=TBL_COL_CHOICES, default=None,
                         help="Table column names: 'headers' = S3 file headers (default, or VSAM_TBL_COL env) or "
                              "'copybook' = names of the mapped copybook columns. Datatypes always come from the "
@@ -733,9 +732,9 @@ def main():
     df = pd.DataFrame(inv) if inv else pd.DataFrame(columns=inv_cols)
     lm = pd.DataFrame(loads) if loads else pd.DataFrame(columns=lm_cols)
 
-    if args.latest_only and not lm.empty:
+    if not lm.empty:      # VSAM files are full snapshots: only the newest version per (company, source file) is loaded
         orig_count = len(lm)
-        lm = filter_latest_versions(lm, ["target_schema", "target_table"])
+        lm = filter_latest_versions(lm, ["source_company", "source_filename"])
         logger.info(f"Filtered to latest file versions: {len(lm)} tasks (was {orig_count})")
 
     OUT.mkdir(parents=True, exist_ok=True)
