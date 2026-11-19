@@ -91,9 +91,6 @@ from vsam.common_schema import (  # noqa: F401
     AUDIT_COL_NAMES,
     build_table_ddl,
     check_table_exists,
-    get_table_pk_columns_live,
-    table_has_existing_data,
-    check_table_load_strategy,
     table_ddl,
 )
 from vsam.common_files import (  # noqa: F401
@@ -200,9 +197,6 @@ __all__ = [
     "AUDIT_COL_NAMES",
     "build_table_ddl",
     "check_table_exists",
-    "get_table_pk_columns_live",
-    "table_has_existing_data",
-    "check_table_load_strategy",
     "table_ddl",
     "extract_version_key",
     "filter_latest_versions",

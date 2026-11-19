@@ -21,94 +21,28 @@ rows can break the same rules everywhere):
       rejected rows -> sweep_ctl.load_rejects, load_log row, triggers back on, COMMIT
     END
 
-Rejected rows never fail the file unless their number reaches `max_rejects` (default 10).
+Rejected rows never fail the file unless their number reaches `max_rejects` (default 0 = never).
 `fast_bulk` keeps the old direct COPY for an empty, constraint-free table (no bad-row isolation).
 """
-import json
-
-from sweep_common import CTL_SCHEMA, LOAD_LOG_TABLE, lit, q, query_db_dicts, run_psql
+from sweep_common import LOAD_LOG_TABLE, lit, q
+from sweep_loadpipe import (  # re-exported: the Oracle loader and its tests import these from here
+    MAX_DUP_ROWS_PRINTED, MAX_REJECT_ROWS_PRINTED, REJECT_TABLE, REJECT_TABLE_DDL, TEXT_TYPES, _cmp,
+    ensure_reject_table, load_table_meta, parse_output, persist_failed_file_rejects, probe_trigger_mode, upsert_statements,
+)
 from sweep_s3meta import meta_sql_values
 
-REJECT_TABLE = f"{CTL_SCHEMA}.load_rejects"
-MAX_REJECT_ROWS_PRINTED = 1000       # rejected rows echoed back per file (and stored when the file fails)
-MAX_DUP_ROWS_PRINTED = 200
-TEXT_TYPES = ("text", "character varying")                  # unbounded text needs no validation / cast
-
-REJECT_TABLE_DDL = f"""
-CREATE TABLE IF NOT EXISTS {REJECT_TABLE} (
-    id            bigserial PRIMARY KEY,
-    uri           text NOT NULL,
-    target_schema text,
-    target_table  text,
-    row_no        bigint,
-    reason        text NOT NULL,
-    detail        text,
-    row_data      jsonb,
-    file_status   text DEFAULT 'LOADED',
-    rejected_at   timestamptz DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_sweep_load_rejects_uri ON {REJECT_TABLE} (uri);
-"""
-
-
-def ensure_reject_table():
-    run_psql(REJECT_TABLE_DDL)
-
+__all__ = [
+    "MAX_DUP_ROWS_PRINTED", "MAX_REJECT_ROWS_PRINTED", "REJECT_TABLE", "REJECT_TABLE_DDL", "TEXT_TYPES", "_cmp",
+    "ensure_reject_table", "load_table_meta", "parse_output", "persist_failed_file_rejects", "probe_trigger_mode", "upsert_statements",
+    "build_fast_script", "build_staged_script", "has_constraints", "load_log_insert", "load_table_meta", "plan_load",
+]
 
 # -----------------------------------------------------------------------------
 # Catalog metadata (cached per table by the caller)
 # -----------------------------------------------------------------------------
-def load_table_meta(schema, table):
-    """Columns, unique keys, CHECK / FK constraints and enabled user triggers of schema.table."""
-    reg = f"to_regclass({lit(q(schema) + '.' + q(table))})"
-    cols = query_db_dicts(
-        f"SELECT a.attname AS name, format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull AS notnull, "
-        f"a.atthasdef AS hasdef, a.attidentity AS identity, a.attgenerated AS generated "
-        f"FROM pg_attribute a WHERE a.attrelid = {reg} AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum")
-    keys = query_db_dicts(
-        f"SELECT c.relname AS name, i.indisprimary AS is_primary, "
-        f"(SELECT string_agg(a.attname, ',' ORDER BY k.ord) FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, ord) "
-        f" JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum) AS cols "
-        f"FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
-        f"WHERE i.indrelid = {reg} AND i.indisunique AND i.indisvalid AND i.indpred IS NULL AND i.indexprs IS NULL "
-        f"ORDER BY i.indisprimary DESC, c.relname")
-    checks = query_db_dicts(
-        f"SELECT conname AS name, pg_get_expr(conbin, conrelid) AS expr, "
-        f"(SELECT string_agg(a.attname, ',') FROM pg_attribute a WHERE a.attrelid = conrelid AND a.attnum = ANY(conkey)) AS cols "
-        f"FROM pg_constraint WHERE conrelid = {reg} AND contype = 'c' ORDER BY conname")
-    fks = query_db_dicts(
-        f"SELECT conname AS name, confrelid::regclass::text AS parent, confrelid = conrelid AS self_ref, "
-        f"(SELECT string_agg(a.attname, ',' ORDER BY u.ord) FROM unnest(conkey) WITH ORDINALITY u(attnum, ord) "
-        f" JOIN pg_attribute a ON a.attrelid = conrelid AND a.attnum = u.attnum) AS cols, "
-        f"(SELECT string_agg(a.attname, ',' ORDER BY u.ord) FROM unnest(confkey) WITH ORDINALITY u(attnum, ord) "
-        f" JOIN pg_attribute a ON a.attrelid = confrelid AND a.attnum = u.attnum) AS parent_cols "
-        f"FROM pg_constraint WHERE conrelid = {reg} AND contype = 'f' ORDER BY conname")
-    triggers = query_db_dicts(
-        f"SELECT tgname AS name FROM pg_trigger WHERE tgrelid = {reg} AND NOT tgisinternal AND tgenabled = 'O' ORDER BY tgname")
-    flag = lambda v: str(v).strip().lower() in ("t", "true", "1")
-    return {
-        "columns": {c["name"]: {"type": c["type"], "notnull": flag(c["notnull"]), "hasdef": flag(c["hasdef"]),
-                                "identity": c["identity"], "generated": c["generated"]} for c in cols},
-        "keys": [{"name": k["name"], "primary": flag(k["is_primary"]), "cols": k["cols"].split(",")} for k in keys if k["cols"]],
-        "checks": [{"name": c["name"], "expr": c["expr"], "cols": (c["cols"] or "").split(",") if c["cols"] else []} for c in checks],
-        "fks": [{"name": f["name"], "parent": f["parent"], "self_ref": flag(f["self_ref"]),
-                 "cols": f["cols"].split(","), "parent_cols": f["parent_cols"].split(",")} for f in fks if f["cols"]],
-        "triggers": [t["name"] for t in triggers],
-    }
-
-
 def has_constraints(meta):
     return bool(meta["keys"] or meta["checks"] or meta["fks"]
                 or any(c["notnull"] for c in meta["columns"].values()))
-
-
-def probe_trigger_mode():
-    """'replica' when this database user may SET session_replication_role, otherwise 'disable'."""
-    try:
-        run_psql("BEGIN;\nSET LOCAL session_replication_role = replica;\nROLLBACK;")
-        return "replica"
-    except RuntimeError:
-        return "disable"
 
 
 # -----------------------------------------------------------------------------
@@ -116,11 +50,6 @@ def probe_trigger_mode():
 # -----------------------------------------------------------------------------
 def _is_text(type_name):
     return type_name in TEXT_TYPES
-
-
-def _cmp(expr, type_name):
-    """Comparison operand: types without an equality operator (json, xml) are compared as text."""
-    return f"{expr}::text" if type_name in ("json", "xml") or type_name.startswith("point") else expr
 
 
 def _trigger_off_on(schema, table, meta, mode):
@@ -269,46 +198,9 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
             "FROM (SELECT * FROM _rej WHERE reason <> 'DUP_IN_FILE' ORDER BY row_no LIMIT 5) f; "
             f"RAISE EXCEPTION 'Too many rejected rows: % (limit {int(max_rejects)}). First: %', n, msg; END IF; END $$;\n")
 
-    # 8. apply: INSERT ... ON CONFLICT on the arbiter key
-    head = ", ".join(q(c) for c in header_cols)
-    ins_cols = f"INSERT INTO {tgt} AS t ({head})" + (" OVERRIDING SYSTEM VALUE" if plan["identity"] else "")
-    arb = plan["arbiter"]
-    on_conflict = ""
-    if arb:
-        a_set = set(arb["cols"])
-        upd = [c for c in header_cols if c not in a_set and cols[c]["identity"] != "a"]
-        sets = [f"{q(c)} = EXCLUDED.{q(c)}" for c in upd]
-        # triggers are off, so set the audit columns the audit trigger would have set on an update
-        if "modifiedby" in cols and "modifiedby" not in plan["present"]:
-            sets.append('"modifiedby" = CURRENT_USER')
-        if "modifieddate" in cols and "modifieddate" not in plan["present"]:
-            sets.append('"modifieddate" = CURRENT_TIMESTAMP')
-        arb_list = ", ".join(q(c) for c in arb["cols"])
-        if upd:
-            # only rows that actually differ are updated. Columns that come FROM the file (modifieddate / modifiedby
-            # included) are source data and count as a change; audit values the tool sets itself are not compared.
-            old = ", ".join(_cmp(f"t.{q(c)}", cols[c]["type"]) for c in upd)
-            new = ", ".join(_cmp(f"EXCLUDED.{q(c)}", cols[c]["type"]) for c in upd)
-            on_conflict = (f" ON CONFLICT ({arb_list}) DO UPDATE SET {', '.join(sets)} "
-                           f"WHERE ({old}) IS DISTINCT FROM ({new})")
-        else:
-            on_conflict = f" ON CONFLICT ({arb_list}) DO NOTHING"
-    if arb:
-        # which staged keys already exist (before the statement) -> updated; the rest -> inserted. Works on
-        # partitioned tables too (RETURNING xmax does not).
-        key_join = " AND ".join(f"t.{q(c)} = s.{q(c)}" for c in arb["cols"])
-        add(f"CREATE TEMP TABLE _existing ON COMMIT DROP AS SELECT {', '.join('s.' + q(c) for c in arb['cols'])} "
-            f"FROM _stg s WHERE EXISTS (SELECT 1 FROM {tgt} t WHERE {key_join});\n")
-        ret = ", ".join(f"{q(c)}" for c in arb["cols"])
-        e_join = " AND ".join(f"i.{q(c)} = e.{q(c)}" for c in arb["cols"])
-        e_first = q(arb["cols"][0])
-        add(f"WITH ins AS ({ins_cols} SELECT {head} FROM _stg AS s{on_conflict} RETURNING {ret}), "
-            f"x AS (SELECT count(*) AS tot, count(e.{e_first}) AS upd FROM ins i LEFT JOIN _existing e ON {e_join}) "
-            "INSERT INTO _c SELECT 'inserted', tot - upd FROM x UNION ALL SELECT 'updated', upd FROM x;\n")
-    else:
-        add(f"WITH ins AS ({ins_cols} SELECT {head} FROM _stg AS s RETURNING 1) "
-            "INSERT INTO _c SELECT 'inserted', count(*) FROM ins UNION ALL SELECT 'updated', 0;\n")
-    add("INSERT INTO _c SELECT 'unchanged', (SELECT n FROM _c WHERE k = 'staged') - (SELECT sum(n) FROM _c WHERE k IN ('inserted', 'updated'));\n")
+    # 8. apply: INSERT ... ON CONFLICT on the arbiter key, updating only rows that differ
+    for stmt in upsert_statements(tgt, header_cols, cols, plan["arbiter"], plan["present"], plan["identity"]):
+        add(stmt)
 
     # 9. nothing may disappear silently
     add("DO $$ DECLARE raw_n bigint; acc bigint; BEGIN "
@@ -327,34 +219,6 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
     add(on)
     add(log_sql + "\nCOMMIT;\n")
     return "".join(s)
-
-
-# -----------------------------------------------------------------------------
-# Output parsing / failure-path persistence
-# -----------------------------------------------------------------------------
-def parse_output(stdout):
-    """Counts (last @@COUNTS@@ wins), reject summary and sample rows echoed by the staged script."""
-    counts, summary, rows = {}, [], []
-    for line in (stdout or "").splitlines():
-        if line.startswith("@@COUNTS@@"):
-            counts = {k: int(v) for k, v in json.loads(line[10:]).items()}
-        elif line.startswith("@@REJ_SUMMARY@@"):
-            summary.append(json.loads(line[15:]))
-        elif line.startswith("@@REJ_ROW@@"):
-            rows.append(json.loads(line[11:]))
-    return counts, summary, rows
-
-
-def persist_failed_file_rejects(uri, schema, table, rows):
-    """When a file fails (e.g. too many rejects) its transaction rolled back; keep the reject sample for review."""
-    if not rows:
-        return
-    values = ",\n".join(
-        f"({lit(uri)}, {lit(schema)}, {lit(table)}, {int(r['row_no'])}, {lit(r['reason'])}, {lit(r.get('detail'))}, "
-        f"{lit(json.dumps(r.get('row')))}::jsonb, 'FILE_FAILED')" for r in rows)
-    run_psql(f"DELETE FROM {REJECT_TABLE} WHERE uri = {lit(uri)} AND target_schema = {lit(schema)} AND target_table = {lit(table)};\n"
-             f"INSERT INTO {REJECT_TABLE} (uri, target_schema, target_table, row_no, reason, detail, row_data, file_status) "
-             f"VALUES {values};")
 
 
 def load_log_insert(uri, schema, table, size_bytes, file_format, worker_id, s3_meta=None):

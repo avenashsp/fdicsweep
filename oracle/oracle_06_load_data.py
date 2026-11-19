@@ -52,7 +52,7 @@ from oracle.oracle_06_pipeline import (
     build_fast_script, build_staged_script, ensure_reject_table, has_constraints, load_log_insert, load_table_meta,
     parse_output, persist_failed_file_rejects, plan_load, probe_trigger_mode,
 )
-from sweep_s3meta import has_meta, head_many, head_object, make_meta, meta_equal, meta_from_row, describe_difference
+from sweep_s3meta import classify_loaded, head_many, head_object, make_meta, meta_from_row
 from oracle.oracle_06_order import plan_levels
 from sweep_streaming import read_stream_head, stream_program_literal
 from sweep_platform import atomic_write_json
@@ -156,20 +156,8 @@ def get_loaded_log():
 
 
 def classify_job(job, stored, live):
-    """
-    ('skip' | 'load' | 'reload', reason). A file is already loaded only when its load_log row is SUCCESS and
-    LastModified, ETag and size all equal what S3 reports now (`live`, else the file map).
-    """
-    if stored is None:
-        return "load", "not loaded yet"
-    if not any(stored.values()):
-        return "skip", "loaded by an earlier version without S3 metadata (use --reload to re-verify)"
-    current = live or meta_from_row(job)
-    if not has_meta(current):
-        return "skip", "S3 metadata unavailable; cannot compare, treated as loaded"
-    if meta_equal(stored, current):
-        return "skip", "unchanged since the last load"
-    return "reload", "S3 object changed: " + describe_difference(stored, current)
+    """('skip' | 'load' | 'reload', reason) - see sweep_s3meta.classify_loaded; `live` = HEAD result, else the file map."""
+    return classify_loaded([] if stored is None else [stored], live or meta_from_row(job))
 
 
 def get_target_columns(schema, table):

@@ -88,6 +88,24 @@ def describe_difference(stored, current):
     return ", ".join(diffs)
 
 
+def classify_loaded(stored_list, current):
+    """
+    ('load' | 'skip' | 'reload', reason) for a file given the S3 metadata stored with its SUCCESS load_log row(s)
+    (`stored_list`, empty = never loaded) and the metadata S3 reports now (`current`).
+    A file is already loaded only when every stored row equals LastModified + ETag + size.
+    """
+    if not stored_list:
+        return "load", "not loaded yet"
+    if any(not any(m.values()) for m in stored_list):
+        return "skip", "loaded by an earlier version without S3 metadata (use --reload to re-verify)"
+    if not has_meta(current):
+        return "skip", "S3 metadata unavailable; cannot compare, treated as loaded"
+    changed = [m for m in stored_list if not meta_equal(m, current)]
+    if not changed:
+        return "skip", "unchanged since the last load"
+    return "reload", "S3 object changed: " + describe_difference(changed[0], current)
+
+
 def split_s3_uri(uri):
     rest = uri[5:]
     bucket, _, key = rest.partition("/")

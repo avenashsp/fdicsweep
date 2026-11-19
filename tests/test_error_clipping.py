@@ -34,7 +34,7 @@ def test_schema_counts_format():
 
 
 def test_load_summary_shows_schema_breakdowns_instead_of_totals():
-    rows, _ = build_load_summary([{
+    rows = build_load_summary([{
         "s3_filename": "f.csv", "table": "t", "status": "SUCCESS", "records_loaded_mapped": 54,
         "records_loaded_unmapped": 0, "records_loaded_mapped_detail": "bss01104 = 20, bss01112 = 34",
         "records_loaded_unmapped_detail": "", "records_loaded_bcs": 3, "full_path": "u"}])

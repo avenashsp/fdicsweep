@@ -3,80 +3,88 @@
 =============================================================================
 vsam/vsam_06_load_data.py - Step 06: Schema-Segregated S3 Streaming & Upsert
 =============================================================================
-Streams VSAM flat files from S3 directly into PostgreSQL.
+Streams VSAM flat files from S3 into PostgreSQL with the SAME workflow as the Oracle track: temp staging tables,
+bulk \\copy, set-based validation in SQL, one transaction per file (see vsam/vsam_06_pipeline.py).
 
-KEY FEATURES:
-  1. Primary Key Pre-Requisite & Dynamic Upsert:
-     Runs AFTER Step 06 (load-obj), so all target tables already have primary
-     key constraints active in PostgreSQL. When inserting rows, dynamic UPSERT
-     logic (ON CONFLICT (pk) DO UPDATE SET ...) guarantees newer file versions
-     or files with duplicate keys update existing records seamlessly.
-  2. Latest File Version Filter (always on):
-     Timestamps in filenames (e.g. MMDDYYYY, YYYYMMDD, YYYYMMDDHHMMSS) identify
-     the newest version per (company, source file); only that one is loaded,
-     because VSAM files are full snapshots.
-  3. Dynamic Schema Segregation:
-     When a source file maps to multiple schemas, filters rows dynamically
-     matching the inferred schema discriminator column to route records to their
-     dedicated schema without hardcoding.
+  1. Keys: only a primary key from the copybook KEY group (every key column reliably mapped) or from
+     korg_overrides is applied - never a guessed one. A key that cannot be applied is an ERROR. A table without
+     a known key is loaded keyless and REPLACED by each new snapshot.
+  2. Latest file version per (company, source file) only; VSAM files are full snapshots.
+  3. Schema routing: the korg column's last 3 digits select the active schema, anything else goes to `bcs`.
+  4. Bad rows are rejected (BAD_VALUE, NOT_NULL, PK_BLANK, PK_SENTINEL, ALL_NULL) and listed in
+     sweep_ctl.load_rejects and the Reject_Summary / Rejected_Rows sheets; valid rows always load unless
+     --max-rejects N is given (then a file with N rejects fails and rolls back).
+  5. A file is loaded again only when its S3 LastModified, ETag or size changed (or with --reload).
+  6. Keyed tables are upserted (only rows that differ are updated); rows missing from a newer snapshot are
+     never deleted.
 
 Generates:
   - outputs/vsam/vsam_06_load_log_<run_id>.csv
   - reports/vsam/<db>_vsam_06_load_data_report_<ts>.xlsx
 =============================================================================
 """
-import sys
+import argparse
+import json
 import os
 import re
-import csv
-import json
-import time
-import argparse
+import sys
 import threading
-from pathlib import Path
+import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
 import pandas as pd
 
 from sweep_common import (
-    VSAM_GEN_DDL_DIR,
+    CTL_SCHEMA,
+    DEFAULT_WORKERS,
     VSAM_LOGS_DIR,
     VSAM_REPORTS_DIR,
-    DEFAULT_WORKERS,
-    CTL_SCHEMA,
     clip_error,
+    generate_excel_report,
+    get_db_name,
     get_logger,
     get_timestamp,
-    get_db_name,
-    generate_excel_report,
-    run_psql,
-    query_db_rows,
-    q,
     lit,
     norm_col,
+    q,
+    query_db_dicts,
+    query_db_rows,
+    run_psql,
+    run_psql_script,
 )
+from sweep_loadpipe import REJECT_TABLE, ensure_reject_table, load_table_meta, parse_output, probe_trigger_mode
 from sweep_platform import atomic_write_json
+from sweep_s3meta import classify_loaded, head_many, make_meta, meta_from_row
+from sweep_streaming import stream_program_literal
 from vsam.common_colmap import effective_columns_meta, header_to_table_map
-from collections import defaultdict
+from vsam.common_config import PG_ENCODING
+from vsam.common_files import first_row, has_trailing_delim, pg_delim, pg_quote
+from vsam.common_mapping import get_active_schemas_map, get_all_active_schemas, get_korg_override_pkey
+from vsam.vsam_06_pipeline import build_unit_script, parse_counts
 from vsam.vsam_common import (
-    _opener,
-    AUDIT_COL_NAMES,
+    OUT,
     build_table_ddl,
     check_table_exists,
     delim_for,
     filter_latest_versions,
-    get_all_active_schemas,
-    get_pk_validation_failure_reason,
     load_csv_safe,
-    match_schema_by_last3,
-    OUT,
     read_json,
-    record_passes_pk_validation,
 )
 
 logger = get_logger("vsam_06_load_data", "vsam_06_load_data")
 LOCK = threading.Lock()
 ACTIVE_WORKERS_FILE = VSAM_LOGS_DIR / "active_workers.json"
 _ACTIVE_STREAMS = {}
+DEFAULT_MAX_REJECTS = 0          # 0 = valid rows always load; the file fails only on technical errors
+PSQL_LOAD_OPTIONS = "-c synchronous_commit=off -c statement_timeout=0 -c lock_timeout=0"
+
+# Tables without a primary key are REPLACED by the newest snapshot. In a PARTIAL run (--company, --tables,
+# --limit-files) other source files of a shared table could be missing, so replacing a table that already holds
+# rows needs --force-truncate.
+FORCE_TRUNCATE = False
+PARTIAL_RUN = False
 
 
 def _flush_active_streams():
@@ -96,23 +104,10 @@ def _flush_active_streams():
 def record_stream_start(worker_id, schema, table, full_path, filename, size_mb=0):
     with LOCK:
         _ACTIVE_STREAMS[worker_id] = {
-            "pid": os.getpid(),
-            "worker_id": worker_id,
-            "filename": filename,
-            "table": f"{schema}.{table}",
-            "mb": float(size_mb or 0.0),
-            "rows": 0,
-            "start_time": time.time(),
-            "uri": full_path
+            "pid": os.getpid(), "worker_id": worker_id, "filename": filename, "table": f"{schema}.{table}",
+            "mb": float(size_mb or 0.0), "rows": 0, "start_time": time.time(), "uri": full_path,
         }
         _flush_active_streams()
-
-
-def record_stream_progress(worker_id, rows_added):
-    with LOCK:
-        if worker_id in _ACTIVE_STREAMS:
-            _ACTIVE_STREAMS[worker_id]["rows"] = int(_ACTIVE_STREAMS[worker_id].get("rows", 0) + rows_added)
-            _flush_active_streams()
 
 
 def record_stream_end(worker_id):
@@ -125,57 +120,10 @@ def record_stream_end(worker_id):
 
 
 # -----------------------------------------------------------------------------
-# Snapshot replace for tables WITHOUT a primary key
+# load_log helpers
 # -----------------------------------------------------------------------------
-# VSAM files are full snapshots. A table that has no primary key cannot be upserted, so it is REPLACED by the
-# newest snapshot - atomically:
-#   1. every file that feeds the table loads into one staging table (`<table>__sweep_stg`, same schema)
-#   2. when the run is finished and every file of that table succeeded, ONE transaction does
-#      TRUNCATE target; INSERT INTO target SELECT * FROM stage; <load_log rows>; DROP stage
-#   3. if any file of the table failed, the staging table is dropped and the target stays untouched
-# Several source files may feed one table (e.g. different companies into the shared `bcs` schema); because all
-# of them are staged before the swap, none of them is wiped by another. In a PARTIAL run (--company, --tables,
-# --limit-files) files that feed the same table could be missing, so replacing a table that already holds rows
-# needs --force-truncate.
-FORCE_TRUNCATE = False
-PARTIAL_RUN = False
-_STAGE_LOCK = threading.Lock()
-_STAGED = {}     # (schema, table) -> {"stage": str, "ok": bool, "files": [uri], "logs": [tuple]}
-
-
-def _stage_name(table):
-    return f"{table[:48]}__sweep_stg"
-
-
-def claim_table(dest_schema, table, strategy):
-    """
-    Called per (file, destination table). Returns None for tables that have a primary key (they are upserted in
-    place) or the shared staging state for tables without one. Raises RuntimeError when the table already holds
-    rows and the run is partial without --force-truncate.
-    """
-    if strategy.get("has_pk"):
-        return None
-    key = (dest_schema.lower(), table.lower())
-    with _STAGE_LOCK:
-        state = _STAGED.get(key)
-        if state:
-            return state
-        if strategy.get("has_data") and PARTIAL_RUN and not FORCE_TRUNCATE:
-            raise RuntimeError(
-                f"{dest_schema}.{table} already contains rows and has no primary key; this partial run "
-                f"(--company/--tables/--limit-files) cannot replace it safely because other source files of the "
-                f"table may be missing. Run without filters, or pass --force-truncate."
-            )
-        stage = _stage_name(table)
-        tgt = f"{q(dest_schema)}.{q(table)}"
-        run_psql(f"DROP TABLE IF EXISTS {q(dest_schema)}.{q(stage)};\n"
-                 f"CREATE UNLOGGED TABLE {q(dest_schema)}.{q(stage)} (LIKE {tgt} INCLUDING DEFAULTS);")
-        state = {"stage": stage, "ok": True, "files": [], "logs": []}
-        _STAGED[key] = state
-        return state
-
-
 def load_log_sql(full_path, dest_schema, table, size_bytes, rows, seconds, worker_id, status="SUCCESS", message=None):
+    """One load_log row (keyed `<uri>#<schema>`, which Step 07 strips)."""
     msg_cols = ", message" if message else ""
     msg_val = f", {lit(message)}" if message else ""
     msg_upd = f", message={lit(message)}" if message else ""
@@ -190,50 +138,26 @@ def load_log_sql(full_path, dest_schema, table, size_bytes, rows, seconds, worke
 
 
 def write_load_log(full_path, dest_schema, table, size_bytes, rows, seconds, worker_id, status="SUCCESS", message=None):
-    """
-    Records a per-destination-schema load in sweep_ctl.load_log (keyed `<uri>#<schema>`, which Step 07
-    strips). Errors propagate: a lost log row would cause the file to be reloaded.
-    """
+    """Records a per-destination-schema load in sweep_ctl.load_log. Errors propagate (a lost row means a reload)."""
     run_psql(load_log_sql(full_path, dest_schema, table, size_bytes, rows, seconds, worker_id, status, message))
 
 
-def finalize_replacements(results):
-    """
-    Swaps every staged table into place (one transaction each) or discards it. Downgrades the result rows of
-    files whose data was discarded so reports and the exit code tell the truth.
-    """
-    by_uri = {}
-    for r in results:
-        by_uri.setdefault(r.get("uri") or r.get("full_path"), []).append(r)
-
-    def fail(uris, reason):
-        for u in uris:
-            for r in by_uri.get(u, []):
-                if r.get("status") == "SUCCESS":
-                    r["status"] = "FAILED"
-                    r["error"] = reason
-                    r["rows_loaded"] = r["records_loaded"] = 0
-
-    for (schema, table), st in sorted(_STAGED.items()):
-        tgt, stage = f"{q(schema)}.{q(table)}", f"{q(schema)}.{q(st['stage'])}"
-        if st["ok"]:
-            logs = "\n".join(load_log_sql(*args) for args in st["logs"])
-            try:
-                run_psql(f"BEGIN;\nTRUNCATE TABLE {tgt};\nINSERT INTO {tgt} SELECT * FROM {stage};\n{logs}\n"
-                         f"DROP TABLE {stage};\nCOMMIT;")
-                logger.info(f"[REPLACE] {schema}.{table} replaced by the new snapshot ({len(st['files'])} file(s))")
-                continue
-            except RuntimeError as e:
-                fail(st["files"], clip_error(f"snapshot swap failed for {schema}.{table}: {e}"))
-                logger.error(f"[REPLACE] swap failed for {schema}.{table}: {e}")
-        else:
-            fail(st["files"], f"staged data discarded: another file for {schema}.{table} failed; table left unchanged")
-            logger.error(f"[REPLACE] {schema}.{table} left unchanged (a source file failed)")
+def get_loaded_log():
+    """{file uri: [S3 metadata stored with its SUCCESS rows]} - one entry per destination schema of the file."""
+    try:
+        rows = query_db_dicts(f"SELECT uri, s3_last_modified, s3_etag, s3_size FROM {CTL_SCHEMA}.load_log WHERE status = 'SUCCESS'")
+    except RuntimeError as e:
+        logger.warning(f"Could not read S3 metadata from load_log ({e}); falling back to URIs only. "
+                       f"Apply the control DDL (Step 05) to add the s3_* columns.")
         try:
-            run_psql(f"DROP TABLE IF EXISTS {stage};")
-        except RuntimeError as e:
-            logger.warning(f"Could not drop staging table {stage}: {e}")
-    _STAGED.clear()
+            rows = query_db_dicts(f"SELECT uri FROM {CTL_SCHEMA}.load_log WHERE status = 'SUCCESS'")
+        except RuntimeError as e2:
+            logger.warning(f"Could not read load_log (table might be new): {e2}")
+            return {}
+    out = defaultdict(list)
+    for r in rows:
+        out[r["uri"].rsplit("#", 1)[0]].append(make_meta(r.get("s3_last_modified"), r.get("s3_etag"), r.get("s3_size")))
+    return out
 
 
 def newer_snapshot_loaded(table, source_key, version):
@@ -250,378 +174,325 @@ def newer_snapshot_loaded(table, source_key, version):
     return any(v > str(version) for v in loaded)
 
 
-def load_segregated(task, worker_id, run_id, tg_prof, cb_meta):
-    """
-    Loads a single source file into PostgreSQL:
-    - If NO schema_col is identified for the file: the entire file is loaded ONLY into the 'bcs' schema.
-      None of the mapped schemas receive data.
-    - If schema_col is identified: records are segregated to mapped destination schemas based on last 3 digits
-      of schema_col (unmatched records -> bcs).
-    - Table PK constraint check:
-      * If table contains PK constraint: checks every record and loads ONLY records that pass PK validation
-        (non-null, non-blank, non-sentinel PK values; all-null/sentinel rows filtered). Upserts via ON CONFLICT DO UPDATE.
-      * If table contains NO PK constraint: loads ALL records (does not remove/ignore NULL, blank, empty whitespace,
-        or sentinel values). If table has existing data, truncates table in that mapped schema then loads fresh.
-    - Truncation / upsert is performed ONLY on the target destination schemas for that file.
-    """
-    target_schemas = list(task.get("target_schemas") or [task["target_schema"]])
-    table = task["target_table"]
+# -----------------------------------------------------------------------------
+# Per-file preparation (columns, key, routing)
+# -----------------------------------------------------------------------------
+def expected_key(task, tg):
+    """Primary key of the source: copybook KEY group (Step 02) or korg_overrides - never guessed."""
+    raw = str(task.get("key_columns", "") or "")
+    key = [norm_col(c.strip()) for c in re.split(r"[,;+]", raw) if c.strip()]
+    if not key:
+        key = [norm_col(c) for c in (tg.get("extracted_pk_cols") or []) if c]
+    if not key:
+        key = [norm_col(c) for c in get_korg_override_pkey(
+            task.get("source_company", ""), task.get("source_filename", task.get("source_file", "")),
+            task.get("s3_filename", "")) if c]
+    return key
+
+
+def prepare_file(task, tg_prof, cb_meta, index, worker_id, snapshot_msg=""):
+    """Everything the SQL pipeline needs to know about one file. Raises RuntimeError when it cannot be loaded."""
     full_path = task["full_path"]
     filename = task.get("s3_filename") or Path(full_path).name
     co = task.get("source_company", "")
     src = task.get("source_filename", task.get("source_file", ""))
     source_key = f"{co}|{src}"
-    size_mb = float(task.get("size_mb", 0) or 0)
-    size_bytes = int(size_mb * 1024 * 1024)
-    has_header = task.get("has_header", "NO").upper() in ("YES", "UNVERIFIED")
-
-    # Step 03 profile
     tg = tg_prof.get(source_key, {})
+    size_mb = float(task.get("size_mb", 0) or 0)
+    has_header = str(task.get("has_header", "NO")).upper() in ("YES", "UNVERIFIED")
     schema_col = tg.get("schema_col")
     has_schema_col = bool(schema_col and str(schema_col).strip().upper() not in ("", "NONE", "NO_SCHEMA_COL", "NO_KORG"))
 
-    raw_mapped = [s.strip().lower() for s in (task.get("target_schemas") or [task.get("target_schema", "")]) if s and s.strip()]
-    if not has_schema_col or raw_mapped == ["bcs"]:
-        mapped_schemas_set = {"bcs"}
+    cb_name_raw = task.get("copybook_map", "")
+    cb_key = cb_name_raw.upper().split(".")[0] if (cb_name_raw and cb_name_raw.upper() != "NO_COPYBOOK") else ""
+    cb_display = cb_name_raw if (cb_name_raw and cb_name_raw.upper() != "NO_COPYBOOK") else "NO_COPYBOOK"
+    columns_meta = effective_columns_meta(co, src, cb_meta.get(cb_key, []) if cb_key else [])
+    h2t = header_to_table_map(columns_meta)
+    if not columns_meta:
+        columns_meta = tg.get("columns", [])
+    if not columns_meta:
+        header = first_row(full_path)
+        columns_meta = [{"col_name": norm_col(h.strip()), "sql_type": "text", "is_filler": "NO"} for h in header if h.strip()]
+    if not columns_meta:
+        raise RuntimeError(f"No column metadata or header found for '{cb_display}'")
+
+    cols = [c["col_name"] for c in columns_meta if c.get("is_filler") != "YES"]
+    route_name = h2t.get(schema_col, schema_col) if has_schema_col else None
+
+    # physical columns of the file -> raw temp-table columns named after the table columns
+    row0 = first_row(full_path)
+    n_phys = len(row0) + (1 if has_trailing_delim(full_path) else 0)
+    if has_header:
+        names = [(h2t.get(norm_col(t.strip()), norm_col(t.strip())) if t.strip() else "_skip") for t in row0]
     else:
-        mapped_schemas_set = set(raw_mapped) - {"bcs"}
+        names = cols[:len(row0)]
+    names += ["_skip"] * (n_phys - len(names))
+    seen, raw_cols = set(), []
+    for pos in range(len(names) - 1, -1, -1):          # a column named twice: the LAST one wins, like the old loader
+        n = names[pos]
+        if n.startswith("_skip") or n in seen:
+            raw_cols.append(f"_skip{pos}")
+        else:
+            seen.add(n)
+            raw_cols.append(n)
+    raw_cols.reverse()
 
-    if not has_schema_col:
-        # User requirement: If no schema_col identified, the file data is fully loaded ONLY to bcs schema.
-        # That file should not be loaded to any of the mapped schemas.
-        target_schemas = ["bcs"]
-        logger.info(f"[Worker {worker_id}] File {filename} has NO schema_col identified -> FULLY ROUTING TO 'bcs' ONLY.")
-    else:
-        # Ensure all mapped schemas are included (e.g. bss01104 AND bss01112 for FDIC)
-        prof_schemas = list(tg.get("schema_disc_map", {}).keys()) or tg.get("target_schemas", [])
-        for ps in prof_schemas:
-            if ps and ps not in target_schemas:
-                target_schemas.append(ps)
-        # Also ensure active schemas are known for destination tracking
-        for act_s in get_all_active_schemas():
-            if act_s not in target_schemas:
-                target_schemas.append(act_s)
+    tg_key = expected_key(task, tg)
+    return {
+        "i": index, "uri": full_path, "name": filename, "table": task["target_table"], "task": task,
+        "source_key": source_key, "co": co, "src": src, "tg": tg, "cb_display": cb_display,
+        "columns_meta": columns_meta, "stream_cmd": None, "raw_cols": raw_cols, "header": has_header,
+        "route_col": route_name if (route_name and route_name in raw_cols) else None,
+        "sc_display": route_name if has_schema_col else "NO_KORG",
+        "delim_sql": pg_delim(delim_for(full_path)), "quote_sql": pg_quote(full_path),
+        "size_bytes": int(size_mb * 1024 * 1024), "size_mb": size_mb, "worker_id": worker_id,
+        "snapshot_msg": snapshot_msg or f"source={source_key};snapshot={task.get('version_date', '')}",
+        "expected_key": tg_key, "pk_error": tg.get("pk_error", ""), "s3_meta": None, "has_schema_col": has_schema_col,
+    }
 
-    t0 = time.time()
-    record_stream_start(worker_id, ",".join(target_schemas), table, full_path, filename, size_mb)
 
+# -----------------------------------------------------------------------------
+# Tables: destinations, provisioning, key
+# -----------------------------------------------------------------------------
+def destinations(specs):
+    """Schemas a table can receive rows in: every active schema + bcs when a file is routed by korg, else bcs only."""
+    if any(s["route_col"] for s in specs):
+        return list(dict.fromkeys(list(get_active_schemas_map().values()) + ["bcs"]))
+    return ["bcs"]
+
+
+def live_pk(schema, table):
+    """Primary key columns of schema.table; raises on a lookup failure (never guesses 'no key')."""
+    rows = query_db_rows(
+        f"SELECT a.attname FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
+        f"JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey) "
+        f"WHERE n.nspname = {lit(schema.lower())} AND c.relname = {lit(table.lower())} AND i.indisprimary "
+        f"ORDER BY array_position(i.indkey, a.attnum)")
+    return [r.strip() for r in rows if r.strip()]
+
+
+def table_has_rows(schema, table):
+    return bool(query_db_rows(f"SELECT 1 FROM {q(schema)}.{q(table)} LIMIT 1"))
+
+
+def resolve_table(table, specs):
+    """
+    Creates missing destination tables, applies the expected primary key and returns
+    {dests, cols, arbiter ([] = keyless), has_data}. A key that cannot be applied is an error.
+    """
+    dests = destinations(specs)
+    for d in dests:
+        if not check_table_exists(d, table):
+            pre_sql, _ = build_table_ddl(d, table, specs[0]["columns_meta"], [])
+            run_psql(f"CREATE SCHEMA IF NOT EXISTS {q(d)};\n{pre_sql}")
+            logger.info(f"Provisioned table {d}.{table} on the fly.")
+    expected = next((s["expected_key"] for s in specs if s["expected_key"]), [])
+    pk = []
+    for d in dests:
+        d_pk = live_pk(d, table)
+        if expected and not d_pk:
+            try:
+                run_psql(f"ALTER TABLE {q(d)}.{q(table)} ADD CONSTRAINT {q('pk_' + table)} PRIMARY KEY ({', '.join(q(k) for k in expected)});")
+            except RuntimeError as e:
+                raise RuntimeError(clip_error(f"Primary key ({', '.join(expected)}) from the copybook cannot be applied to {d}.{table}: {e}"))
+            logger.info(f"Applied primary key ({', '.join(expected)}) to {d}.{table}")
+            d_pk = live_pk(d, table)
+        pk = pk or d_pk
+    cols = load_table_meta(dests[0], table)["columns"]
+    has_data = any(table_has_rows(d, table) for d in dests) if not pk else True
+    return {"dests": dests, "cols": cols, "arbiter": pk, "has_data": has_data}
+
+
+def table_is_keyed(table, tasks, tg_prof):
+    """Cheap check used for planning: does this table have (or will it get) a primary key?"""
+    for t in tasks:
+        tg = tg_prof.get(f"{t.get('source_company', '')}|{t.get('source_filename', t.get('source_file', ''))}", {})
+        if expected_key(t, tg):
+            return True
     try:
-        cb_name_raw = task.get("copybook_map", "")
-        cb_key = cb_name_raw.upper().split(".")[0] if (cb_name_raw and cb_name_raw.upper() != "NO_COPYBOOK") else ""
-        cb_display = cb_name_raw if (cb_name_raw and cb_name_raw.upper() != "NO_COPYBOOK") else "NO_COPYBOOK"
-        columns_meta = cb_meta.get(cb_key, []) if cb_key else []
-        # Step 02 column map: S3 headers as column names (or copybook names per --tbl-col), copybook datatypes
-        columns_meta = effective_columns_meta(co, src, columns_meta)
-        h2t = header_to_table_map(columns_meta)      # header in the file -> table column
+        return bool(query_db_rows(
+            f"SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid WHERE c.relname = {lit(table.lower())} "
+            f"AND i.indisprimary LIMIT 1"))
+    except RuntimeError:
+        return False
 
-        if not columns_meta:
-            # When copybook is missing: retrieve columns inferred in Step 03
-            columns_meta = tg.get("columns", [])
 
-        if not columns_meta:
-            with _opener(full_path) as f:
-                first_line = f.readline()
-                if isinstance(first_line, bytes):
-                    first_line = first_line.decode("utf-8-sig", errors="replace")
-                d_probe = delim_for(full_path)
-                header_tokens = [norm_col(t.strip()) for t in first_line.strip().split(d_probe) if t.strip()]
-                columns_meta = [{"col_name": h, "sql_type": "text", "is_filler": "NO"} for h in header_tokens]
+# -----------------------------------------------------------------------------
+# Running one unit (a keyed file, or all files of a keyless table)
+# -----------------------------------------------------------------------------
+def _reject_totals(rows, summary, fi):
+    by_reason = defaultdict(int)
+    detail = {}
+    for g in summary:
+        if g.get("f") == fi:
+            by_reason[g["reason"]] += int(g["n"])
+            detail.setdefault(g["reason"], g.get("detail") or "")
+    return dict(by_reason), detail
 
-        if not columns_meta:
-            return {
-                "schema": ",".join(target_schemas), "table": table, "uri": full_path, "filename": filename,
-                "copybook_display": cb_display, "korg_display": "NO_KORG",
-                "status": "FAILED", "seconds": 0.0, "worker_id": worker_id, "rows_loaded": 0,
-                "error": f"No column metadata or header found for '{cb_display}'"
-            }
 
-        cols = [c["col_name"] for c in columns_meta if c.get("is_filler") != "YES"]
-        schema_col = tg.get("schema_col")
-        if schema_col:
-            schema_col = h2t.get(schema_col, schema_col)
-        sc_display = schema_col if (schema_col and schema_col.upper() != "NO_KORG") else "NO_KORG"
-        d = delim_for(full_path)
-        type_overrides = tg.get("type_overrides", {})
-        type_map = {c["col_name"]: type_overrides.get(c["col_name"], c.get("sql_type", "text")) for c in columns_meta if c.get("is_filler") != "YES"}
+def _file_result(spec, status, seconds, error, info, counts, summary, rows, worker_id, mapped_set):
+    fi = spec["i"]
+    c = counts.get(fi, {"raw": 0, "rejected": 0, "dup": 0, "by_dest": {}})
+    by_dest = c["by_dest"]
+    loaded_by = {d: v["inserted"] + v["updated"] + v["unchanged"] for d, v in by_dest.items() if (v["inserted"] + v["updated"] + v["unchanged"]) > 0}
+    inserted = sum(v["inserted"] for v in by_dest.values())
+    updated = sum(v["updated"] for v in by_dest.values())
+    unchanged = sum(v["unchanged"] for v in by_dest.values())
+    total_loaded = sum(loaded_by.values()) if status == "SUCCESS" else 0
+    if status != "SUCCESS":
+        loaded_by, inserted, updated, unchanged = {}, 0, 0, 0
+    reasons, details = _reject_totals(rows, summary, fi)
+    reasons_dups = reasons.pop("DUP_IN_FILE", 0)
+    reasons_txt = ", ".join(f"{k} = {v}" for k, v in sorted(reasons.items()))
+    bcs_loaded = loaded_by.get("bcs", 0)
+    if mapped_set == {"bcs"}:
+        mapped_by = {"bcs": bcs_loaded}
+        unmapped_by = {s: n for s, n in loaded_by.items() if s.lower() != "bcs"}
+    else:
+        mapped_by = {s: n for s, n in loaded_by.items() if s.lower() in mapped_set and s.lower() != "bcs"}
+        unmapped_by = {s: n for s, n in loaded_by.items() if s.lower() not in mapped_set and s.lower() != "bcs"}
+    mapped_loaded = sum(mapped_by.values())
+    pct = round(mapped_loaded / c["raw"] * 100.0, 2) if c["raw"] else 0
+    load_pct = f"{int(pct)}%" if pct == int(pct) else f"{pct}%"
+    keyed = bool(info and info["arbiter"])
+    if status != "SUCCESS":
+        summary_txt = f"FAILED: {error}"
+    else:
+        parts = []
+        if c["rejected"]:
+            parts.append(f"{c['rejected']} rejected [{reasons_txt}]")
+        if reasons_dups:
+            parts.append(f"{reasons_dups} duplicate key rows dropped (last row wins)")
+        summary_txt = "; ".join(parts) or ("None (0 rejected)" if keyed else "None (table has no PK constraint; 100% rows loaded)")
+    line_offset = 1 if spec["header"] else 0
+    skipped = []
+    for r in rows:
+        if r.get("f") == fi:
+            skipped.append({
+                "s3_filename": spec["name"], "table": spec["table"], "row_num": int(r["row_no"]) + line_offset,
+                "dest_schema_attempted": r.get("dest") or "", "skipped_reason": r["reason"], "detail": r.get("detail") or "",
+                "row": r.get("row"), "full_path": spec["uri"],
+            })
+    return {
+        "s3_filename": spec["name"], "filename": spec["name"], "table": spec["table"],
+        "copybook_display": spec["cb_display"], "korg_display": spec["sc_display"],
+        "total_records": c["raw"], "records_loaded": total_loaded, "skipped_count": c["rejected"],
+        "records_loaded_mapped": mapped_loaded, "records_loaded_unmapped": sum(unmapped_by.values()),
+        "records_loaded_mapped_detail": format_schema_counts(mapped_by),
+        "records_loaded_unmapped_detail": format_schema_counts(unmapped_by),
+        "records_loaded_bcs": bcs_loaded, "load_pct": load_pct,
+        "rows_inserted": inserted, "rows_updated": updated, "rows_unchanged": unchanged,
+        "rows_rejected": c["rejected"], "duplicates_dropped": c["dup"], "reject_reasons": reasons_txt,
+        "has_pk": "YES" if keyed else "NO", "pk_cols": ", ".join(info["arbiter"]) if keyed else "NONE",
+        "skipped_reasons_summary": summary_txt, "skipped_records": skipped, "reject_summary_rows": [
+            {"filename": spec["name"], "target_table": spec["table"], "reason": k, "detail": details.get(k, ""),
+             "rows": v, "file_status": status} for k, v in sorted(reasons.items())] + (
+            [{"filename": spec["name"], "target_table": spec["table"], "reason": "DUP_IN_FILE", "detail": details.get("DUP_IN_FILE", ""),
+              "rows": reasons_dups, "file_status": status}] if reasons_dups else []),
+        "schema": ",".join(loaded_by.keys()) or ",".join(info["dests"] if info else ["bcs"]),
+        "uri": spec["uri"], "full_path": spec["uri"], "status": status, "seconds": seconds, "worker_id": worker_id,
+        "rows_loaded": total_loaded, "schema_counts": dict(loaded_by), "breakdown": dict(loaded_by), "error": error,
+    }
 
-        # Dynamic strategy per destination schema (inspects PostgreSQL live)
-        from vsam.vsam_common import check_table_load_strategy
-        schema_strategies = {}
-        touched_stages = []
 
-        def get_schema_strategy(dest_s):
-            if dest_s not in schema_strategies:
-                # Ensure destination table exists (auto-provision on the fly if needed)
-                if not check_table_exists(dest_s, table):
-                    try:
-                        pre_sql, _ = build_table_ddl(dest_s, table, columns_meta, [])
-                        run_psql(f"CREATE SCHEMA IF NOT EXISTS {q(dest_s)};\n{pre_sql}")
-                        logger.info(f"[Worker {worker_id}] Provisioned table {dest_s}.{table} on the fly.")
-                    except RuntimeError as pe:
-                        # The load below will fail with the real database error if the table is truly missing.
-                        logger.warning(f"Could not provision {dest_s}.{table} on the fly: {pe}")
+def _mapped_set(spec):
+    task = spec["task"]
+    raw_mapped = [s.strip().lower() for s in (task.get("target_schemas") or [task.get("target_schema", "")]) if s and s.strip()]
+    if not spec["has_schema_col"] or raw_mapped == ["bcs"]:
+        return {"bcs"}
+    return set(raw_mapped) - {"bcs"}
 
-                strat = check_table_load_strategy(
-                    dest_s, table,
-                    tg_prof_pk=[norm_col(c) for c in tg.get("pk_cols", []) if c] if tg.get("pk_valid") else []
-                )
-                schema_strategies[dest_s] = strat
-                state = claim_table(dest_s, table, strat)
-                strat["stage_state"] = state
-                if state:
-                    with _STAGE_LOCK:
-                        state["files"].append(full_path)
-                    touched_stages.append(state)
-                    logger.info(f"[Worker {worker_id}] Table {dest_s}.{table} has no PK: loading snapshot into staging table; "
-                                f"it replaces the table atomically when the run completes.")
-                elif strat["action"] == "UPSERT":
-                    logger.info(f"[Worker {worker_id}] Table {dest_s}.{table} has existing data and active PK ({', '.join(strat['pk_cols'])}). Upsert enabled.")
-                elif strat["action"] == "INSERT_FRESH":
-                    logger.info(f"[Worker {worker_id}] Table {dest_s}.{table} is fresh. Applied PK ({', '.join(strat['pk_cols'])}). Validated record insert enabled.")
-                else:
-                    logger.info(f"[Worker {worker_id}] Table {dest_s}.{table} is fresh (empty). Loaded without a primary key.")
-            return schema_strategies[dest_s]
 
-        # Cast value helper
-        def cast_val(col_name, val):
-            t = type_map.get(col_name, "text")
-            if val is None or str(val).strip() == "":
-                return "NULL"
-            v = str(val).strip().replace("'", "''")
-            if t.startswith(("varchar", "text", "char")):
-                return f"'{v}'"
-            if t == "date":
-                if re.match(r"^\d{4}-\d{2}-\d{2}$", v) and not v.startswith("9999"):
-                    return f"'{v}'::date"
-                return "NULL"
-            if t in ("integer", "bigint", "smallint"):
-                if re.match(r"^-?\d+$", v):
-                    return f"'{v}'::{t}"
-                return "NULL"
-            if t.startswith("numeric"):
-                if re.match(r"^-?(\d+(\.\d*)?|\.\d+)$", v):
-                    return f"'{v}'::{t}"
-                return "NULL"
-            return f"'{v}'::{t}"
+def _failed_results(specs, error, seconds, worker_id, info=None):
+    return [_file_result(s, "FAILED", seconds, error, info, {}, [], [], worker_id, _mapped_set(s)) for s in specs]
 
-        qcols = ", ".join(q(c) for c in cols)
-        BATCH = 10000
-        dest_batches = defaultdict(list)
-        dest_loaded = defaultdict(int)
 
-        def flush_batch(dest_s):
-            batch = dest_batches[dest_s]
-            if not batch:
-                return
-            strat = get_schema_strategy(dest_s)
-            state = strat.get("stage_state")
-            tgt = f"{q(dest_s)}.{q(state['stage'] if state else table)}"
-            active_pks = strat.get("pk_cols", [])
+def persist_failed_rejects(specs, table, rows):
+    """A failed unit rolled back; keep the echoed reject sample of its files for review."""
+    by_file = defaultdict(list)
+    for r in rows:
+        by_file[r.get("f")].append(r)
+    for s in specs:
+        sample = by_file.get(s["i"])
+        if not sample:
+            continue
+        values = ",\n".join(
+            f"({lit(s['uri'])}, {lit(r.get('dest') or 'bcs')}, {lit(table)}, {int(r['row_no'])}, {lit(r['reason'])}, "
+            f"{lit(r.get('detail'))}, {lit(json.dumps(r.get('row')))}::jsonb, 'FILE_FAILED')" for r in sample)
+        run_psql(f"DELETE FROM {REJECT_TABLE} WHERE uri = {lit(s['uri'])} AND target_table = {lit(table)};\n"
+                 f"INSERT INTO {REJECT_TABLE} (uri, target_schema, target_table, row_no, reason, detail, row_data, file_status) "
+                 f"VALUES {values};")
 
-            if active_pks:
-                dedup = {}
-                for r in batch:
-                    key_vals = tuple(r.get(kc) for kc in active_pks)
-                    dedup[key_vals] = r
-                to_insert = list(dedup.values())
-                upd_cols = [c for c in cols if c not in active_pks and c not in AUDIT_COL_NAMES]
-                if upd_cols:
-                    upd = ", ".join(f"{q(c)} = EXCLUDED.{q(c)}" for c in upd_cols)
-                    upd += ', "modifiedby" = CURRENT_USER, "modifieddate" = CURRENT_TIMESTAMP'
-                    conflict_clause = f' ON CONFLICT ({", ".join(q(k) for k in active_pks)}) DO UPDATE SET {upd}'
-                else:
-                    conflict_clause = f' ON CONFLICT ({", ".join(q(k) for k in active_pks)}) DO NOTHING'
-            else:
-                to_insert = batch
-                conflict_clause = ""
 
-            vals = ",\n".join(
-                "(" + ", ".join(cast_val(c, row.get(c)) for c in cols) + ")"
-                for row in to_insert
-            )
-            sql = f"INSERT INTO {tgt} ({qcols}) VALUES\n{vals}{conflict_clause};\n"
-            run_psql(sql)
-            dest_loaded[dest_s] += len(to_insert)
-            record_stream_progress(worker_id, len(to_insert))
-            batch.clear()
-
-        # Stream file line by line
-        skipped_records = []
-        total_rows_read = 0
-
-        def route_row(row_idx, row):
-            """Routes one parsed record to its destination schema batch (or the skipped list)."""
-            if not has_schema_col or not schema_col or schema_col not in row or schema_col == "NO_KORG":
-                dest_s = "bcs"
-            else:
-                dest_s = match_schema_by_last3(row.get(schema_col), target_schemas)
-
-            strat = get_schema_strategy(dest_s)
-            if strat["has_pk"] and not record_passes_pk_validation(row, strat["pk_cols"]):
-                # Table has a PK constraint: load only records that pass PK validation
-                skipped_records.append({
-                    "s3_filename": filename,
-                    "table": table,
-                    "row_num": row_idx,
-                    "dest_schema_attempted": dest_s,
-                    "skipped_reason": get_pk_validation_failure_reason(row, strat["pk_cols"]),
-                    "pk_cols": ", ".join(strat["pk_cols"]),
-                    "pk_values": json.dumps({k: row.get(k) for k in strat["pk_cols"]}),
-                    "record_sample": json.dumps(row),
-                    "full_path": full_path
-                })
-                return
-            # Table has NO PK constraint -> load ALL records (NULL / blank / sentinel values are kept)
-            dest_batches[dest_s].append(row)
-            if len(dest_batches[dest_s]) >= BATCH:
-                flush_batch(dest_s)
-
-        with _opener(full_path) as f:
-            if not has_header:
-                for row_idx, raw_row in enumerate(csv.reader(f, delimiter=d), start=1):
-                    total_rows_read += 1
-                    route_row(row_idx, dict(zip(cols, raw_row)))
-            else:
-                for row_idx, raw_row in enumerate(csv.DictReader(f, delimiter=d), start=2):
-                    total_rows_read += 1
-                    route_row(row_idx, {h2t.get(norm_col(k), norm_col(k)): v for k, v in raw_row.items()})
-
-        for dest_s in list(dest_batches.keys()):
-            flush_batch(dest_s)
-
-        total_loaded = sum(dest_loaded.values())
-        skipped_count = len(skipped_records)
-        dur = round(time.time() - t0, 2)
-
-        schema_breakdown_str = ", ".join(f"{s} = {cnt}" for s, cnt in sorted(dest_loaded.items())) if dest_loaded else "None (0 loaded)"
-        skipped_str = f"skipped = {skipped_count}"
-
-        has_pk_flag = any(st.get("has_pk") for st in schema_strategies.values())
-        all_active_pks = []
-        for st in schema_strategies.values():
-            for pk in st.get("pk_cols", []):
-                if pk not in all_active_pks:
-                    all_active_pks.append(pk)
-
-        if skipped_records:
-            samples = [f"Row {sr['row_num']}: {sr['skipped_reason']}" for sr in skipped_records[:5]]
-            if len(skipped_records) > 5:
-                samples.append(f"... (+{len(skipped_records) - 5} more)")
-            skipped_summary = clip_error(f"{len(skipped_records)} skipped [{'; '.join(samples)}]")
-        else:
-            skipped_summary = "None (0 skipped)" if has_pk_flag else "None (table has no PK constraint; 100% rows loaded)"
-
-        # Log load for each schema (errors propagate -> the file is reported FAILED, never silently unlogged)
-        snapshot_msg = f"source={source_key};snapshot={task.get('version_date', '')}"
-        for dest_s, cnt in dest_loaded.items():
-            state = schema_strategies[dest_s].get("stage_state")
-            if state:       # written inside the swap transaction, so a log row exists only if the data does
-                with _STAGE_LOCK:
-                    state["logs"].append((full_path, dest_s, table, size_bytes, cnt, dur, worker_id, "SUCCESS", snapshot_msg))
-            else:
-                write_load_log(full_path, dest_s, table, size_bytes, cnt, dur, worker_id)
-
-        bcs_loaded = dest_loaded.get("bcs", 0)
-        if mapped_schemas_set == {"bcs"}:
-            mapped_by_schema = {"bcs": bcs_loaded}
-            unmapped_by_schema = {s: cnt for s, cnt in dest_loaded.items() if s.lower() != "bcs"}
-        else:
-            mapped_by_schema = {s: cnt for s, cnt in dest_loaded.items() if s.lower() in mapped_schemas_set and s.lower() != "bcs"}
-            unmapped_by_schema = {s: cnt for s, cnt in dest_loaded.items() if s.lower() not in mapped_schemas_set and s.lower() != "bcs"}
-        mapped_loaded = sum(mapped_by_schema.values())
-        unmapped_loaded = sum(unmapped_by_schema.values())
-
-        if total_rows_read > 0:
-            pct_val = round((mapped_loaded / total_rows_read) * 100.0, 2)
-            if pct_val == int(pct_val):
-                load_pct_str = f"{int(pct_val)}%"
-            else:
-                load_pct_str = f"{pct_val}%"
-        else:
-            load_pct_str = "0%"
-
-        logger.info(f"[Worker {worker_id}] Loaded {filename} -> {dict(dest_loaded)} ({total_loaded} rows loaded, {skipped_str}, {dur}s, load%={load_pct_str})")
-        return {
-            "s3_filename": filename,
-            "filename": filename,
-            "table": table,
-            "copybook_display": cb_display,
-            "korg_display": sc_display,
-            "total_records": total_rows_read,
-            "records_loaded": total_loaded,
-            "skipped_count": skipped_count,
-            "records_loaded_mapped": mapped_loaded,
-            "records_loaded_unmapped": unmapped_loaded,
-            "records_loaded_mapped_detail": format_schema_counts(mapped_by_schema),
-            "records_loaded_unmapped_detail": format_schema_counts(unmapped_by_schema),
-            "records_loaded_bcs": bcs_loaded,
-            "load_pct": load_pct_str,
-            "schema_breakdown": schema_breakdown_str,
-            "skipped": skipped_str,
-            "has_pk": "YES" if has_pk_flag else "NO",
-            "pk_cols": ", ".join(all_active_pks) if all_active_pks else "NONE",
-            "skipped_reasons_summary": skipped_summary,
-            "skipped_records": skipped_records,
-            "schema": ",".join(dest_loaded.keys()) or ",".join(target_schemas),
-            "uri": full_path,
-            "full_path": full_path,
-            "status": "SUCCESS",
-            "seconds": dur,
-            "worker_id": worker_id,
-            "rows_loaded": total_loaded,
-            "schema_counts": dict(dest_loaded),
-            "breakdown": dict(dest_loaded),
-            "error": ""
-        }
-
-    except Exception as e:  # noqa: BLE001 - worker boundary: report any failure for this file, never kill the pool
-        dur = round(time.time() - t0, 2)
-        err = clip_error(e)
-        logger.error(f"[Worker {worker_id}] Load failed for {filename}: {e}")
-        with _STAGE_LOCK:
-            for st_state in locals().get("touched_stages", []):
-                st_state["ok"] = False
-        schema_str = ",".join(target_schemas)
+def run_unit(table, specs, worker_id, run, tg_prof):
+    """Loads one unit in ONE transaction. Returns one result dict per file."""
+    t0 = time.time()
+    names = ", ".join(s["name"] for s in specs)
+    record_stream_start(worker_id, "bcs", table, specs[0]["uri"], names if len(specs) == 1 else f"{len(specs)} files", sum(s["size_mb"] for s in specs))
+    info = None
+    try:
+        bad = [s for s in specs if s["pk_error"]]
+        if bad:
+            raise RuntimeError(bad[0]["pk_error"])
+        info = resolve_table(table, specs)
+        if not info["arbiter"] and info["has_data"] and PARTIAL_RUN and not FORCE_TRUNCATE:
+            raise RuntimeError(
+                f"{table} already contains rows and has no primary key; this partial run (--company/--tables/--limit-files) "
+                f"cannot replace it safely because other source files of the table may be missing. "
+                f"Run without filters, or pass --force-truncate.")
+        for s in specs:
+            s["present"] = [c for c in s["raw_cols"] if not c.startswith("_skip") and c in info["cols"]]
+            if not s["present"]:
+                raise RuntimeError(f"No column of {s['name']} matches the columns of {table}")
+            missing_key = [k for k in info["arbiter"] if k not in s["present"]]
+            if missing_key:
+                raise RuntimeError(f"Primary key column(s) {', '.join(missing_key)} of {table} are not in {s['name']}")
+            s["stream_cmd"] = stream_program_literal(s["uri"])
+            s["s3_meta"] = s["s3_meta"] or run["heads"].get(s["uri"])
+        route = [(k, v) for k, v in get_active_schemas_map().items()]
+        unit = {"table": table, "files": specs, "dests": info["dests"], "cols": info["cols"], "arbiter": info["arbiter"],
+                "route": route, "max_rejects": run["max_rejects"], "replica": run["replica"], "encoding": PG_ENCODING}
+        logger.info(f"[Worker {worker_id}] Started: {names} -> {table} ({'upsert on ' + ', '.join(info['arbiter']) if info['arbiter'] else 'snapshot replace, no key'})")
+        res = run_psql_script(build_unit_script(unit), options=PSQL_LOAD_OPTIONS)
+        sec = round(time.time() - t0, 2)
+        counts_raw, summary, rows = parse_output(res.stdout)
+        counts = parse_counts(counts_raw) if counts_raw else {}
+        if res.returncode != 0:
+            err = clip_error(res.stderr or res.stdout or "psql failed")
+            try:
+                persist_failed_rejects(specs, table, rows)
+            except RuntimeError as e:
+                logger.warning(f"Could not store the rejected rows of the failed load: {e}")
+            raise RuntimeError(err)
+        # per-schema seconds (the in-transaction rows were written with 0)
         try:
-            fail_sql = (
-                f"INSERT INTO {CTL_SCHEMA}.load_log "
-                f"(uri, target_schema, target_table, size_bytes, loaded_rows, seconds, worker_id, status, message, loaded_at) "
-                f"VALUES ({lit(full_path)}, {lit(schema_str)}, {lit(table)}, {size_bytes}, 0, {dur}, {worker_id}, 'FAILED', {lit(err)}, now()) "
-                f"ON CONFLICT (uri) DO UPDATE SET status='FAILED', message={lit(err)}, loaded_at=now();"
-            )
-            run_psql(fail_sql)
-        except RuntimeError as log_err:
-            logger.error(f"[Worker {worker_id}] Could not record FAILED status for {filename}: {log_err}")
-        return {
-            "s3_filename": filename,
-            "filename": filename,
-            "table": table,
-            "copybook_display": cb_display if "cb_display" in locals() else "NO_COPYBOOK",
-            "korg_display": sc_display if "sc_display" in locals() else "NO_KORG",
-            "total_records": 0,
-            "records_loaded": 0,
-            "skipped_count": 0,
-            "records_loaded_mapped": 0,
-            "records_loaded_unmapped": 0,
-            "records_loaded_bcs": 0,
-            "load_pct": "0%",
-            "schema_breakdown": "None (0 loaded)",
-            "skipped": "skipped = 0",
-            "has_pk": "UNKNOWN",
-            "pk_cols": "NONE",
-            "skipped_reasons_summary": f"FAILED: {err}",
-            "skipped_records": [],
-            "schema": schema_str,
-            "uri": full_path,
-            "full_path": full_path,
-            "status": "FAILED",
-            "seconds": dur,
-            "worker_id": worker_id,
-            "rows_loaded": 0,
-            "schema_counts": {},
-            "breakdown": {},
-            "error": err
-        }
+            for s in specs:
+                run_psql(f"UPDATE {CTL_SCHEMA}.load_log SET seconds = {round(sec / len(specs), 2)} "
+                         f"WHERE uri = {lit(s['uri'])} OR starts_with(uri, {lit(s['uri'] + '#')});")
+        except RuntimeError as e:
+            logger.warning(f"Could not record load seconds: {e}")
+        results = [_file_result(s, "SUCCESS", round(sec / len(specs), 2), "", info, counts, summary, rows, worker_id, _mapped_set(s)) for s in specs]
+        for r in results:
+            if r["rows_rejected"]:
+                logger.warning(f"[Worker {worker_id}] {r['filename']}: {r['rows_rejected']} row(s) rejected [{r['reject_reasons']}] "
+                               f"(see sweep_ctl.load_rejects / the report)")
+        return results
+    except Exception as e:  # noqa: BLE001 - worker boundary: report any failure for this unit, never kill the pool
+        sec = round(time.time() - t0, 2)
+        err = clip_error(e)
+        if len(specs) > 1:
+            err = clip_error(f"{err} (all {len(specs)} files of {table} were rolled back together; the table keeps its old data)")
+        logger.error(f"[Worker {worker_id}] Load failed for {names}: {e}")
+        for s in specs:
+            try:
+                run_psql(
+                    f"INSERT INTO {CTL_SCHEMA}.load_log (uri, target_schema, target_table, size_bytes, loaded_rows, seconds, worker_id, "
+                    f"status, message, loaded_at) VALUES ({lit(s['uri'])}, {lit(','.join(info['dests']) if info else 'bcs')}, {lit(table)}, "
+                    f"{s['size_bytes']}, 0, {sec}, {worker_id}, 'FAILED', {lit(err)}, now()) "
+                    f"ON CONFLICT (uri) DO UPDATE SET status='FAILED', message={lit(err)}, loaded_at=now();")
+            except RuntimeError as log_err:
+                logger.error(f"[Worker {worker_id}] Could not record FAILED status for {s['name']}: {log_err}")
+        return _failed_results(specs, err, sec, worker_id, info)
     finally:
         record_stream_end(worker_id)
 
@@ -629,53 +500,6 @@ def load_segregated(task, worker_id, run_id, tg_prof, cb_meta):
 def format_schema_counts(counts):
     """{'bss01112': 34, 'bss01104': 20} -> 'bss01104 = 20, bss01112 = 34' (empty string when nothing was loaded)."""
     return ", ".join(f"{s} = {n}" for s, n in sorted(counts.items()) if n)
-
-
-def build_load_summary(results):
-    """Flattens per-file load results into the LoadSummary rows and the skipped-record rows."""
-    load_summary_rows = []
-    all_skipped_rows = []
-
-    for r in results:
-        if r.get("status") == "FAILED":
-            reason = r.get("error") or r.get("skipped_reasons_summary") or "Load execution failed"
-        else:
-            reason = r.get("skipped_reasons_summary") or "None (0 skipped)"
-
-        load_summary_rows.append({
-            "s3 filename": r.get("s3_filename") or r.get("filename", ""),
-            "tablename": r.get("table", ""),
-            "copybook": r.get("copybook_display", "NO_COPYBOOK"),
-            "korg column": r.get("korg_display", "NO_KORG"),
-            "total recs": r.get("total_records", 0),
-            "loaded recs": r.get("records_loaded", r.get("rows_loaded", 0)),
-            "skipped recs": r.get("skipped_count", 0),
-            "records loaded in mapped schema": r.get("records_loaded_mapped_detail", ""),
-            "records loaded in unmapped schema": r.get("records_loaded_unmapped_detail", ""),
-            "records loaded in bcs schema": r.get("records_loaded_bcs", 0),
-            "load %": r.get("load_pct", "0%"),
-            "has PK?": r.get("has_pk", "NO"),
-            "PK columns": r.get("pk_cols", "NONE"),
-            "skipped/failed reason": reason,
-            "duration": round(float(r.get("seconds", 0) or 0), 2),
-            "status": r.get("status", "SUCCESS"),
-            "full s3 uri": r.get("full_path") or r.get("uri", "")
-        })
-
-        for sk in r.get("skipped_records", []):
-            all_skipped_rows.append({
-                "S3 file name": sk.get("s3_filename", ""),
-                "table": sk.get("table", ""),
-                "file line number": sk.get("row_num", 0),
-                "destination schema attempted": sk.get("dest_schema_attempted", ""),
-                "skipped reason": sk.get("skipped_reason", ""),
-                "PK Columns": sk.get("pk_cols", ""),
-                "PK Values": sk.get("pk_values", ""),
-                "record sample": sk.get("record_sample", ""),
-                "Full S3 URI": sk.get("full_path", "")
-            })
-
-    return load_summary_rows, all_skipped_rows
 
 
 def build_schema_breakdown(results):
@@ -729,9 +553,93 @@ def build_schema_breakdown(results):
 
     return schema_breakdown_rows
 
+def build_load_summary(results):
+    """Flattens per-file load results into the LoadSummary rows."""
+    rows = []
+    for r in results:
+        if r.get("status") == "FAILED":
+            reason = r.get("error") or r.get("skipped_reasons_summary") or "Load execution failed"
+        else:
+            reason = r.get("skipped_reasons_summary") or "None (0 rejected)"
+        rows.append({
+            "s3 filename": r.get("s3_filename") or r.get("filename", ""),
+            "tablename": r.get("table", ""),
+            "copybook": r.get("copybook_display", "NO_COPYBOOK"),
+            "korg column": r.get("korg_display", "NO_KORG"),
+            "total recs": r.get("total_records", 0),
+            "loaded recs": r.get("records_loaded", r.get("rows_loaded", 0)),
+            "inserted": r.get("rows_inserted", 0),
+            "updated": r.get("rows_updated", 0),
+            "unchanged": r.get("rows_unchanged", 0),
+            "skipped recs": r.get("skipped_count", 0),
+            "rejected by reason": r.get("reject_reasons", ""),
+            "duplicates dropped": r.get("duplicates_dropped", 0),
+            "records loaded in mapped schema": r.get("records_loaded_mapped_detail", ""),
+            "records loaded in unmapped schema": r.get("records_loaded_unmapped_detail", ""),
+            "records loaded in bcs schema": r.get("records_loaded_bcs", 0),
+            "load %": r.get("load_pct", "0%"),
+            "has PK?": r.get("has_pk", "NO"),
+            "PK columns": r.get("pk_cols", "NONE"),
+            "skipped/failed reason": reason,
+            "duration": round(float(r.get("seconds", 0) or 0), 2),
+            "status": r.get("status", "SUCCESS"),
+            "full s3 uri": r.get("full_path") or r.get("uri", ""),
+        })
+    return rows
+
+
+def build_reject_sheets(results):
+    """Reject_Summary (per file and reason) and Rejected_Rows (the rows, capped like the stored copy)."""
+    summary, rows = [], []
+    for r in results:
+        summary.extend(r.get("reject_summary_rows", []))
+        for sk in r.get("skipped_records", []):
+            rows.append({
+                "filename": sk["s3_filename"], "target_table": sk["table"], "dest_schema": sk["dest_schema_attempted"],
+                "file_line_no": sk["row_num"], "reason": sk["skipped_reason"], "detail": sk["detail"],
+                "row_data": clip_error(json.dumps(sk.get("row"), ensure_ascii=False, default=str)),
+                "file_status": r.get("status", ""),
+            })
+    if not summary:
+        summary = [{"filename": "NONE", "target_table": "NONE", "reason": "No rows were rejected or dropped", "detail": "", "rows": 0, "file_status": ""}]
+    if not rows:
+        rows = [{"filename": "NONE", "target_table": "NONE", "dest_schema": "", "file_line_no": 0, "reason": "No rows were rejected",
+                 "detail": "", "row_data": "", "file_status": ""}]
+    return summary, rows[:10000]
+
+
+def classify_tasks(tasks, tg_prof, reload, heads_live):
+    """
+    Splits tasks into those to load and those to skip. A file is skipped only when load_log holds SUCCESS rows
+    whose S3 LastModified / ETag / size equal what S3 reports now. A table WITHOUT a key is replaced as a whole, so
+    when any of its files changed ALL of its files are loaded together; keyed tables load only the changed files.
+    """
+    stored = {} if reload else get_loaded_log()
+    by_table = defaultdict(list)
+    for t in tasks:
+        by_table[t["target_table"]].append(t)
+    pending, skipped = [], []
+    for table, group in by_table.items():
+        verdict = {}
+        for t in group:
+            current = heads_live.get(t["full_path"]) or meta_from_row({"s3_last_modified": t.get("s3_last_modified"),
+                                                                       "s3_etag": t.get("s3_etag"), "s3_size": t.get("s3_size"),
+                                                                       "size_bytes": t.get("size_bytes")})
+            verdict[t["full_path"]] = ("reload", "--reload given") if reload else classify_loaded(stored.get(t["full_path"], []), current)
+            if verdict[t["full_path"]][0] == "reload" and not reload:
+                logger.info(f"Reloading {t.get('s3_filename') or t['full_path']}: {verdict[t['full_path']][1]}")
+        keyed = table_is_keyed(table, group, tg_prof)
+        any_load = any(v[0] != "skip" for v in verdict.values())
+        for t in group:
+            if keyed:
+                (pending if verdict[t["full_path"]][0] != "skip" else skipped).append(t)
+            else:
+                (pending if any_load else skipped).append(t)
+    return pending, skipped
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Step 06: Stream VSAM data from S3 to PostgreSQL with dynamic upsert and schema segregation.")
+    parser = argparse.ArgumentParser(description="Step 06: Stream VSAM data from S3 to PostgreSQL with staged validation, upsert and schema segregation.")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     parser.add_argument("--company", help="Comma-separated company filter")
     parser.add_argument("--tables", help="Comma-separated tables to load")
@@ -740,6 +648,9 @@ def main():
                         help="Tables without a primary key are replaced by the new snapshot automatically in a full run. "
                              "In a PARTIAL run (--company/--tables/--limit-files) replacing a table that already has rows "
                              "needs this flag, because other source files of the table may be missing.")
+    parser.add_argument("--reload", action="store_true", help="Load files again even when their S3 LastModified/ETag/size are unchanged")
+    parser.add_argument("--max-rejects", type=int, default=DEFAULT_MAX_REJECTS,
+                        help=f"Fail (and roll back) a file when this many rows are rejected (default {DEFAULT_MAX_REJECTS} = never; only technical errors fail a file)")
     parser.add_argument("--dry-run", action="store_true", help="List the files and tables that would be loaded, then exit without writing")
     parser.add_argument("--bg", action="store_true", help="Run in background daemon mode")
     args = parser.parse_args()
@@ -752,141 +663,154 @@ def main():
     logger.info("=" * 75)
     logger.info(f"SWEEP VSAM MIGRATION - STEP 06: S3 STREAMING INGESTION (Run: {run_id})")
     logger.info(f"Workers: {args.workers}")
-    logger.info("Strategy: Live Database Inspection (Direct load for fresh tables; Dynamic Upsert if PK exists; "
-                "Tables without a PK are replaced atomically by the newest snapshot)")
+    logger.info("Strategy: staged load, one transaction per file (keyed tables: upsert of changed rows; "
+                "tables without a key: all their files replace the table together)")
     logger.info("Version Filter: LATEST FILE VERSION per (company, source file); VSAM files are full snapshots")
+    logger.info(("A file fails when " + str(args.max_rejects) + " rows are rejected") if args.max_rejects
+                else "Rejected rows never fail a file (only technical errors roll it back)")
     logger.info("=" * 75)
 
-    # Load Step 02 load matrix
     lm_file = OUT / "vsam_02_load_matrix.csv" if (OUT / "vsam_02_load_matrix.csv").exists() else OUT / "load_matrix.csv"
     lm = load_csv_safe(lm_file)
-
     if args.company:
         cos = [c.strip().upper() for c in args.company.split(",")]
         lm = lm[lm["source_company"].isin(cos)]
     if args.tables:
         tbls = [t.strip().lower() for t in args.tables.split(",")]
         lm = lm[lm["target_table"].isin(tbls)]
-
     if lm.empty:
         logger.warning("Load matrix is empty. Nothing to load.")
         return True
 
-    # MAJOR CHANGE: Only consider the single latest version for each file
     orig_count = len(lm)
     src_col = "source_filename" if "source_filename" in lm.columns else "source_file"
     lm = filter_latest_versions(lm, ["source_company", src_col])
-
-    # Sort files based on file size (small to large)
     lm["_size_mb"] = pd.to_numeric(lm["size_mb"], errors="coerce").fillna(0.0)
-    lm = lm.sort_values(by="_size_mb", ascending=True).reset_index(drop=True)
-    lm = lm.drop(columns=["_size_mb"])
+    lm = lm.sort_values(by="_size_mb", ascending=True).reset_index(drop=True).drop(columns=["_size_mb"])
     logger.info(f"Filtered to latest file versions and sorted small to large: {len(lm)} tasks (was {orig_count})")
-
     if args.limit_files:
         lm = lm.head(args.limit_files)
 
-    # Load copybook metadata from Step 01
     cb_csv = OUT / "vsam_01_copybook_extracts.csv"
     cb_meta = {}
     if cb_csv.exists():
         cb_df = pd.read_csv(cb_csv, dtype=str).fillna("")
         for cb_name, grp in cb_df.groupby("copybook_file"):
-            cb_key = cb_name.upper().split(".")[0]
-            cb_meta[cb_key] = grp.to_dict(orient="records")
-
-    # Load type-gate profile from Step 03
-    tg_file = OUT / "vsam_03_type_gate.json"
-    tg_prof = read_json(tg_file, default={})
+            cb_meta[cb_name.upper().split(".")[0]] = grp.to_dict(orient="records")
+    tg_prof = read_json(OUT / "vsam_03_type_gate.json", default={})
 
     tasks = []
-    skipped = 0
-
-    # Group by file so each unique file is streamed once and segregated to target schemas + bcs
     for (co, src, fp, tbl), grp in lm.groupby(["source_company", src_col, "full_path", "target_table"], sort=False):
-        target_schemas = list(grp["target_schema"].dropna().unique())
         rec = grp.iloc[0].to_dict()
-        rec["target_schemas"] = target_schemas
+        rec["target_schemas"] = list(grp["target_schema"].dropna().unique())
         tasks.append(rec)
-
-    logger.info(f"Total tasks: {len(lm)} | Already loaded (skipping): {skipped} | Pending: {len(tasks)}")
-
-    if not tasks:
-        logger.info("All files already loaded successfully. Nothing to do.")
-        return True
+    total_tasks = len(tasks)
 
     if args.dry_run:
         for t in tasks:
             logger.info(f"[DRY-RUN] {t.get('s3_filename') or Path(t['full_path']).name} -> "
                         f"{','.join(t.get('target_schemas') or [])}.{t['target_table']} ({t.get('size_mb', 0)} MB)")
-        logger.info(f"[DRY-RUN] {len(tasks)} file(s) would be loaded. No database changes made.")
+        logger.info(f"[DRY-RUN] {len(tasks)} file(s) would be considered. No database changes made.")
         return True
 
-    # Primary keys are always applied before loading
-    pk_file = VSAM_GEN_DDL_DIR / "all_pk.sql"
-    if pk_file.exists():
-        logger.info(f"Applying PK constraints to available tables before loading data: {pk_file}")
-        try:
-            run_psql(pk_file, is_file=True)
-            logger.info("[+] PK constraints applied to available tables.")
-        except RuntimeError as pe:
-            logger.warning(f"Could not pre-apply PK constraints (tables keep their current constraints): {pe}")
+    ensure_reject_table()
+    if not args.reload:
+        known = get_loaded_log()
+        live = head_many([t["full_path"] for t in tasks if t["full_path"] in known]) if known else {}
+    else:
+        live = {}
+    tasks, skipped_tasks = classify_tasks(tasks, tg_prof, args.reload, live)
+    skipped = len(skipped_tasks)
+    logger.info(f"Total tasks: {total_tasks} | Unchanged since the last load (skipping): {skipped} | Pending: {len(tasks)}")
+    if not tasks:
+        logger.info("All files already loaded successfully. Nothing to do.")
+        return True
 
     # A full snapshot must never overwrite a NEWER snapshot of the same source that is already loaded.
-    runnable, stale_results = [], []
+    runnable, stale = [], []
     for t in tasks:
         sk = f"{t.get('source_company', '')}|{t.get('source_filename', t.get('source_file', ''))}"
         if newer_snapshot_loaded(t["target_table"], sk, t.get("version_date", "")):
             logger.warning(f"[SKIPPED] {t.get('s3_filename')}: a newer snapshot of {sk} is already loaded; not loading an older file")
-            stale_results.append({"s3_filename": t.get("s3_filename"), "filename": t.get("s3_filename"), "table": t["target_table"],
-                                  "uri": t["full_path"], "full_path": t["full_path"], "status": "SKIPPED", "seconds": 0,
-                                  "rows_loaded": 0, "records_loaded": 0, "error": "older snapshot than the one already loaded"})
+            stale.append(t)
         else:
             runnable.append(t)
     tasks = runnable
 
-    results = list(stale_results)
-    max_workers = min(args.workers, max(1, len(tasks)))
-    logger.info(f"Starting ingestion with {max_workers} worker threads...")
+    # HEAD right before loading: the load_log rows store exactly what was loaded
+    heads = head_many([t["full_path"] for t in tasks])
+    run = {"max_rejects": args.max_rejects, "heads": heads, "replica": probe_trigger_mode() == "replica"}
+
+    results = [{"s3_filename": t.get("s3_filename"), "filename": t.get("s3_filename"), "table": t["target_table"], "uri": t["full_path"],
+                "full_path": t["full_path"], "status": "SKIPPED", "seconds": 0, "rows_loaded": 0, "records_loaded": 0,
+                "error": "older snapshot than the one already loaded"} for t in stale]
+
+    by_table = defaultdict(list)
+    for t in tasks:
+        by_table[t["target_table"]].append(t)
+    units = []        # (table, [task...])
+    for table, group in by_table.items():
+        if table_is_keyed(table, group, tg_prof):
+            units.extend((table, [t]) for t in group)
+        else:
+            units.append((table, group))        # all files of a table without a key replace it together
+
+    max_workers = min(args.workers, max(1, len(units)))
+    logger.info(f"Starting ingestion with {max_workers} worker threads ({len(units)} unit(s) of work)...")
+
+    def prepare_unit(table, group, worker_id):
+        specs, failed = [], []
+        for n, t in enumerate(group, 1):
+            try:
+                specs.append(prepare_file(t, tg_prof, cb_meta, n, worker_id))
+            except Exception as e:  # noqa: BLE001 - a file that cannot be prepared fails (and with it a keyless table's replace)
+                failed.append((t, clip_error(e)))
+        return specs, failed
+
+    def work(unit, worker_id):
+        table, group = unit
+        specs, failed = prepare_unit(table, group, worker_id)
+        if failed:
+            out = []
+            for t, err in failed:
+                logger.error(f"[Worker {worker_id}] Cannot prepare {t.get('s3_filename')}: {err}")
+                out.append({"s3_filename": t.get("s3_filename"), "filename": t.get("s3_filename"), "table": table,
+                            "copybook_display": t.get("copybook_map") or "NO_COPYBOOK", "korg_display": "NO_KORG",
+                            "uri": t["full_path"], "full_path": t["full_path"], "status": "FAILED", "seconds": 0,
+                            "rows_loaded": 0, "records_loaded": 0, "total_records": 0, "skipped_count": 0, "load_pct": "0%",
+                            "error": err, "schema_counts": {}})
+            if len(group) > 1 and specs:      # keyless table: one broken file blocks the whole replace
+                for s in specs:
+                    out.append({"s3_filename": s["name"], "filename": s["name"], "table": table, "copybook_display": s["cb_display"],
+                                "korg_display": s["sc_display"], "uri": s["uri"], "full_path": s["uri"], "status": "FAILED",
+                                "seconds": 0, "rows_loaded": 0, "records_loaded": 0, "total_records": 0, "skipped_count": 0,
+                                "load_pct": "0%", "schema_counts": {},
+                                "error": f"not loaded: another file of {table} could not be prepared; the table keeps its old data"})
+            return out
+        return run_unit(table, specs, worker_id, run, tg_prof)
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        future_map = {
-            pool.submit(load_segregated, task, i % max_workers + 1, run_id, tg_prof, cb_meta): task
-            for i, task in enumerate(tasks)
-        }
+        future_map = {pool.submit(work, u, i % max_workers + 1): u for i, u in enumerate(units)}
         for fut in as_completed(future_map):
-            task = future_map[fut]
+            table, group = future_map[fut]
             try:
-                res = fut.result()
-                results.append(res)
-                st = res.get("status", "UNKNOWN")
-                rows = res.get("rows_loaded", 0)
-                sec = res.get("seconds", 0)
-                logger.info(f"[{st}] {res.get('schema')}.{res.get('table')} <- {res.get('filename')} ({rows} rows, {sec}s)")
-            except Exception as e:  # noqa: BLE001 - worker boundary: record the failure for this item and continue
-                logger.error(f"[ERROR] Task failed for {task.get('s3_filename')}: {e}")
-                results.append({
-                    "schema": task.get("target_schema"), "table": task.get("target_table"),
-                    "uri": task.get("full_path"), "filename": task.get("s3_filename"),
-                    "s3_filename": task.get("s3_filename"),
-                    "copybook_display": task.get("copybook_map") or "NO_COPYBOOK",
-                    "korg_display": task.get("korg_map") or "NO_KORG",
-                    "total_records": 0, "records_loaded": 0, "skipped_count": 0,
-                    "records_loaded_mapped": 0, "records_loaded_unmapped": 0, "records_loaded_bcs": 0,
-                    "load_pct": "0%", "status": "FAILED", "seconds": 0, "worker_id": 0, "rows_loaded": 0,
-                    "error": clip_error(e), "schema_counts": {}
-                })
-
-    finalize_replacements(results)     # atomic snapshot swap (or discard) for tables without a primary key
+                out = fut.result()
+            except Exception as e:  # noqa: BLE001 - last line of defence
+                logger.error(f"[ERROR] Unit for {table} failed: {e}")
+                out = [{"s3_filename": t.get("s3_filename"), "filename": t.get("s3_filename"), "table": table, "uri": t["full_path"],
+                        "full_path": t["full_path"], "status": "FAILED", "seconds": 0, "rows_loaded": 0, "records_loaded": 0,
+                        "error": clip_error(e), "schema_counts": {}} for t in group]
+            results.extend(out)
+            for res in out:
+                logger.info(f"[{res.get('status')}] {res.get('schema', '')}.{res.get('table')} <- {res.get('filename')} "
+                            f"({res.get('rows_loaded', 0):,} rows, {res.get('seconds', 0)}s)")
     record_stream_end(None)
 
-    # Save outputs and report
     ts = get_timestamp()
     log_csv = OUT / f"vsam_06_load_log_{run_id}.csv"
-
-    load_summary_rows, all_skipped_rows = build_load_summary(results)
+    load_summary_rows = build_load_summary(results)
     schema_breakdown_rows = build_schema_breakdown(results)
-
+    reject_summary, rejected_rows = build_reject_sheets(results)
     pd.DataFrame(load_summary_rows).to_csv(log_csv, index=False)
     logger.info(f"Load log saved: {log_csv}")
 
@@ -894,54 +818,32 @@ def main():
     VSAM_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     success_count = sum(1 for r in results if r["status"] == "SUCCESS")
     failed_count = sum(1 for r in results if r["status"] == "FAILED")
+    skipped_stale = sum(1 for r in results if r["status"] == "SKIPPED")
     total_loaded_rows = sum(r.get("records_loaded", r.get("rows_loaded", 0)) for r in results)
-    total_skipped_rows = sum(r.get("skipped_count", 0) for r in results)
-
+    total_rejected = sum(r.get("rows_rejected", 0) for r in results)
+    total_dups = sum(r.get("duplicates_dropped", 0) for r in results)
     run_overview_rows = [{
-        "run_id": run_id,
-        "total_tasks": len(tasks),
-        "success": success_count,
-        "failed": failed_count,
-        "skipped_already_done": skipped,
-        "total_rows_loaded": total_loaded_rows,
-        "total_rows_skipped_pk_validation": total_skipped_rows,
-        "workers": max_workers
+        "run_id": run_id, "total_tasks": len(tasks), "success": success_count, "failed": failed_count,
+        "skipped_unchanged": skipped, "skipped_older_snapshot": skipped_stale, "total_rows_loaded": total_loaded_rows,
+        "total_rows_rejected": total_rejected, "duplicate_rows_dropped": total_dups,
+        "reject_limit_per_file": args.max_rejects if args.max_rejects else "none", "workers": max_workers,
     }]
-
-    if not all_skipped_rows:
-        all_skipped_rows = [{
-            "S3 file name": "NONE",
-            "table": "NONE",
-            "file line number": 0,
-            "destination schema attempted": "NONE",
-            "skipped reason": "No records were skipped during this load.",
-            "PK Columns": "NONE",
-            "PK Values": "NONE",
-            "record sample": "NONE",
-            "Full S3 URI": "NONE"
-        }]
-
     generate_excel_report(report_file, {
         "LoadSummary": load_summary_rows,
         "SchemaBreakdown": schema_breakdown_rows,
-        "RunOverview": run_overview_rows
+        "Reject_Summary": reject_summary,
+        "Rejected_Rows": rejected_rows,
+        "RunOverview": run_overview_rows,
     })
     logger.info(f"Excel Report: {report_file}")
-
-    summary_lines = [
-        "=" * 65,
-        f" EXECUTION SUMMARY: {Path(__file__).name}",
-        "=" * 65,
-        f"  tasks executed             : {len(results):>10,}",
-        f"  successful loads           : {success_count:>10,}",
-        f"  failed loads               : {failed_count:>10,}",
-        f"  previously completed       : {skipped:>10,}",
-        f"  total rows loaded/upserted : {total_loaded_rows:>10,}",
-        "=" * 65
-    ]
-    for line in summary_lines:
-        logger.info(line)
-
+    logger.info("=" * 65)
+    logger.info(f" EXECUTION SUMMARY: {Path(__file__).name}")
+    logger.info("=" * 65)
+    for label, value in (("files executed", len(results)), ("files loaded", success_count), ("files failed", failed_count),
+                         ("files skipped (unchanged)", skipped), ("rows loaded", total_loaded_rows),
+                         ("rows rejected", total_rejected), ("duplicate rows dropped", total_dups)):
+        logger.info(f"  {label:<28}: {value:>10,}")
+    logger.info("=" * 65)
     return failed_count == 0
 
 

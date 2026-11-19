@@ -207,22 +207,24 @@ def verify_pk_uniqueness(df, resolved_key_cols):
         return False, 0, 0, 0, "EMPTY_DATASET", "Dataset is empty"
 
     sub = df[valid_cols]
-    null_mask = sub.isnull().any(axis=1) | (sub.astype(str).apply(lambda s: s.str.strip().isin(["", "none", "nan", "null"]))).any(axis=1)
+    # blank / placeholder keys are not loaded (Step 06 rejects them as PK_BLANK / PK_SENTINEL), so they do not make
+    # the key "not unique"; only duplicates among the usable rows do
+    bad = sub.isnull() | sub.astype(str).apply(lambda s: s.str.strip().str.lower().isin(["", "none", "nan", "null"])
+                                                  | s.str.strip().str.fullmatch(r"9+|9{4}[-_]9{2}[-_]9{2}"))
+    null_mask = bad.any(axis=1)
     null_count = int(null_mask.sum())
-    if null_count > 0:
-        first_null_row = int(null_mask.idxmax()) + 2
-        return False, null_count, 0, len(df), f"PK_HAS_NULLS:{null_count}_rows", f"NULL/blank key on row {first_null_row}"
-
-    dup_mask = sub.duplicated(keep=False)
-    dup_count = int(sub.duplicated().sum())
+    usable = sub[~null_mask]
+    dup_mask = usable.duplicated(keep=False)
+    dup_count = int(usable.duplicated().sum())
     if dup_count > 0:
-        dup_sub = sub[dup_mask]
+        dup_sub = usable[dup_mask]
         first_dup_vals = tuple(dup_sub.iloc[0])
-        offending_rows = [i + 2 for i, row in sub.iterrows() if tuple(row) == first_dup_vals]
+        offending_rows = [i + 2 for i, row in usable.iterrows() if tuple(row) == first_dup_vals]
         key_repr = dict(zip(valid_cols, first_dup_vals))
         detail = f"Uniqueness compromised on rows {offending_rows[:4]} with duplicate key: {key_repr}"
-        return False, 0, dup_count, len(df), f"PK_NOT_UNIQUE:{dup_count}_duplicates", detail
-
+        return False, null_count, dup_count, len(df), f"PK_NOT_UNIQUE:{dup_count}_duplicates", detail
+    if null_count:
+        return True, null_count, 0, len(df), f"PK_VALID_UNIQUE ({null_count} blank/placeholder key rows are rejected at load)", ""
     return True, 0, 0, len(df), "PK_VALID_UNIQUE", ""
 
 
@@ -510,7 +512,7 @@ def profile_source(source_key, rows, key_cols, target_schemas, columns_meta, mod
             actual_key_cols = [col_map[k] for k in key_cols if k in col_map]
             if len(actual_key_cols) == len(key_cols):
                 is_unique, null_cnt, dup_cnt, checked_rows, msg, detail = verify_pk_uniqueness(df, actual_key_cols)
-                if is_unique and null_cnt == 0:
+                if is_unique:
                     result["pk_valid"] = True
                     result["pk_cols"] = list(key_cols)
                     result["pk_type"] = "SINGLE" if len(key_cols) == 1 else f"COMPOSITE({len(key_cols)})"
@@ -521,12 +523,18 @@ def profile_source(source_key, rows, key_cols, target_schemas, columns_meta, mod
                     result["pk_type"] = "NO_PK"
                     comp_msg = f"PK_COMPROMISED: {detail}" if detail else msg
                     result["issues"].append(comp_msg)
+                    result["pk_error"] = f"Copybook primary key ({', '.join(key_cols)}) cannot be applied: {comp_msg}"
+                    result["status"] = "PK_ERROR"
+                    logger.error(f"  [PK ERROR] {source_key}: {result['pk_error']}. Step 06 will not load this source.")
             else:
                 missing = [k for k in key_cols if k not in col_map]
                 result["pk_valid"] = False
                 result["pk_cols"] = []
                 result["pk_type"] = "NO_PK"
                 result["issues"].append(f"KEY_COLS_MISSING_IN_DATA:{','.join(missing)}")
+                result["pk_error"] = f"Copybook primary key column(s) not found in the file: {', '.join(missing)}"
+                result["status"] = "PK_ERROR"
+                logger.error(f"  [PK ERROR] {source_key}: {result['pk_error']}. Step 06 will not load this source.")
         else:
             discovered = find_unique_key_columns_sequential(df, max_cols=8)
             result["extracted_pk_cols"] = []
@@ -549,7 +557,7 @@ def profile_source(source_key, rows, key_cols, target_schemas, columns_meta, mod
                 actual_key_cols = [col_map[k] for k in key_cols_df if k in col_map]
                 if len(actual_key_cols) == len(key_cols_df):
                     is_unique, null_cnt, dup_cnt, checked_rows, msg, detail = verify_pk_uniqueness(df, actual_key_cols)
-                    if is_unique and null_cnt == 0:
+                    if is_unique:
                         result["pk_valid"] = True
                         result["pk_cols"] = list(key_cols)
                         result["pk_type"] = "SINGLE" if len(key_cols) == 1 else f"COMPOSITE({len(key_cols)})"
@@ -560,13 +568,18 @@ def profile_source(source_key, rows, key_cols, target_schemas, columns_meta, mod
                         result["pk_type"] = "NO_PK"
                         comp_msg = f"PK_COMPROMISED: {detail}" if detail else msg
                         result["issues"].append(comp_msg)
-                        logger.warning(f"  [PK COMPROMISED] Copybook PK {key_cols} failed on {source_key}: {comp_msg}. Table will load WITHOUT PK.")
+                        result["pk_error"] = f"Copybook primary key ({', '.join(key_cols)}) cannot be applied: {comp_msg}"
+                        result["status"] = "PK_ERROR"
+                        logger.error(f"  [PK ERROR] {source_key}: {result['pk_error']}. Step 06 will not load this source.")
                 else:
                     missing = [k for k in key_cols_df if k not in col_map]
                     result["pk_valid"] = False
                     result["pk_cols"] = []
                     result["pk_type"] = "NO_PK"
                     result["issues"].append(f"KEY_COLS_MISSING_IN_DATA:{','.join(missing)}")
+                    result["pk_error"] = f"Copybook primary key column(s) not found in the file: {', '.join(missing)}"
+                    result["status"] = "PK_ERROR"
+                    logger.error(f"  [PK ERROR] {source_key}: {result['pk_error']}. Step 06 will not load this source.")
             else:
                 result["pk_valid"] = False
                 result["pk_cols"] = []
@@ -795,8 +808,9 @@ def main():
             new_pk_str = ", ".join(result["pk_cols"])
             if new_pk_str != key_cols_raw:
                 lm.loc[(lm["source_company"] == co) & (lm[src_col] == src), "key_columns"] = new_pk_str
-        else:
-            # Table has no valid PK constraint: clear key_columns so downstream knows it has NO PK
+        elif not result.get("pk_error"):
+            # Table has no PK: clear key_columns so downstream knows it has NO PK.
+            # (A copybook key that failed verification is an ERROR and stays visible - see pk_error.)
             lm.loc[(lm["source_company"] == co) & (lm[src_col] == src), "key_columns"] = ""
 
         status = result["status"]

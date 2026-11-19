@@ -168,3 +168,107 @@ def test_gzip_timestamped_file_names_are_accepted(repo):
         csv.writer(fh).writerows([["ref_id", "ref_name"], [1, "a"], [2, "b"]])
     run_steps(repo_dir, env, STEPS[:3] + STEPS[3:6])
     assert q("SELECT count(*) FROM bcs.stg_bcsxref_rec_v") == "2"
+
+
+# ---------------------------------------------------------------------------- staged load (v5.4.0)
+def run_step6(repo_dir, env, *extra):
+    return subprocess.run([sys.executable, "-m", "vsam.vsam_06_load_data", *extra], cwd=repo_dir, env=env,
+                          capture_output=True, text=True, timeout=300)
+
+
+def load_summary(repo_dir):
+    import openpyxl
+    report = sorted((repo_dir / "vsam" / "reports").glob("*vsam_06_load_data_report*.xlsx"))[-1]
+    rows = list(openpyxl.load_workbook(report, read_only=True)["LoadSummary"].iter_rows(values_only=True))
+    head = rows[0]
+    return {r[head.index("tablename")]: dict(zip(head, r)) for r in rows[1:]}
+
+
+HDR = ["status_code", "b_korg", "amount", "account_number", "effective_date", "extra_note"]
+
+
+def test_bad_rows_are_rejected_valid_rows_load_and_9999_dates_are_kept(repo):
+    repo_dir, data, env = repo
+    write_csv(data / "FDICSWP_FDIC_ACHFILE_FLAT_20240101.csv", HDR, [
+        ["A", "104", "1.5", "1001", "2024-01-01", "ok"], ["A", "112", "2.5", "1002", "2024-01-01", "ok"]])
+    run_steps(repo_dir, env, STEPS)                                  # the first snapshot fixes the column types
+    (data / "FDICSWP_FDIC_ACHFILE_FLAT_20240101.csv").unlink()
+    write_csv(data / "FDICSWP_FDIC_ACHFILE_FLAT_20240201.csv", HDR, [
+        ["A", "104", "1.5", "1001", "2024-01-01", "ok"],
+        ["A", "112", "2.5", "1002", "9999-12-31", "far-future date is a real date"],
+        ["A", "104", "3.5", "", "2024-01-01", "blank pk"],
+        ["A", "104", "4.5", "999999999", "2024-01-01", "sentinel pk"],
+        ["A", "104", "not-a-number", "1005", "2024-01-01", "bad amount"],
+        ["", "", "", "", "", ""],
+    ])
+    run_steps(repo_dir, env, STEPS[1:6])
+    assert q("SELECT count(*) FROM bss01104.stg_achfile_v") == "1"
+    assert q("SELECT effective_date::text FROM bss01112.stg_achfile_v WHERE account_number = 1002") == "9999-12-31"
+    reasons = q("SELECT string_agg(reason || '=' || n, ',' ORDER BY reason) FROM (SELECT reason, count(*) n FROM sweep_ctl.load_rejects "
+                "WHERE target_table = 'stg_achfile_v' GROUP BY reason) x")
+    assert reasons == "ALL_NULL=1,BAD_VALUE=1,PK_BLANK=1,PK_SENTINEL=1"
+    assert q("SELECT detail FROM sweep_ctl.load_rejects WHERE reason = 'BAD_VALUE'").startswith("amount = 'not-a-number'")
+    ach = load_summary(repo_dir)["stg_achfile_v"]
+    assert (ach["total recs"], ach["loaded recs"], ach["skipped recs"], ach["duplicates dropped"]) == (6, 2, 4, 0)
+    assert (ach["inserted"], ach["updated"], ach["unchanged"]) == (0, 1, 1)
+    assert ach["rejected by reason"] == "ALL_NULL = 1, BAD_VALUE = 1, PK_BLANK = 1, PK_SENTINEL = 1"
+    assert ach["status"] == "SUCCESS"
+    import openpyxl
+    report = sorted((repo_dir / "vsam" / "reports").glob("*vsam_06_load_data_report*.xlsx"))[-1]
+    wb = openpyxl.load_workbook(report, read_only=True)
+    assert {"Reject_Summary", "Rejected_Rows"} <= set(wb.sheetnames)
+    assert len(list(wb["Rejected_Rows"].iter_rows(values_only=True))) == 1 + 4                  # header + 4 rejected rows
+
+
+def test_unchanged_files_are_skipped_and_changed_ones_reload(repo):
+    repo_dir, data, env = repo
+    write_snapshot(data, "20240101", "A", range(1, 11), "x", 5)
+    run_steps(repo_dir, env, STEPS[:6])
+    first = q("SELECT string_agg(DISTINCT s3_etag, ',') FROM sweep_ctl.load_log WHERE s3_etag IS NOT NULL AND s3_last_modified IS NOT NULL AND s3_size > 0")
+    assert first
+    r = run_step6(repo_dir, env)
+    assert r.returncode == 0 and "Nothing to do" in r.stdout + r.stderr          # nothing changed -> skipped
+    # re-delivered file: same name, new content -> loaded again (keyed table: only that file's keys change)
+    f = data / "FDICSWP_FDIC_ACHFILE_FLAT_20240101.csv"
+    write_csv(f, HDR, [["B", "104", "9.5", "1001", "2024-01-01", "n"]])
+    st = f.stat()
+    os.utime(f, (st.st_atime + 5, st.st_mtime + 5))
+    run_steps(repo_dir, env, ["vsam_02_inventory"])
+    r = run_step6(repo_dir, env)
+    assert r.returncode == 0, r.stdout[-1500:] + r.stderr[-1500:]
+    assert q("SELECT status_code FROM bss01104.stg_achfile_v WHERE account_number = 1001") == "B"
+    assert q("SELECT count(*) FROM bss01104.stg_achfile_v") == "5"                # nothing deleted
+    assert q("SELECT count(*) FROM bcs.stg_bcsxref_rec_v") == "5"                 # the unchanged keyless table was not touched
+
+
+def test_a_failing_keyless_load_rolls_back_and_keeps_the_old_snapshot(repo):
+    repo_dir, data, env = repo
+    write_snapshot(data, "20240101", "A", range(1, 6), "x", 5)
+    run_steps(repo_dir, env, STEPS[:6])
+    assert q("SELECT count(*) FROM bcs.stg_bcsxref_rec_v") == "5"
+    for f in data.glob("*BCSXREF*"):
+        f.unlink()
+    write_csv(data / "FDICSWP_SWP_BCSXREF_FLAT_20240301.csv", ["ref_id", "ref_name", "ref_date"],
+              [[1, "new", "2024-03-01"], [2, "new", "not-a-date"], [3, "new", "2024-03-01"]])
+    run_steps(repo_dir, env, ["vsam_02_inventory"])
+    r = run_step6(repo_dir, env, "--max-rejects", "1")
+    assert r.returncode != 0
+    assert q("SELECT count(*), min(ref_name) FROM bcs.stg_bcsxref_rec_v") == "5|x1"      # old snapshot untouched
+    assert q("SELECT count(*) FROM sweep_ctl.load_log WHERE uri LIKE '%20240301%' AND status = 'SUCCESS'") == "0"
+    assert q("SELECT count(*) FROM sweep_ctl.load_rejects WHERE file_status = 'FILE_FAILED'") == "1"
+    # default (no reject limit): the valid rows load, the bad one is reported
+    r = run_step6(repo_dir, env)
+    assert r.returncode == 0, r.stdout[-1500:] + r.stderr[-1500:]
+    assert q("SELECT count(*), min(ref_name) FROM bcs.stg_bcsxref_rec_v") == "2|new"
+    assert q("SELECT count(*) FROM sweep_ctl.load_rejects WHERE reason = 'BAD_VALUE' AND file_status = 'LOADED'") == "1"
+
+
+def test_a_copybook_key_that_cannot_be_applied_is_an_error(repo):
+    repo_dir, data, env = repo
+    write_csv(data / "FDICSWP_FDIC_ACHFILE_FLAT_20240101.csv", HDR, [
+        ["A", "104", "1.5", "1001", "2024-01-01", "x"], ["A", "104", "2.5", "1001", "2024-01-01", "same key twice"]])
+    run_steps(repo_dir, env, STEPS[:5])
+    r = run_step6(repo_dir, env)
+    assert r.returncode != 0
+    assert q("SELECT count(*) FROM bss01104.stg_achfile_v") == "0"
+    assert "cannot be applied" in r.stdout + r.stderr

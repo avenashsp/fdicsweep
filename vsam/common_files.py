@@ -156,8 +156,9 @@ class S3Text(io.TextIOWrapper):
 
 class S3File:
     """Mock file object for S3 objects: name, exists(), stat().st_size / st_mtime."""
-    def __init__(self, uri, size=0, mtime=0.0):
+    def __init__(self, uri, size=0, mtime=0.0, etag=""):
         self.uri, self.size, self.mtime = str(uri), int(float(size or 0)), float(mtime or 0)
+        self.etag = str(etag or "")
         self.name = self.uri.rsplit("/", 1)[-1]
 
     def __str__(self):

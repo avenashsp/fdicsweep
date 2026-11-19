@@ -62,6 +62,8 @@ from vsam.vsam_common import (
     S3File,
 )
 
+from sweep_s3meta import canon_etag, canon_time
+
 logger = get_logger("vsam_02_inventory", "vsam_02_inventory")
 
 
@@ -86,7 +88,7 @@ def discover_s3_files(s3_uri, folders):
                         uri = f"s3://{bucket_name}/{key}"
                         size = obj.get("Size", 0)
                         mtime = obj.get("LastModified").timestamp() if obj.get("LastModified") else 0
-                        s3_files.append((fld, S3File(uri, size=size, mtime=mtime)))
+                        s3_files.append((fld, S3File(uri, size=size, mtime=mtime, etag=obj.get("ETag", ""))))
         logger.info(f"Discovered {len(s3_files)} S3 candidate file(s) across {len(folders)} folder(s).")
     except AWS_ERRORS as e:
         logger.warning(f"S3 listing failed ({e}); checking local data directories.")
@@ -661,8 +663,13 @@ def main():
             try:
                 st = p.stat()
                 size_mb = round(st.st_size / (1024 * 1024), 2)
+                # S3 object metadata (a file is only "already loaded" while all three still match - see Step 06)
+                s3_meta = {"s3_last_modified": canon_time(st.st_mtime) if st.st_mtime else "",
+                           "s3_etag": canon_etag(getattr(p, "etag", "")) or f"local-{st.st_size}-{int(st.st_mtime)}",
+                           "s3_size": st.st_size}
             except OSError:
                 size_mb = 0
+                s3_meta = {"s3_last_modified": "", "s3_etag": "", "s3_size": ""}
 
             inv_row = {
                 "folder": folder,
@@ -711,7 +718,8 @@ def main():
                         "size_mb": size_mb,
                         "copybook_file": cb_file,
                         "copybook_map": cb_map_display,
-                        "korg_map": korg_display
+                        "korg_map": korg_display,
+                        **s3_meta
                     }
                     loads.append(load_row)
                     row_refs[cm_key].append(load_row)
@@ -726,7 +734,8 @@ def main():
     ]
     lm_cols = [
         "folder", "s3_filename", "full_path", "source_company", "source_filename", "has_header", "version_date",
-        "target_schema", "broker", "target_table", "key_columns", "size_mb", "copybook_file", "copybook_map", "korg_map"
+        "target_schema", "broker", "target_table", "key_columns", "size_mb", "copybook_file", "copybook_map", "korg_map",
+        "s3_last_modified", "s3_etag", "s3_size"
     ]
 
     df = pd.DataFrame(inv) if inv else pd.DataFrame(columns=inv_cols)

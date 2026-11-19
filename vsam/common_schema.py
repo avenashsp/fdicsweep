@@ -2,7 +2,7 @@
 """
 vsam/common_schema.py - Target table DDL building and live PostgreSQL inspection / load-strategy decisions.
 """
-from sweep_common import DB_ERRORS, norm_col, q, query_db_rows, run_psql
+from sweep_common import DB_ERRORS, norm_col, q, query_db_rows
 from vsam.common_config import logger
 
 
@@ -86,86 +86,6 @@ def check_table_exists(schema: str, table: str) -> bool:
     except DB_ERRORS as e:
         logger.debug(f"Could not check existence of table {schema}.{table}: {e}")
         return False
-
-
-def get_table_pk_columns_live(schema: str, table: str) -> list:
-    """
-    Queries PostgreSQL live catalog to check if schema.table has an active PRIMARY KEY constraint.
-    Returns list of primary key column names (in ordinal order), or [] if no PK exists.
-    """
-    sql = f"""
-    SELECT a.attname
-    FROM pg_index i
-    JOIN pg_class c ON c.oid = i.indrelid
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
-    WHERE n.nspname = '{schema.lower()}'
-      AND c.relname = '{table.lower()}'
-      AND i.indisprimary
-    ORDER BY array_position(i.indkey, a.attnum);
-    """
-    try:
-        rows = query_db_rows(sql)
-        return [r.strip() for r in rows if r.strip()]
-    except DB_ERRORS as e:
-        logger.warning(f"Could not check PK for {schema}.{table}: e")
-        logger.debug(f"Could not check PK for {schema}.{table}: {e}")
-        return []
-
-
-def table_has_existing_data(schema: str, table: str) -> bool:
-    """
-    Checks if schema.table currently has at least 1 row in PostgreSQL.
-    """
-    sql = f"SELECT 1 FROM {q(schema)}.{q(table)} LIMIT 1;"
-    try:
-        rows = query_db_rows(sql)
-        return len(rows) > 0
-    except DB_ERRORS as e:
-        logger.debug(f"Could not check row existence for {schema}.{table}: {e}")
-        return False
-
-
-def check_table_load_strategy(schema: str, table: str, tg_prof_pk: list = None) -> dict:
-    """
-    Inspects PostgreSQL live for schema.table to determine the load strategy. Primary keys are always applied
-    before loading:
-      - table is fresh (no rows): when the copybook PK is known and the table has none yet, the PK is applied first
-          * has a PK            -> action = 'INSERT_FRESH', has_pk = True
-          * has no PK           -> action = 'NO_PK_LOAD',  has_pk = False
-      - table has rows and a PK -> action = 'UPSERT',            has_pk = True
-      - table has rows, no PK   -> action = 'TRUNCATE_AND_LOAD', has_pk = False
-    """
-    has_data = table_has_existing_data(schema, table)
-    live_pk_cols = get_table_pk_columns_live(schema, table)
-    has_pk = bool(live_pk_cols)
-    candidate_pks = [norm_col(c) for c in (tg_prof_pk or []) if c]
-
-    if not has_data:
-        if candidate_pks and not has_pk:
-            try:
-                pk_name = q(f"pk_{table}")
-                pk_def = ", ".join(q(k) for k in candidate_pks)
-                alter_sql = f"ALTER TABLE {q(schema)}.{q(table)} ADD CONSTRAINT {pk_name} PRIMARY KEY ({pk_def});"
-                run_psql(alter_sql)
-                logger.info(f"Applied PK constraint on fresh table {schema}.{table} ({', '.join(candidate_pks)})")
-                live_pk_cols = get_table_pk_columns_live(schema, table)
-                has_pk = bool(live_pk_cols)
-            except DB_ERRORS as e:
-                logger.warning(f"Could not apply PK constraint to {schema}.{table}: {e}")
-                has_pk = False
-        action = "INSERT_FRESH" if has_pk else "NO_PK_LOAD"
-    elif has_pk:
-        action = "UPSERT"
-    else:
-        action = "TRUNCATE_AND_LOAD"
-
-    return {
-        "has_data": has_data,
-        "has_pk": has_pk,
-        "pk_cols": live_pk_cols if has_pk else [],
-        "action": action
-    }
 
 
 # -----------------------------------------------------------------------------

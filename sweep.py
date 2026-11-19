@@ -449,6 +449,8 @@ def handle_vsam(args):
         if getattr(args, "limit_files", None): c.extend(["--limit-files", str(args.limit_files)])
         if getattr(args, "force_truncate", False): c.append("--force-truncate")
         if getattr(args, "dry_run", False): c.append("--dry-run")
+        if getattr(args, "reload", False): c.append("--reload")
+        if getattr(args, "max_rejects", None) is not None: c.extend(["--max-rejects", str(args.max_rejects)])
         run_or_bg("vsam_06_load_data", c, getattr(args, "bg", False))
 
     # Step 07: Validate
@@ -635,6 +637,8 @@ def main():
     v_load.add_argument("--limit-files", type=int, help="Limit files loaded")
     v_load.add_argument("--force-truncate", action="store_true", help="Allow replacing a table that already has rows and no PK in a PARTIAL run (--company/--tables/--limit-files); full runs replace such tables automatically")
     v_load.add_argument("--dry-run", action="store_true", help="List the files that would be loaded without writing to the database")
+    v_load.add_argument("--reload", action="store_true", help="Load files again even when their S3 LastModified/ETag/size are unchanged")
+    v_load.add_argument("--max-rejects", type=int, default=None, help="Fail a file when this many rows are rejected (default 0 = never fail; N = fail the file at N rejects)")
     v_load.add_argument("--bg", action="store_true", help="Run in background daemon")
 
     v_lobj = v_sub.add_parser("load-obj", aliases=["load-objects", "post-load"], help="Legacy alias: Merged into Step 06 (load-data)")
