@@ -32,6 +32,12 @@ CREATE INDEX IF NOT EXISTS idx_sweep_load_log_target
 CREATE INDEX IF NOT EXISTS idx_sweep_load_log_status 
     ON sweep_ctl.load_log (status);
 
+-- S3 object metadata of the file as loaded (a file counts as loaded only while all three still match S3).
+-- CREATE TABLE IF NOT EXISTS does not add columns to an existing table, hence the ALTERs.
+ALTER TABLE sweep_ctl.load_log ADD COLUMN IF NOT EXISTS s3_last_modified text;
+ALTER TABLE sweep_ctl.load_log ADD COLUMN IF NOT EXISTS s3_etag          text;
+ALTER TABLE sweep_ctl.load_log ADD COLUMN IF NOT EXISTS s3_size          bigint;
+
 -- Run-level execution history and audit log
 CREATE TABLE IF NOT EXISTS sweep_ctl.load_audit (
     id              bigserial PRIMARY KEY,

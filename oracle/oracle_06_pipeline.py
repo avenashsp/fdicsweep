@@ -27,6 +27,7 @@ Rejected rows never fail the file unless their number reaches `max_rejects` (def
 import json
 
 from sweep_common import CTL_SCHEMA, LOAD_LOG_TABLE, lit, q, query_db_dicts, run_psql
+from sweep_s3meta import meta_sql_values
 
 REJECT_TABLE = f"{CTL_SCHEMA}.load_rejects"
 MAX_REJECT_ROWS_PRINTED = 1000       # rejected rows echoed back per file (and stored when the file fails)
@@ -115,6 +116,11 @@ def probe_trigger_mode():
 # -----------------------------------------------------------------------------
 def _is_text(type_name):
     return type_name in TEXT_TYPES
+
+
+def _cmp(expr, type_name):
+    """Comparison operand: types without an equality operator (json, xml) are compared as text."""
+    return f"{expr}::text" if type_name in ("json", "xml") or type_name.startswith("point") else expr
 
 
 def _trigger_off_on(schema, table, meta, mode):
@@ -265,7 +271,7 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
 
     # 8. apply: INSERT ... ON CONFLICT on the arbiter key
     head = ", ".join(q(c) for c in header_cols)
-    ins_cols = f"INSERT INTO {tgt} ({head})" + (" OVERRIDING SYSTEM VALUE" if plan["identity"] else "")
+    ins_cols = f"INSERT INTO {tgt} AS t ({head})" + (" OVERRIDING SYSTEM VALUE" if plan["identity"] else "")
     arb = plan["arbiter"]
     on_conflict = ""
     if arb:
@@ -277,12 +283,32 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
             sets.append('"modifiedby" = CURRENT_USER')
         if "modifieddate" in cols and "modifieddate" not in plan["present"]:
             sets.append('"modifieddate" = CURRENT_TIMESTAMP')
-        on_conflict = (f" ON CONFLICT ({', '.join(q(c) for c in arb['cols'])}) DO UPDATE SET {', '.join(sets)}"
-                       if sets else f" ON CONFLICT ({', '.join(q(c) for c in arb['cols'])}) DO NOTHING")
-    add(f"WITH ins AS ({ins_cols} SELECT {head} FROM _stg{on_conflict} RETURNING (xmax = 0) AS inserted) "
-        "INSERT INTO _c SELECT 'inserted', count(*) FILTER (WHERE inserted) FROM ins "
-        "UNION ALL SELECT 'updated', count(*) FILTER (WHERE NOT inserted) FROM ins;\n"
-        "INSERT INTO _c SELECT 'unchanged', (SELECT n FROM _c WHERE k = 'staged') - (SELECT sum(n) FROM _c WHERE k IN ('inserted', 'updated'));\n")
+        arb_list = ", ".join(q(c) for c in arb["cols"])
+        if upd:
+            # only rows that actually differ are updated. Columns that come FROM the file (modifieddate / modifiedby
+            # included) are source data and count as a change; audit values the tool sets itself are not compared.
+            old = ", ".join(_cmp(f"t.{q(c)}", cols[c]["type"]) for c in upd)
+            new = ", ".join(_cmp(f"EXCLUDED.{q(c)}", cols[c]["type"]) for c in upd)
+            on_conflict = (f" ON CONFLICT ({arb_list}) DO UPDATE SET {', '.join(sets)} "
+                           f"WHERE ({old}) IS DISTINCT FROM ({new})")
+        else:
+            on_conflict = f" ON CONFLICT ({arb_list}) DO NOTHING"
+    if arb:
+        # which staged keys already exist (before the statement) -> updated; the rest -> inserted. Works on
+        # partitioned tables too (RETURNING xmax does not).
+        key_join = " AND ".join(f"t.{q(c)} = s.{q(c)}" for c in arb["cols"])
+        add(f"CREATE TEMP TABLE _existing ON COMMIT DROP AS SELECT {', '.join('s.' + q(c) for c in arb['cols'])} "
+            f"FROM _stg s WHERE EXISTS (SELECT 1 FROM {tgt} t WHERE {key_join});\n")
+        ret = ", ".join(f"{q(c)}" for c in arb["cols"])
+        e_join = " AND ".join(f"i.{q(c)} = e.{q(c)}" for c in arb["cols"])
+        e_first = q(arb["cols"][0])
+        add(f"WITH ins AS ({ins_cols} SELECT {head} FROM _stg AS s{on_conflict} RETURNING {ret}), "
+            f"x AS (SELECT count(*) AS tot, count(e.{e_first}) AS upd FROM ins i LEFT JOIN _existing e ON {e_join}) "
+            "INSERT INTO _c SELECT 'inserted', tot - upd FROM x UNION ALL SELECT 'updated', upd FROM x;\n")
+    else:
+        add(f"WITH ins AS ({ins_cols} SELECT {head} FROM _stg AS s RETURNING 1) "
+            "INSERT INTO _c SELECT 'inserted', count(*) FROM ins UNION ALL SELECT 'updated', 0;\n")
+    add("INSERT INTO _c SELECT 'unchanged', (SELECT n FROM _c WHERE k = 'staged') - (SELECT sum(n) FROM _c WHERE k IN ('inserted', 'updated'));\n")
 
     # 9. nothing may disappear silently
     add("DO $$ DECLARE raw_n bigint; acc bigint; BEGIN "
@@ -331,8 +357,13 @@ def persist_failed_file_rejects(uri, schema, table, rows):
              f"VALUES {values};")
 
 
-def load_log_insert(uri, schema, table, size_bytes, file_format, worker_id):
-    return (f"INSERT INTO {LOAD_LOG_TABLE} (uri, target_schema, target_table, size_bytes, file_format, worker_id, status) "
-            f"VALUES ({lit(uri)}, {lit(schema)}, {lit(table)}, {size_bytes}, {lit(file_format)}, {worker_id}, 'SUCCESS') "
-            f"ON CONFLICT (uri) DO UPDATE SET loaded_at = now(), status = 'SUCCESS', size_bytes = EXCLUDED.size_bytes;")
+def load_log_insert(uri, schema, table, size_bytes, file_format, worker_id, s3_meta=None):
+    """load_log row of the file (one row per URI, refreshed on a reload) incl. the S3 metadata it was loaded with."""
+    lm, etag, size = meta_sql_values(s3_meta)
+    return (f"INSERT INTO {LOAD_LOG_TABLE} (uri, target_schema, target_table, size_bytes, file_format, worker_id, status, "
+            f"s3_last_modified, s3_etag, s3_size) "
+            f"VALUES ({lit(uri)}, {lit(schema)}, {lit(table)}, {size_bytes}, {lit(file_format)}, {worker_id}, 'SUCCESS', "
+            f"{lm}, {etag}, {size}) "
+            f"ON CONFLICT (uri) DO UPDATE SET loaded_at = now(), status = 'SUCCESS', size_bytes = EXCLUDED.size_bytes, "
+            f"s3_last_modified = EXCLUDED.s3_last_modified, s3_etag = EXCLUDED.s3_etag, s3_size = EXCLUDED.s3_size;")
 

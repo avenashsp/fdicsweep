@@ -275,6 +275,13 @@ def fetch_load_log(catalog):
         catalog["load_log"] = execute_db_query(sql_load_log)
     except DB_ERRORS as e:
         logger.warning(f"Could not query {LOAD_LOG_TABLE}: {e}")
+    # per-file S3 metadata (LastModified / ETag / size) as loaded, for the re-delivered-file comparison
+    try:
+        catalog["load_log_files"] = execute_db_query(
+            f"SELECT uri, s3_last_modified, s3_etag, s3_size FROM {LOAD_LOG_TABLE} WHERE status = 'SUCCESS'")
+    except DB_ERRORS as e:
+        logger.warning(f"Could not read S3 metadata from {LOAD_LOG_TABLE} ({e}); re-delivered files cannot be detected")
+        catalog["load_log_files"] = []
 
 
 def fetch_exact_counts(catalog, exact_counts, schemas_filter, tables_filter):
@@ -313,6 +320,7 @@ def fetch_target_postgres_catalogs(exact_counts=False, tables_filter=None, schem
         "views": [],
         "triggers": [],
         "load_log": [],
+        "load_log_files": [],
         "exact_row_counts": {}
     }
 

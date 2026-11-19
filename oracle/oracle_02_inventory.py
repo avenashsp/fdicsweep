@@ -17,6 +17,7 @@ import argparse
 import subprocess
 from pathlib import Path
 from collections import defaultdict
+from sweep_s3meta import canon_etag, canon_time
 from sweep_common import (
     ORACLE_INPUTS_DIR,
     ORACLE_OUTPUTS_DIR,
@@ -107,6 +108,8 @@ def list_s3_objects(s3_uri, region=AWS_REGION):
                         "key": k,
                         "filename": Path(k).name,
                         "size_bytes": sz,
+                        "s3_last_modified": canon_time(item.get("LastModified")),
+                        "s3_etag": canon_etag(item.get("ETag")),
                         "is_gz": is_gz,
                         "is_csv": is_csv
                     })
@@ -157,6 +160,8 @@ def list_s3_objects(s3_uri, region=AWS_REGION):
                     "key": k,
                     "filename": Path(k).name,
                     "size_bytes": sz,
+                    "s3_last_modified": canon_time(item.get("LastModified")),
+                    "s3_etag": canon_etag(item.get("ETag")),
                     "is_gz": is_gz,
                     "is_csv": is_csv
                 })
@@ -322,6 +327,8 @@ def build_inventory(s3_uri=None, mock_files=None, owners_filter=None, tables_fil
                     "key": p.name,
                     "filename": p.name,
                     "size_bytes": p.stat().st_size,
+                    "s3_last_modified": canon_time(p.stat().st_mtime),
+                    "s3_etag": f"local-{p.stat().st_size}-{int(p.stat().st_mtime)}",
                     "is_gz": p.suffix.lower() == ".gz",
                     "is_csv": p.suffix.lower() == ".csv"
                 })
@@ -559,7 +566,10 @@ def build_inventory(s3_uri=None, mock_files=None, owners_filter=None, tables_fil
             "size_bytes": f["size_bytes"],
             "size_mb": round(f["size_bytes"] / (1024**2), 2),
             "uri": f["uri"],
-            "filename": f["filename"]
+            "filename": f["filename"],
+            "s3_last_modified": f.get("s3_last_modified", ""),
+            "s3_etag": f.get("s3_etag", ""),
+            "s3_size": f["size_bytes"]
         })
 
     # Write output CSV (both oracle_02_s3_file_map.csv and legacy s3_file_map.csv)
@@ -573,7 +583,8 @@ def build_inventory(s3_uri=None, mock_files=None, owners_filter=None, tables_fil
                 w.writerows(file_map_rows)
             else:
                 w = csv.writer(out)
-                w.writerow(["load_order_rank", "owner", "table_name", "target_schema", "target_table", "file_format", "size_bytes", "size_mb", "uri", "filename"])
+                w.writerow(["load_order_rank", "owner", "table_name", "target_schema", "target_table", "file_format", "size_bytes", "size_mb", "uri", "filename",
+                            "s3_last_modified", "s3_etag", "s3_size"])
 
     logger.info(f"Generated {map_csv_path} and {legacy_map_path} with {len(file_map_rows)} file(s) ordered small to large.")
 

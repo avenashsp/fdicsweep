@@ -110,21 +110,25 @@ def test_triggers_are_skipped_and_restored(gz_file, mode):
 def test_file_fails_at_reject_limit_and_rolls_back(gz_file):
     _t("p9", "t", "id int primary key, v text not null")
     body = "id,v\n" + "".join(f"{i},\n" for i in range(10)) + "100,ok\n"
-    o = _load(gz_file, "a.csv.gz", body, "p9", "t")
+    o = _load(gz_file, "a.csv.gz", body, "p9", "t", max_rejects=10)
     assert o.status == "FAILED" and "Too many rejected rows" in o.error
     assert _q("SELECT count(*) FROM p9.t") == "0"
     assert _q(f"SELECT count(*) FROM {c.LOAD_LOG_TABLE}") == "0"
     assert int(_q(f"SELECT count(*) FROM {pl.REJECT_TABLE}")) >= 10                 # kept for diagnosis
     # 9 rejects is below the limit -> file succeeds
     body = "id,v\n" + "".join(f"{i},\n" for i in range(9)) + "100,ok\n"
-    o = _load(gz_file, "b.csv.gz", body, "p9", "t")
+    o = _load(gz_file, "b.csv.gz", body, "p9", "t", max_rejects=10)
     assert (o.status, o.rejected, o.inserted) == ("SUCCESS", 9, 1)
 
 
-def test_max_rejects_zero_never_fails(gz_file):
+def test_default_never_fails_a_file_for_rejected_rows(gz_file):
+    assert o6.DEFAULT_MAX_REJECTS == 0
     _t("pa", "t", "id int primary key, v text not null")
+    body = "id,v\n" + "".join(f"{i},\n" for i in range(20)) + "100,ok\n"
+    o = _load(gz_file, "a.csv.gz", body, "pa", "t")
+    assert (o.status, o.rejected, o.inserted) == ("SUCCESS", 20, 1)
     body = "id,v\n" + "".join(f"{i},\n" for i in range(20))
-    o = _load(gz_file, "a.csv.gz", body, "pa", "t", max_rejects=0)
+    o = _load(gz_file, "b.csv.gz", body, "pa", "t")
     assert (o.status, o.rejected) == ("SUCCESS", 20)
 
 
@@ -133,3 +137,37 @@ def test_fast_bulk_on_empty_constraint_free_table(gz_file):
     o = _load(gz_file, "a.csv.gz", "a,b\n1,x\n2,y\n", "pb", "t", fast_bulk=True)
     assert (o.status, o.rows) == ("SUCCESS", 2)
     assert _q("SELECT count(*) FROM pb.t") == "2"
+
+
+def test_only_rows_that_differ_are_updated(gz_file):
+    _t("pc", "t", "id int primary key, v text, n int, modifieddate timestamp, modifiedby text")
+    c.run_psql("CREATE OR REPLACE FUNCTION pc.touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.v := 'trigger'; RETURN NEW; END $$; "
+               "CREATE TRIGGER trg_touch BEFORE UPDATE ON pc.t FOR EACH ROW EXECUTE FUNCTION pc.touch();")
+    o = _load(gz_file, "a.csv.gz", "id,v,n\n1,a,1\n2,b,2\n3,c,3\n", "pc", "t")
+    assert (o.inserted, o.updated, o.unchanged) == (3, 0, 0)
+    first = _q("SELECT modifieddate FROM pc.t WHERE id=1")
+    o = _load(gz_file, "b.csv.gz", "id,v,n\n1,a,1\n2,CHANGED,2\n3,c,3\n4,d,4\n", "pc", "t")
+    assert (o.status, o.inserted, o.updated, o.unchanged) == ("SUCCESS", 1, 1, 2)
+    assert o.read == o.inserted + o.updated + o.unchanged + o.rejected + o.duplicates
+    assert _q("SELECT modifieddate FROM pc.t WHERE id=1") == first          # unchanged row not touched
+    assert _q("SELECT modifiedby FROM pc.t WHERE id=2") == c.PGUSER          # tool-set audit value on the changed row
+    assert _q("SELECT v FROM pc.t WHERE id=2") == "CHANGED"
+
+
+def test_modifieddate_from_the_file_counts_as_a_change(gz_file):
+    _t("pd", "t", "id int primary key, v text, modifieddate timestamp")
+    _load(gz_file, "a.csv.gz", "id,v,modifieddate\n1,a,2020-01-01 00:00:00\n", "pd", "t")
+    o = _load(gz_file, "b.csv.gz", "id,v,modifieddate\n1,a,2021-01-01 00:00:00\n", "pd", "t")
+    assert (o.updated, o.unchanged) == (1, 0)
+    assert _q("SELECT modifieddate FROM pd.t") == "2021-01-01 00:00:00"
+    o = _load(gz_file, "c.csv.gz", "id,v,modifieddate\n1,a,2021-01-01 00:00:00\n", "pd", "t")
+    assert (o.updated, o.unchanged) == (0, 1)
+
+
+def test_counts_balance_on_a_partitioned_table(gz_file):
+    c.run_psql('CREATE SCHEMA IF NOT EXISTS pe; CREATE TABLE pe.t (id int, d int, v text, PRIMARY KEY (id, d)) PARTITION BY RANGE (d); '
+               'CREATE TABLE pe.t1 PARTITION OF pe.t FOR VALUES FROM (0) TO (100);')
+    o = _load(gz_file, "a.csv.gz", "id,d,v\n1,5,a\n2,6,b\n", "pe", "t")
+    assert (o.status, o.inserted) == ("SUCCESS", 2), o.error
+    o = _load(gz_file, "b.csv.gz", "id,d,v\n1,5,a\n2,6,CH\n3,7,c\n", "pe", "t")
+    assert (o.status, o.inserted, o.updated, o.unchanged) == ("SUCCESS", 1, 1, 1), o.error

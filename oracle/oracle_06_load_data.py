@@ -39,6 +39,7 @@ from sweep_common import (
     get_timestamp,
     get_db_name,
     generate_excel_report,
+    query_db_dicts,
     run_psql,
     run_psql_script,
     norm_col,
@@ -51,12 +52,14 @@ from oracle.oracle_06_pipeline import (
     build_fast_script, build_staged_script, ensure_reject_table, has_constraints, load_log_insert, load_table_meta,
     parse_output, persist_failed_file_rejects, plan_load, probe_trigger_mode,
 )
+from sweep_s3meta import has_meta, head_many, head_object, make_meta, meta_equal, meta_from_row, describe_difference
+from oracle.oracle_06_order import plan_levels
 from sweep_streaming import read_stream_head, stream_program_literal
 from sweep_platform import atomic_write_json
 logger = get_logger("oracle_06_load_data", "oracle_06_load_data")
 LOCK = threading.Lock()
 MAX_REJECT_ROWS_IN_REPORT = 10000   # rows shown in the Rejected_Rows sheet; all are in sweep_ctl.load_rejects
-DEFAULT_MAX_REJECTS = 10      # the file fails when this many rows are rejected (0 = never)
+DEFAULT_MAX_REJECTS = 0       # 0 = valid rows always load; the file fails only on technical errors (--max-rejects N to fail at N rejects)
 COL_CACHE = {}
 PK_CACHE = {}
 
@@ -133,15 +136,40 @@ def record_stream_end(worker_id):
         _flush_active_streams()
 
 
-def get_loaded_uris():
-    """Queries sweep_ctl.load_log to get all previously successfully loaded S3 URIs."""
+def get_loaded_log():
+    """
+    {uri: stored S3 metadata} of every file with a SUCCESS row in sweep_ctl.load_log. Rows loaded before the
+    metadata columns existed carry empty metadata (see classify_job).
+    """
     try:
-        sql = f"SELECT uri FROM {LOAD_LOG_TABLE} WHERE status = 'SUCCESS';"
-        out = run_psql(sql)
-        return {line.strip() for line in out.splitlines() if line.strip()}
+        rows = query_db_dicts(f"SELECT uri, s3_last_modified, s3_etag, s3_size FROM {LOAD_LOG_TABLE} WHERE status = 'SUCCESS'")
+        return {r["uri"]: make_meta(r.get("s3_last_modified"), r.get("s3_etag"), r.get("s3_size")) for r in rows}
+    except DB_ERRORS as e:
+        logger.warning(f"Could not read S3 metadata from {LOAD_LOG_TABLE} ({e}); falling back to URIs only. "
+                       f"Apply the control DDL (Step 05) to add the s3_* columns.")
+    try:
+        return {r["uri"]: make_meta("", "", "")
+                for r in query_db_dicts(f"SELECT uri FROM {LOAD_LOG_TABLE} WHERE status = 'SUCCESS'")}
     except DB_ERRORS as e:
         logger.warning(f"Could not read loaded URIs from {LOAD_LOG_TABLE} (table might be new): {e}")
-        return set()
+        return {}
+
+
+def classify_job(job, stored, live):
+    """
+    ('skip' | 'load' | 'reload', reason). A file is already loaded only when its load_log row is SUCCESS and
+    LastModified, ETag and size all equal what S3 reports now (`live`, else the file map).
+    """
+    if stored is None:
+        return "load", "not loaded yet"
+    if not any(stored.values()):
+        return "skip", "loaded by an earlier version without S3 metadata (use --reload to re-verify)"
+    current = live or meta_from_row(job)
+    if not has_meta(current):
+        return "skip", "S3 metadata unavailable; cannot compare, treated as loaded"
+    if meta_equal(stored, current):
+        return "skip", "unchanged since the last load"
+    return "reload", "S3 object changed: " + describe_difference(stored, current)
 
 
 def get_target_columns(schema, table):
@@ -233,8 +261,11 @@ def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False, max_rejec
         if problem:
             return _failed(problem)
 
+        # Re-check the object right before loading: the load_log row stores exactly what was loaded, so a stale
+        # file map cannot cause a skipped or mis-recorded reload.
+        s3_meta = head_object(uri, region)
         stream_cmd = stream_program_literal(uri, region)
-        log_sql = load_log_insert(uri, schema, table, size_bytes, file_format, worker_id)
+        log_sql = load_log_insert(uri, schema, table, size_bytes, file_format, worker_id, s3_meta)
         name = job.get("filename", Path(uri).name)
 
         use_fast = fast_bulk and not has_constraints(meta) and is_table_empty(schema, table)
@@ -279,7 +310,7 @@ def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False, max_rejec
         # Update loaded_rows and seconds
         try:
             update_sql = f"UPDATE {LOAD_LOG_TABLE} SET loaded_rows = {rows}, seconds = {sec} WHERE uri = {lit(uri)};"
-            run_psql(update_sql, capture=False)
+            run_psql(update_sql)
         except RuntimeError as e:
             # Data and its load_log row are already committed; only the stats update failed.
             logger.warning(f"[Worker {worker_id}] Could not record row count for {uri}: {e}")
@@ -399,24 +430,53 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
     if min_size_mb is not None:
         all_jobs = [j for j in all_jobs if float(j.get("size_mb") or (int(j.get("size_bytes") or 0) / (1024**2))) >= min_size_mb]
 
-    # Rule: Load the s3 files in that order (small to large file size)
+    # Small to large inside a level (and overall with --fast-bulk); the level order itself is decided below
     all_jobs.sort(key=lambda x: (int(x.get("size_bytes") or 0), x.get("filename", "")))
 
     if limit_files:
         all_jobs = all_jobs[:limit_files]
 
     total_candidates = len(all_jobs)
-    loaded_uris = get_loaded_uris() if not dry_run else set()
-    if not reload and not file_uri and not filename:
-        pending_jobs = [j for j in all_jobs if j["uri"] not in loaded_uris]
+    changed_count = 0
+    if not reload and not file_uri and not filename and not dry_run:
+        stored_log = get_loaded_log()
+        known = [j["uri"] for j in all_jobs if j["uri"] in stored_log and any(stored_log[j["uri"]].values())]
+        live = head_many(known, region=AWS_REGION) if known else {}
+        pending_jobs, legacy = [], 0
+        for j in all_jobs:
+            action, why = classify_job(j, stored_log.get(j["uri"]), live.get(j["uri"]))
+            if action == "skip":
+                legacy += "without S3 metadata" in why
+                continue
+            if action == "reload":
+                changed_count += 1
+                logger.info(f"Reloading {j['filename']}: {why}")
+            pending_jobs.append(j)
         skipped_count = total_candidates - len(pending_jobs)
+        if legacy:
+            logger.warning(f"{legacy} file(s) were loaded before S3 metadata was recorded and are treated as loaded "
+                           f"(run with --reload to load them again and record their metadata).")
     else:
         pending_jobs = all_jobs
         skipped_count = 0
 
+    if fast_bulk:
+        # fast bulk loads are not FK-ordered: smallest to largest
+        for j in pending_jobs:
+            j["load_level"] = 0
+        level_plan = [(0, pending_jobs)]
+        order_text = "Smallest to Largest File Size (--fast-bulk)"
+    else:
+        level_plan = plan_levels(pending_jobs) if pending_jobs else []
+        order_text = "Parent tables first, level by level"
+        pending_jobs = [j for _, files in level_plan for j in files]
+
     logger.info("=" * 70)
-    logger.info(f"SWEEP Ingestion Engine: {len(pending_jobs)} pending file(s) ({skipped_count} already loaded)")
-    logger.info(f"Order: Smallest to Largest File Size | Workers: {workers} | Gate-Pass: {gate_pass} | Dry-Run: {dry_run}")
+    logger.info(f"SWEEP Ingestion Engine: {len(pending_jobs)} pending file(s) ({skipped_count} already loaded, {changed_count} re-delivered)")
+    logger.info(f"Order: {order_text} | Workers: {workers} | Gate-Pass: {gate_pass} | Dry-Run: {dry_run}")
+    if len(level_plan) > 1 or (level_plan and not fast_bulk):
+        for lv, files in level_plan:
+            logger.info(f"  level {lv}: {len({(f['target_schema'], f['target_table']) for f in files}):>5} table(s), {len(files):>5} file(s)")
     logger.info("=" * 70)
 
     if not pending_jobs:
@@ -429,7 +489,9 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
             trigger_mode = probe_trigger_mode()
         logger.info(f"Triggers are switched off per load transaction via: {trigger_mode} "
                     f"({'session_replication_role = replica' if trigger_mode == 'replica' else 'ALTER TABLE ... DISABLE TRIGGER (table lock until commit)'})")
-        logger.info(f"A file fails when {max_rejects} rejected rows are reached (0 = never); fast bulk: {fast_bulk}")
+        logger.info(("A file fails when " + str(max_rejects) + " rejected rows are reached"
+                     if max_rejects else "Rejected rows never fail a file (only technical errors roll it back)")
+                    + f"; fast bulk: {fast_bulk}")
     else:
         trigger_mode = trigger_mode if trigger_mode != "auto" else "replica"
 
@@ -441,61 +503,67 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
     total_loaded_bytes = 0
     t_start = time.time()
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {}
-        for idx, job in enumerate(pending_jobs):
-            worker_id = (idx % workers) + 1
-            f = executor.submit(load_single_file, job, worker_id, dry_run=dry_run, max_rejects=max_rejects,
-                                fast_bulk=fast_bulk, trigger_mode=trigger_mode)
-            futures[f] = job
+    for level, level_jobs in level_plan:
+        if not level_jobs:
+            continue
+        if not fast_bulk:
+            logger.info(f"--- level {level}: loading {len(level_jobs)} file(s); the next level starts when all of them are done ---")
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {}
+            for idx, job in enumerate(level_jobs):
+                worker_id = (idx % workers) + 1
+                f = executor.submit(load_single_file, job, worker_id, dry_run=dry_run, max_rejects=max_rejects,
+                                    fast_bulk=fast_bulk, trigger_mode=trigger_mode)
+                futures[f] = job
 
-        for future in as_completed(futures):
-            job = futures[future]
-            out = future.result()
-            status, rows, sec, msg = out.status, out.rows, out.seconds, out.error
-            completed_files += 1
+            for future in as_completed(futures):
+                job = futures[future]
+                out = future.result()
+                status, rows, sec, msg = out.status, out.rows, out.seconds, out.error
+                completed_files += 1
 
-            if status == "SUCCESS":
-                total_loaded_rows += rows
-                total_loaded_bytes += int(job.get("size_bytes") or 0)
-                rate = round(rows / sec) if sec > 0 else 0
-                logger.info(f"[{completed_files}/{len(pending_jobs)}] OK: {job['filename']} -> "
-                            f"{job['target_schema']}.{job['target_table']} ({rows:,} rows in {sec}s ~ {rate:,} r/s; "
-                            f"inserted {out.inserted:,}, updated {out.updated:,}, rejected {out.rejected:,}, duplicates dropped {out.duplicates:,})")
-            elif status == "DRY_RUN":
-                logger.info(f"[{completed_files}/{len(pending_jobs)}] DRY-RUN: {job['filename']} -> "
-                            f"{job['target_schema']}.{job['target_table']} ({job['size_mb']} MB)")
-            else:
-                logger.error(f"[{completed_files}/{len(pending_jobs)}] FAILED: {job['filename']} -> {msg}")
+                if status == "SUCCESS":
+                    total_loaded_rows += rows
+                    total_loaded_bytes += int(job.get("size_bytes") or 0)
+                    rate = round(rows / sec) if sec > 0 else 0
+                    logger.info(f"[{completed_files}/{len(pending_jobs)}] OK: {job['filename']} -> "
+                                f"{job['target_schema']}.{job['target_table']} ({rows:,} rows in {sec}s ~ {rate:,} r/s; "
+                                f"inserted {out.inserted:,}, updated {out.updated:,}, rejected {out.rejected:,}, duplicates dropped {out.duplicates:,})")
+                elif status == "DRY_RUN":
+                    logger.info(f"[{completed_files}/{len(pending_jobs)}] DRY-RUN: {job['filename']} -> "
+                                f"{job['target_schema']}.{job['target_table']} ({job['size_mb']} MB)")
+                else:
+                    logger.error(f"[{completed_files}/{len(pending_jobs)}] FAILED: {job['filename']} -> {msg}")
 
-            results.append({
+                results.append({
+                    "load_level": job.get("load_level", ""),
                 "load_order_rank": job.get("load_order_rank", ""),
-                "target_schema": job["target_schema"],
-                "target_table": job["target_table"],
-                "filename": job["filename"],
-                "size_mb": job["size_mb"],
-                "file_format": job.get("file_format", "gzip"),
-                "status": status,
-                "loaded_rows": rows,
-                "rows_read": out.read,
-                "rows_inserted": out.inserted,
-                "rows_updated": out.updated,
-                "rows_unchanged": out.unchanged,
-                "rows_rejected": out.rejected,
-                "duplicates_dropped": out.duplicates,
-                "duration_seconds": sec,
-                "error_message": msg,
-                "uri": job["uri"]
-            })
-            for g in out.reject_summary:
-                reject_summary_rows.append({"filename": job["filename"], "target_table": f"{job['target_schema']}.{job['target_table']}",
-                                            "reason": g.get("reason"), "detail": g.get("detail"), "rows": g.get("n"),
+                    "target_schema": job["target_schema"],
+                    "target_table": job["target_table"],
+                    "filename": job["filename"],
+                    "size_mb": job["size_mb"],
+                    "file_format": job.get("file_format", "gzip"),
+                    "status": status,
+                    "loaded_rows": rows,
+                    "rows_read": out.read,
+                    "rows_inserted": out.inserted,
+                    "rows_updated": out.updated,
+                    "rows_unchanged": out.unchanged,
+                    "rows_rejected": out.rejected,
+                    "duplicates_dropped": out.duplicates,
+                    "duration_seconds": sec,
+                    "error_message": msg,
+                    "uri": job["uri"]
+                })
+                for g in out.reject_summary:
+                    reject_summary_rows.append({"filename": job["filename"], "target_table": f"{job['target_schema']}.{job['target_table']}",
+                                                "reason": g.get("reason"), "detail": g.get("detail"), "rows": g.get("n"),
+                                                "file_status": status})
+                for r in out.reject_rows:
+                    reject_rows_all.append({"filename": job["filename"], "target_table": f"{job['target_schema']}.{job['target_table']}",
+                                            "record_no": r.get("row_no"), "reason": r.get("reason"), "detail": r.get("detail"),
+                                            "row_data": clip_error(json.dumps(r.get("row"), ensure_ascii=False, default=str)),
                                             "file_status": status})
-            for r in out.reject_rows:
-                reject_rows_all.append({"filename": job["filename"], "target_table": f"{job['target_schema']}.{job['target_table']}",
-                                        "record_no": r.get("row_no"), "reason": r.get("reason"), "detail": r.get("detail"),
-                                        "row_data": clip_error(json.dumps(r.get("row"), ensure_ascii=False, default=str)),
-                                        "file_status": status})
 
     total_time = round(time.time() - t_start, 2)
     success_count = sum(1 for r in results if r["status"] == "SUCCESS")
@@ -576,7 +644,7 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true", help="Dry run: show what would be loaded without database writes")
     parser.add_argument("--reload", action="store_true", help="Force reloading/upserting files even if previously loaded")
     parser.add_argument("--max-rejects", type=int, default=DEFAULT_MAX_REJECTS,
-                        help=f"Fail (and roll back) a file when this many rows are rejected (default {DEFAULT_MAX_REJECTS}; 0 = never fail)")
+                        help=f"Fail (and roll back) a file when this many rows are rejected (default {DEFAULT_MAX_REJECTS} = never; only technical errors fail a file)")
     parser.add_argument("--fast-bulk", action="store_true",
                         help="Direct COPY for an empty table without constraints (fastest first load; one bad row fails the file)")
     parser.add_argument("--trigger-mode", choices=["auto", "replica", "disable"], default="auto",

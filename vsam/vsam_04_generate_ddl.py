@@ -71,6 +71,9 @@ CREATE TABLE IF NOT EXISTS sweep_ctl.load_log (
     loaded_at       timestamptz DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_sweep_vsam_target ON sweep_ctl.load_log (target_schema, target_table);
+ALTER TABLE sweep_ctl.load_log ADD COLUMN IF NOT EXISTS s3_last_modified text;
+ALTER TABLE sweep_ctl.load_log ADD COLUMN IF NOT EXISTS s3_etag          text;
+ALTER TABLE sweep_ctl.load_log ADD COLUMN IF NOT EXISTS s3_size          bigint;
 """
 
 

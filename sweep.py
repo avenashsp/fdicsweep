@@ -577,7 +577,7 @@ def main():
     o_load.add_argument("--min-size-mb", type=float, help="Filter files with size >= min_size_mb")
     o_load.add_argument("--dry-run", action="store_true", help="Simulate load")
     o_load.add_argument("--reload", action="store_true", help="Force reloading/upserting files even if previously loaded")
-    o_load.add_argument("--max-rejects", type=int, default=None, help="Fail a file when this many rows are rejected (default 10; 0 = never)")
+    o_load.add_argument("--max-rejects", type=int, default=None, help="Fail a file when this many rows are rejected (default 0 = never fail; N = fail the file at N rejects)")
     o_load.add_argument("--fast-bulk", action="store_true", help="Direct COPY into empty constraint-free tables (no bad-row isolation)")
     o_load.add_argument("--trigger-mode", choices=["auto", "replica", "disable"], default=None, help="How triggers are switched off while loading")
     o_load.add_argument("--bg", action="store_true", help="Run in background daemon")

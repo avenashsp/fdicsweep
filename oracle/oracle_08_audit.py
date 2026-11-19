@@ -727,7 +727,7 @@ def compare_views_and_triggers(db_connected, discrepancies, meta, pg_cat, schema
     return oracle_triggers, oracle_views, views_triggers_comparison
 
 
-def reconcile_row_counts(db_connected, discrepancies, exact_counts, meta, oracle_tables, pg_cat, pg_child_partitions, s3_loaded_map, s3_planned_map, schemas_filter, tables_filter):
+def reconcile_row_counts(db_connected, discrepancies, exact_counts, meta, oracle_tables, pg_cat, pg_child_partitions, s3_loaded_map, s3_planned_map, schemas_filter, tables_filter, s3_file_state=None):
     # -------------------------------------------------------------------------
     # LEVEL 8: Approximate Row Counts & S3 Parity Reconciliation
     # -------------------------------------------------------------------------
@@ -820,6 +820,17 @@ def reconcile_row_counts(db_connected, discrepancies, exact_counts, meta, oracle
             var_pct = "100%"
             parity_status = "LOADED_WITHOUT_LOG"
 
+        fstate = (s3_file_state or {}).get((s, t), {"current": 0, "changed": 0, "pending": 0})
+        if fstate["changed"] and db_connected:
+            parity_status = "S3_CHANGED_NOT_RELOADED"
+            discrepancies.append({
+                "Object_Category": "S3_FILE", "Target_Schema": s, "Target_Table": t,
+                "Object_Name": t, "Discrepancy_Type": "S3_FILE_CHANGED",
+                "Oracle_Expected": f"{fstate['changed']} file(s) re-delivered in S3 (LastModified/ETag/size differ from load_log)",
+                "Postgres_Actual": "previous version loaded",
+                "Actionable_Recommendation": f"Run Step 06 for {s}.{t}: changed files are reloaded automatically."
+            })
+
         row_count_audit.append({
             "target_schema": s,
             "target_table": t,
@@ -827,6 +838,9 @@ def reconcile_row_counts(db_connected, discrepancies, exact_counts, meta, oracle
             "count_method": count_method if db_connected else "N/A",
             "s3_mapped_files_planned": planned_info["files"],
             "s3_files_loaded": loaded_info["files"],
+            "s3_files_current": fstate["current"],
+            "s3_files_changed": fstate["changed"],
+            "s3_files_pending": fstate["pending"],
             "s3_loaded_rows": s3_loaded_rows,
             "oracle_source_rows": ora_source_rows if ora_source_rows is not None else "N/A",
             "row_difference": diff if db_connected else "N/A",

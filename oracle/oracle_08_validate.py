@@ -83,6 +83,7 @@ from sweep_common import (
     PGPORT,
     PGUSER,
 )
+from sweep_s3meta import has_meta, make_meta, meta_equal, meta_from_row
 from oracle.oracle_08_catalog import fetch_target_postgres_catalogs, test_db_connection
 from oracle.oracle_08_audit import (
     compare_columns, compare_constraints, compare_indexes, compare_schemas, compare_sequences,
@@ -185,7 +186,7 @@ def run_full_parity_audit(exact_counts=False, tables_filter=None, schemas_filter
         pg_cat = {
             "schemas": [], "tables": [], "columns": [], "constraints": [],
             "indexes": [], "sequences": [], "views": [], "triggers": [],
-            "load_log": [], "exact_row_counts": {}
+            "load_log": [], "load_log_files": [], "exact_row_counts": {}
         }
 
     # 3. Load S3 Planned File Mapping
@@ -194,15 +195,35 @@ def run_full_parity_audit(exact_counts=False, tables_filter=None, schemas_filter
     if not map_path.exists():
         map_path = ORACLE_OUTPUTS_DIR / "s3_file_map.csv"
     s3_planned_map = defaultdict(lambda: {"files": 0, "size_mb": 0.0})
+    s3_planned_files = defaultdict(list)
     if map_path.exists():
         with open(map_path, "r", encoding="utf-8") as f:
             for r in csv.DictReader(f):
+                s3_planned_files[((r.get("target_schema") or "").lower().strip(), (r.get("target_table") or "").lower().strip())].append(
+                    (r.get("uri"), meta_from_row(r)))
                 s = (r.get("target_schema") or "").lower().strip()
                 t = (r.get("target_table") or "").lower().strip()
                 size_mb = float(r.get("size_mb") or 0.0)
                 if s and t:
                     s3_planned_map[(s, t)]["files"] += 1
                     s3_planned_map[(s, t)]["size_mb"] += size_mb
+
+    # Same comparison as Step 06: a planned file is current only when load_log has a SUCCESS row whose stored
+    # LastModified + ETag + size all equal the file map; SUCCESS with different values = re-delivered, not reloaded.
+    stored_files = {r["uri"]: make_meta(r.get("s3_last_modified"), r.get("s3_etag"), r.get("s3_size"))
+                    for r in pg_cat.get("load_log_files", [])}
+    s3_file_state = {}
+    for key, files in s3_planned_files.items():
+        st = {"current": 0, "changed": 0, "pending": 0}
+        for uri, planned in files:
+            stored = stored_files.get(uri)
+            if stored is None:
+                st["pending"] += 1
+            elif not any(stored.values()) or not has_meta(planned) or meta_equal(stored, planned):
+                st["current"] += 1            # loaded (legacy rows without metadata count as current)
+            else:
+                st["changed"] += 1
+        s3_file_state[key] = st
 
     # S3 Loaded Log aggregation
     s3_loaded_map = {}
@@ -232,7 +253,7 @@ def run_full_parity_audit(exact_counts=False, tables_filter=None, schemas_filter
 
     oracle_triggers, oracle_views, views_triggers_comparison = compare_views_and_triggers(db_connected, discrepancies, meta, pg_cat, schemas_filter)
 
-    row_count_audit = reconcile_row_counts(db_connected, discrepancies, exact_counts, meta, oracle_tables, pg_cat, pg_child_partitions, s3_loaded_map, s3_planned_map, schemas_filter, tables_filter)
+    row_count_audit = reconcile_row_counts(db_connected, discrepancies, exact_counts, meta, oracle_tables, pg_cat, pg_child_partitions, s3_loaded_map, s3_planned_map, schemas_filter, tables_filter, s3_file_state)
 
     # -------------------------------------------------------------------------
     # LEVEL 9: Executive Summary Dashboard & Verdict
