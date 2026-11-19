@@ -1,4 +1,4 @@
-# SWEEP CLI Command Reference - Oracle Migration Track (v5.2.1)
+# SWEEP CLI Command Reference - Oracle Migration Track (v5.3.0)
 
 Complete command reference for the **Oracle Migration Track** of the SWEEP Unified Data Migration Framework.
 
@@ -359,3 +359,14 @@ python3 sweep.py oracle load-data --min-size-mb 100 --max-size-mb 1000 --workers
 # Stage 3: Load large chunk files (> 1000 MB) with lower concurrency
 python3 sweep.py oracle load-data --min-size-mb 1000 --workers 2 --bg
 ```
+
+### Step 06 robust load (v5.3.0)
+
+```bash
+python3 sweep.py oracle load-data --max-rejects 10          # default: file fails at 10 rejected rows
+python3 sweep.py oracle load-data --max-rejects 0           # never fail a file for rejected rows
+python3 sweep.py oracle load-data --fast-bulk               # direct COPY for empty, constraint-free tables
+python3 sweep.py oracle load-data --trigger-mode disable    # when session_replication_role is not permitted
+```
+
+Triggers do not fire during loads; bad rows (NOT NULL, CHECK, bad value, missing FK, alternate-key conflict) are written to `sweep_ctl.load_rejects` and to the `Reject_Summary` / `Rejected_Rows` sheets. Every file is loaded in one transaction and reconciled: `read = inserted + updated + unchanged + rejected + duplicates`.

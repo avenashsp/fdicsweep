@@ -58,8 +58,8 @@ def test_oracle_load_handles_hostile_filenames_without_executing_them(pg_db, gz_
     monkeypatch.chdir(tmp_path)
     _make_table("s1", "logs", "log_id int, msg text")
     p = gz_file(WEIRD, "log_id,msg\n1,a\n2,b\n")
-    status, rows, _, err = o6.load_single_file(_job(p, "s1", "logs"), worker_id=1)
-    assert (status, err) == ("SUCCESS", "") and rows == 2
+    out = o6.load_single_file(_job(p, "s1", "logs"), worker_id=1)
+    assert (out.status, out.error) == ("SUCCESS", "") and out.rows == 2
     assert not (tmp_path / "PWNED").exists()
     assert c.run_psql("SELECT count(*) FROM s1.logs", tuples_only=True) == "2"
     assert c.run_psql(f"SELECT count(*) FROM {c.LOAD_LOG_TABLE}", tuples_only=True) == "1"
@@ -71,8 +71,8 @@ def test_oracle_load_is_atomic_when_stream_is_truncated(pg_db, tmp_path):
     import gzip
     good = gzip.compress(("a,b\n" + "".join(f"{i},{i}\n" for i in range(5000))).encode())
     bad.write_bytes(good[: len(good) // 2])                    # truncated gzip -> pipeline fails mid-stream
-    status, rows, _, err = o6.load_single_file(_job(bad, "s1", "t"), worker_id=1)
-    assert status == "FAILED" and err
+    out = o6.load_single_file(_job(bad, "s1", "t"), worker_id=1)
+    assert out.status == "FAILED" and out.error
     assert c.run_psql("SELECT count(*) FROM s1.t", tuples_only=True) == "0"            # nothing committed
     assert c.run_psql(f"SELECT count(*) FROM {c.LOAD_LOG_TABLE}", tuples_only=True) == "0"
 
@@ -80,8 +80,8 @@ def test_oracle_load_is_atomic_when_stream_is_truncated(pg_db, tmp_path):
 def test_oracle_load_missing_column_fails_cleanly(pg_db, gz_file):
     _make_table("s1", "t2", "a int")
     p = gz_file("x.csv.gz", "a,nope\n1,2\n")
-    status, _, _, err = o6.load_single_file(_job(p, "s1", "t2"), worker_id=1)
-    assert status == "FAILED" and "nope" in err
+    out = o6.load_single_file(_job(p, "s1", "t2"), worker_id=1)
+    assert out.status == "FAILED" and "nope" in out.error
 
 
 def test_lookup_failures_are_not_mistaken_for_empty_or_pkless(pg_db, monkeypatch):

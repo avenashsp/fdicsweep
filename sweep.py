@@ -372,6 +372,9 @@ def handle_oracle(args):
         if getattr(args, "min_size_mb", None) is not None: c.extend(["--min-size-mb", str(args.min_size_mb)])
         if getattr(args, "dry_run", False): c.append("--dry-run")
         if getattr(args, "reload", False): c.append("--reload")
+        if getattr(args, "max_rejects", None) is not None: c.extend(["--max-rejects", str(args.max_rejects)])
+        if getattr(args, "fast_bulk", False): c.append("--fast-bulk")
+        if getattr(args, "trigger_mode", None): c.extend(["--trigger-mode", args.trigger_mode])
         run_or_bg("oracle_06_load_data", c, getattr(args, "bg", False))
 
     elif cmd in ("load-obj", "post-load"):
@@ -576,6 +579,9 @@ def main():
     o_load.add_argument("--min-size-mb", type=float, help="Filter files with size >= min_size_mb")
     o_load.add_argument("--dry-run", action="store_true", help="Simulate load")
     o_load.add_argument("--reload", action="store_true", help="Force reloading/upserting files even if previously loaded")
+    o_load.add_argument("--max-rejects", type=int, default=None, help="Fail a file when this many rows are rejected (default 10; 0 = never)")
+    o_load.add_argument("--fast-bulk", action="store_true", help="Direct COPY into empty constraint-free tables (no bad-row isolation)")
+    o_load.add_argument("--trigger-mode", choices=["auto", "replica", "disable"], default=None, help="How triggers are switched off while loading")
     o_load.add_argument("--bg", action="store_true", help="Run in background daemon")
 
     o_obj = o_sub.add_parser("load-obj", aliases=["post-load"], help="Step 07: Post-Load Keys, Indexes, Views, Triggers")

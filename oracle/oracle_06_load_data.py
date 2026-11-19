@@ -18,9 +18,11 @@ import os
 import re
 import sys
 import csv
+import json
 import time
 import argparse
 import threading
+from typing import NamedTuple
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from sweep_common import (
@@ -45,10 +47,16 @@ from sweep_common import (
     format_size_actual,
     DB_ERRORS,
 )
+from oracle.oracle_06_pipeline import (
+    build_fast_script, build_staged_script, ensure_reject_table, has_constraints, load_log_insert, load_table_meta,
+    parse_output, persist_failed_file_rejects, plan_load, probe_trigger_mode,
+)
 from sweep_streaming import read_stream_head, stream_program_literal
 from sweep_platform import atomic_write_json
 logger = get_logger("oracle_06_load_data", "oracle_06_load_data")
 LOCK = threading.Lock()
+MAX_REJECT_ROWS_IN_REPORT = 10000   # rows shown in the Rejected_Rows sheet; all are in sweep_ctl.load_rejects
+DEFAULT_MAX_REJECTS = 10      # the file fails when this many rows are rejected (0 = never)
 COL_CACHE = {}
 PK_CACHE = {}
 
@@ -162,10 +170,47 @@ def extract_file_header(uri, region=AWS_REGION):
     return [norm_col(c) for c in next(csv.reader([line]))]
 
 
-def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False):
+class LoadOutcome(NamedTuple):
+    """Result of one file load. The first four fields keep the old (status, rows, seconds, error) meaning."""
+    status: str
+    rows: int
+    seconds: float
+    error: str
+    inserted: int = 0
+    updated: int = 0
+    unchanged: int = 0
+    rejected: int = 0
+    duplicates: int = 0
+    read: int = 0
+    reject_summary: tuple = ()
+    reject_rows: tuple = ()
+    trigger_mode: str = ""
+
+
+META_CACHE = {}
+
+
+def get_table_meta(schema, table):
+    key = (schema.lower(), table.lower())
+    with LOCK:
+        if key in META_CACHE:
+            return META_CACHE[key]
+    meta = load_table_meta(schema, table)
+    with LOCK:
+        META_CACHE[key] = meta
+    return meta
+
+
+def _failed(error, sec=0.0, **extra):
+    return LoadOutcome("FAILED", 0, sec, error, **extra)
+
+
+def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False, max_rejects=DEFAULT_MAX_REJECTS,
+                     fast_bulk=False, trigger_mode="replica"):
     """
-    Loads one S3 file inside a dedicated database transaction.
-    Returns: (status, rows_loaded, duration_sec, error_message)
+    Loads one S3 file in ONE database transaction (see oracle_06_pipeline for the steps).
+    Bad rows are rejected and reported; the file fails (and rolls back completely) only when the number of
+    rejected rows reaches `max_rejects` or the row-count check does not add up.
     """
     uri = job["uri"]
     schema = job["target_schema"].lower()
@@ -174,90 +219,62 @@ def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False):
     file_format = job.get("file_format", "gzip")
 
     if dry_run:
-        return "DRY_RUN", 0, 0.0, ""
+        return LoadOutcome("DRY_RUN", 0, 0.0, "")
 
     t0 = time.time()
     size_mb_val = float(job.get("size_mb") or (size_bytes / (1024**2)))
     record_stream_start(worker_id, job, size_mb_val)
     try:
         header_cols = extract_file_header(uri, region)
-        target_cols = get_target_columns(schema, table)
+        meta = get_table_meta(schema, table)
+        if not meta["columns"]:
+            return _failed(f"Target table {schema}.{table} does not exist in PostgreSQL.")
+        plan, problem = plan_load(meta, header_cols)
+        if problem:
+            return _failed(problem)
 
-        if not target_cols:
-            return "FAILED", 0, 0.0, f"Target table {schema}.{table} does not exist in PostgreSQL."
-
-        # Verify header columns
-        missing_cols = [c for c in header_cols if c not in target_cols]
-        if missing_cols:
-            return "FAILED", 0, 0.0, f"Columns in S3 file not found in table: {', '.join(missing_cols[:5])}"
-
-        # Determine whether to bulk copy or upsert
-        pk_cols = get_table_pk_columns(schema, table)
-        table_empty = is_table_empty(schema, table)
-        can_upsert = (not table_empty) and bool(pk_cols)
-
-        col_list_str = ", ".join(q(c) for c in header_cols)
         stream_cmd = stream_program_literal(uri, region)
+        log_sql = load_log_insert(uri, schema, table, size_bytes, file_format, worker_id)
+        name = job.get("filename", Path(uri).name)
 
-        if not can_upsert:
-            if not table_empty and not pk_cols:
-                logger.info(f"[Worker {worker_id}] Started stream: {job.get('filename', Path(uri).name)} ({format_size_actual(size_mb_val)}) -> {schema}.{table} (append load - no PK constraint)")
-            else:
-                logger.info(f"[Worker {worker_id}] Started stream: {job.get('filename', Path(uri).name)} ({format_size_actual(size_mb_val)}) -> {schema}.{table} (bulk load - empty table)")
-
-            sql_script = (
-                f"BEGIN;\n"
-                f"\\copy {q(schema)}.{q(table)} ({col_list_str}) FROM PROGRAM '{stream_cmd}' "
-                f"WITH (FORMAT csv, HEADER true, ENCODING 'UTF8');\n"
-                f"INSERT INTO {LOAD_LOG_TABLE} (uri, target_schema, target_table, size_bytes, file_format, worker_id, status) "
-                f"VALUES ({lit(uri)}, {lit(schema)}, {lit(table)}, {size_bytes}, {lit(file_format)}, {worker_id}, 'SUCCESS') "
-                f"ON CONFLICT (uri) DO UPDATE SET loaded_at = now(), status = 'SUCCESS', size_bytes = EXCLUDED.size_bytes;\n"
-                f"COMMIT;\n"
-            )
+        use_fast = fast_bulk and not has_constraints(meta) and is_table_empty(schema, table)
+        if use_fast:
+            logger.info(f"[Worker {worker_id}] Started stream: {name} ({format_size_actual(size_mb_val)}) -> {schema}.{table} (fast bulk - empty table without constraints)")
+            script = build_fast_script(schema, table, header_cols, stream_cmd, meta, trigger_mode, log_sql)
         else:
-            pk_set = set(pk_cols)
-            update_cols = [c for c in header_cols if c not in pk_set]
-            pk_conflict_str = ", ".join(q(c) for c in pk_cols)
-
-            if update_cols:
-                set_clause = ", ".join(f"{q(c)} = EXCLUDED.{q(c)}" for c in update_cols)
-                on_conflict_clause = f"ON CONFLICT ({pk_conflict_str}) DO UPDATE SET {set_clause}"
-            else:
-                on_conflict_clause = f"ON CONFLICT ({pk_conflict_str}) DO NOTHING"
-
-            logger.info(f"[Worker {worker_id}] Started stream: {job.get('filename', Path(uri).name)} ({format_size_actual(size_mb_val)}) -> {schema}.{table} (upsert load on PK: {', '.join(pk_cols)})")
-
-            sql_script = (
-                f"BEGIN;\n"
-                f"CREATE TEMP TABLE _stg_load (LIKE {q(schema)}.{q(table)} INCLUDING DEFAULTS) ON COMMIT DROP;\n"
-                f"\\copy _stg_load ({col_list_str}) FROM PROGRAM '{stream_cmd}' "
-                f"WITH (FORMAT csv, HEADER true, ENCODING 'UTF8');\n"
-                f"INSERT INTO {q(schema)}.{q(table)} ({col_list_str}) "
-                f"SELECT DISTINCT ON ({pk_conflict_str}) {col_list_str} FROM _stg_load "
-                f"ORDER BY {pk_conflict_str} "
-                f"{on_conflict_clause};\n"
-                f"INSERT INTO {LOAD_LOG_TABLE} (uri, target_schema, target_table, size_bytes, file_format, worker_id, status) "
-                f"VALUES ({lit(uri)}, {lit(schema)}, {lit(table)}, {size_bytes}, {lit(file_format)}, {worker_id}, 'SUCCESS') "
-                f"ON CONFLICT (uri) DO UPDATE SET loaded_at = now(), status = 'SUCCESS', size_bytes = EXCLUDED.size_bytes;\n"
-                f"COMMIT;\n"
-            )
+            how = f"upsert on {', '.join(plan['arbiter']['cols'])}" if plan["arbiter"] else "append - no key"
+            logger.info(f"[Worker {worker_id}] Started stream: {name} ({format_size_actual(size_mb_val)}) -> {schema}.{table} (staged load, {how}; triggers off via {trigger_mode})")
+            for skipped in plan["skipped_checks"]:
+                logger.warning(f"[Worker {worker_id}] CHECK {skipped} references columns that are not in the file; the table still enforces it")
+            script = build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trigger_mode, max_rejects, uri, log_sql)
 
         # High-performance bulk load options. psql runs in its own process group, with a hard
         # timeout (SWEEP_LOAD_TIMEOUT) that also kills the S3/gzip pipeline it spawned.
         res = run_psql_script(
-            sql_script,
+            script,
             options="-c synchronous_commit=off -c statement_timeout=0 -c lock_timeout=0",
         )
         sec = round(time.time() - t0, 2)
+        counts, summary, reject_rows = parse_output(res.stdout)
+        extra = dict(rejected=counts.get("rejected", 0), duplicates=counts.get("dup", 0), read=counts.get("raw", 0),
+                     reject_summary=tuple(summary), reject_rows=tuple(reject_rows), trigger_mode=trigger_mode)
 
         if res.returncode != 0:
-            # the whole psql message (ERROR + DETAIL + CONTEXT lines), clipped only at the report-cell limit
             err = clip_error(res.stderr or res.stdout or "psql failed")
-            return "FAILED", 0, sec, err
+            if reject_rows:       # the transaction rolled back; keep the rejected rows for review
+                try:
+                    persist_failed_file_rejects(uri, schema, table, reject_rows)
+                except RuntimeError as e:
+                    logger.warning(f"[Worker {worker_id}] Could not store the rejected rows of {uri}: {e}")
+            return _failed(err, sec, **extra)
 
-        # Extract loaded rows from COPY output
-        m = re.search(r"(?:COPY|INSERT\s+\d+)\s+(\d+)", res.stdout)
-        rows = int(m.group(1)) if m else 0
+        if use_fast:
+            m = re.search(r"COPY\s+(\d+)", res.stdout)
+            rows = int(m.group(1)) if m else 0
+            counts = {"raw": rows, "inserted": rows}
+            extra.update(read=rows)
+        inserted, updated = counts.get("inserted", 0), counts.get("updated", 0)
+        rows = inserted + updated
 
         # Update loaded_rows and seconds
         try:
@@ -267,16 +284,19 @@ def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False):
             # Data and its load_log row are already committed; only the stats update failed.
             logger.warning(f"[Worker {worker_id}] Could not record row count for {uri}: {e}")
 
-        return "SUCCESS", rows, sec, ""
+        if extra["rejected"]:
+            logger.warning(f"[Worker {worker_id}] {name}: {extra['rejected']} row(s) rejected (see sweep_ctl.load_rejects / the report)")
+        return LoadOutcome("SUCCESS", rows, sec, "", inserted=inserted, updated=updated,
+                           unchanged=counts.get("unchanged", 0), **extra)
     except Exception as e:  # noqa: BLE001 - a worker must report any failure, never crash the pool
         logger.error(f"[Worker {worker_id}] Load failed for {uri}: {e}")
-        sec = round(time.time() - t0, 2)
-        return "FAILED", 0, sec, clip_error(e)
+        return _failed(clip_error(e), round(time.time() - t0, 2))
     finally:
         record_stream_end(worker_id)
 
 
-def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=None, file_uri=None, filename=None, limit_files=None, max_size_mb=None, min_size_mb=None, dry_run=False, gate_pass=False, reload=False):
+def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=None, file_uri=None, filename=None, limit_files=None, max_size_mb=None, min_size_mb=None, dry_run=False, gate_pass=False, reload=False,
+                    max_rejects=DEFAULT_MAX_REJECTS, fast_bulk=False, trigger_mode="auto"):
     ts = get_timestamp()
     if not has_db_auth():
         logger.error(AUTH_HELP)
@@ -403,7 +423,19 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
         logger.info("All planned files have already been loaded into PostgreSQL. Nothing to do.")
         return True
 
+    if not dry_run:
+        ensure_reject_table()
+        if trigger_mode == "auto":
+            trigger_mode = probe_trigger_mode()
+        logger.info(f"Triggers are switched off per load transaction via: {trigger_mode} "
+                    f"({'session_replication_role = replica' if trigger_mode == 'replica' else 'ALTER TABLE ... DISABLE TRIGGER (table lock until commit)'})")
+        logger.info(f"A file fails when {max_rejects} rejected rows are reached (0 = never); fast bulk: {fast_bulk}")
+    else:
+        trigger_mode = trigger_mode if trigger_mode != "auto" else "replica"
+
     results = []
+    reject_summary_rows = []
+    reject_rows_all = []
     completed_files = 0
     total_loaded_rows = 0
     total_loaded_bytes = 0
@@ -413,12 +445,14 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
         futures = {}
         for idx, job in enumerate(pending_jobs):
             worker_id = (idx % workers) + 1
-            f = executor.submit(load_single_file, job, worker_id, dry_run=dry_run)
+            f = executor.submit(load_single_file, job, worker_id, dry_run=dry_run, max_rejects=max_rejects,
+                                fast_bulk=fast_bulk, trigger_mode=trigger_mode)
             futures[f] = job
 
         for future in as_completed(futures):
             job = futures[future]
-            status, rows, sec, msg = future.result()
+            out = future.result()
+            status, rows, sec, msg = out.status, out.rows, out.seconds, out.error
             completed_files += 1
 
             if status == "SUCCESS":
@@ -426,7 +460,8 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
                 total_loaded_bytes += int(job.get("size_bytes") or 0)
                 rate = round(rows / sec) if sec > 0 else 0
                 logger.info(f"[{completed_files}/{len(pending_jobs)}] OK: {job['filename']} -> "
-                            f"{job['target_schema']}.{job['target_table']} ({rows:,} rows in {sec}s ~ {rate:,} r/s)")
+                            f"{job['target_schema']}.{job['target_table']} ({rows:,} rows in {sec}s ~ {rate:,} r/s; "
+                            f"inserted {out.inserted:,}, updated {out.updated:,}, rejected {out.rejected:,}, duplicates dropped {out.duplicates:,})")
             elif status == "DRY_RUN":
                 logger.info(f"[{completed_files}/{len(pending_jobs)}] DRY-RUN: {job['filename']} -> "
                             f"{job['target_schema']}.{job['target_table']} ({job['size_mb']} MB)")
@@ -442,10 +477,25 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
                 "file_format": job.get("file_format", "gzip"),
                 "status": status,
                 "loaded_rows": rows,
+                "rows_read": out.read,
+                "rows_inserted": out.inserted,
+                "rows_updated": out.updated,
+                "rows_unchanged": out.unchanged,
+                "rows_rejected": out.rejected,
+                "duplicates_dropped": out.duplicates,
                 "duration_seconds": sec,
                 "error_message": msg,
                 "uri": job["uri"]
             })
+            for g in out.reject_summary:
+                reject_summary_rows.append({"filename": job["filename"], "target_table": f"{job['target_schema']}.{job['target_table']}",
+                                            "reason": g.get("reason"), "detail": g.get("detail"), "rows": g.get("n"),
+                                            "file_status": status})
+            for r in out.reject_rows:
+                reject_rows_all.append({"filename": job["filename"], "target_table": f"{job['target_schema']}.{job['target_table']}",
+                                        "record_no": r.get("row_no"), "reason": r.get("reason"), "detail": r.get("detail"),
+                                        "row_data": clip_error(json.dumps(r.get("row"), ensure_ascii=False, default=str)),
+                                        "file_status": status})
 
     total_time = round(time.time() - t_start, 2)
     success_count = sum(1 for r in results if r["status"] == "SUCCESS")
@@ -471,9 +521,21 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
         {"Metric": "Overall Throughput", "Value": f"{round(total_loaded_rows / max(total_time, 0.1)):,} rows/sec"}
     ]
 
+    total_rejected = sum(r.get("rows_rejected", 0) for r in results)
+    total_dups = sum(r.get("duplicates_dropped", 0) for r in results)
+    summary_sheet += [
+        {"Metric": "Rows Rejected (bad rows)", "Value": total_rejected},
+        {"Metric": "Duplicate Rows Dropped (in-file, last row wins)", "Value": total_dups},
+        {"Metric": "Reject Limit Per File", "Value": max_rejects if max_rejects else "none"},
+        {"Metric": "Trigger Handling", "Value": trigger_mode},
+    ]
+    empty_summary = [{"filename": "NONE", "target_table": "NONE", "reason": "No rows were rejected or dropped", "detail": "", "rows": 0, "file_status": ""}]
+    empty_rows = [{"filename": "NONE", "target_table": "NONE", "record_no": 0, "reason": "No rows were rejected", "detail": "", "row_data": "", "file_status": ""}]
     sheets = {
         "Summary": summary_sheet,
-        "File_Execution_Details": results
+        "File_Execution_Details": results,
+        "Reject_Summary": reject_summary_rows or empty_summary,
+        "Rejected_Rows": reject_rows_all[:MAX_REJECT_ROWS_IN_REPORT] or empty_rows,
     }
     generate_excel_report(report_file, sheets)
     logger.info(f"Excel report generated: {report_file}")
@@ -513,6 +575,13 @@ if __name__ == "__main__":
     parser.add_argument("--min-size-mb", type=float, help="Filter files with size >= min_size_mb")
     parser.add_argument("--dry-run", action="store_true", help="Dry run: show what would be loaded without database writes")
     parser.add_argument("--reload", action="store_true", help="Force reloading/upserting files even if previously loaded")
+    parser.add_argument("--max-rejects", type=int, default=DEFAULT_MAX_REJECTS,
+                        help=f"Fail (and roll back) a file when this many rows are rejected (default {DEFAULT_MAX_REJECTS}; 0 = never fail)")
+    parser.add_argument("--fast-bulk", action="store_true",
+                        help="Direct COPY for an empty table without constraints (fastest first load; one bad row fails the file)")
+    parser.add_argument("--trigger-mode", choices=["auto", "replica", "disable"], default="auto",
+                        help="How triggers are switched off during a load: session_replication_role=replica (no table lock), "
+                             "or ALTER TABLE DISABLE TRIGGER (needs table ownership, locks the table). auto = replica if allowed")
     args = parser.parse_args()
 
     tables = {t.strip().upper() for t in args.tables.split(",")} if args.tables else None
@@ -528,6 +597,9 @@ if __name__ == "__main__":
         min_size_mb=args.min_size_mb,
         dry_run=args.dry_run,
         gate_pass=args.gate_pass,
-        reload=args.reload
+        reload=args.reload,
+        max_rejects=args.max_rejects,
+        fast_bulk=args.fast_bulk,
+        trigger_mode=args.trigger_mode,
     )
     sys.exit(0 if ok else 1)

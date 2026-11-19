@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [5.3.0] - 2026-11-19
+
+Oracle Step 06 robust load release. The VSAM track is unchanged apart from the shared control-schema DDL.
+
+### Added
+- **Triggers are off while code loads data.** Each file load runs `SET LOCAL session_replication_role = replica` (transaction-scoped, no table lock), so user triggers do not fire and are back on automatically at commit/rollback. When the role may not set it (non-superuser), the load falls back to `ALTER TABLE ... DISABLE TRIGGER <name>` / `ENABLE TRIGGER` inside the same transaction (locks the table until commit; needs ownership). `--trigger-mode auto|replica|disable` (default `auto`, probed once per run). `modifiedby` / `modifieddate` are set explicitly on updates because the audit trigger no longer runs.
+- **Alternate / composite unique keys** are part of dedup and conflict handling: duplicates inside a file are collapsed on the conflict key (last row wins); a row whose alternate key already belongs to a *different* existing row is rejected (`ALT_KEY_CONFLICT`) rather than updating the wrong row.
+- **Relaxed staging + validation of staged rows.** The stage table has no NOT NULL / CHECK / defaults; rows are validated before touching the target for `NOT_NULL`, `CHECK`, `BAD_VALUE` (`pg_input_is_valid`, PostgreSQL 16+), `FK_MISSING`.
+- **Bad rows are reported, not fatal.** Rejected rows are stored in `sweep_ctl.load_rejects` (reason, detail, row number, row as JSON) and shown in new Excel sheets `Reject_Summary` and `Rejected_Rows`; the file still loads in **ONE transaction** (data + `load_log` commit together). A file **fails and rolls back completely when 10 rows are rejected** (`--max-rejects N`, default 10, `0` = never fail); in-file duplicates are not failures. Files with rejects below the limit stay `SUCCESS` and the exit code is unchanged.
+- **Row-count reconciliation** per file: `read = inserted + updated + unchanged + rejected + duplicates`; a mismatch aborts and rolls back the file. New columns in `File_Execution_Details`: `rows_read`, `rows_inserted`, `rows_updated`, `rows_unchanged`, `rows_rejected`, `duplicates_dropped`; new Summary metrics.
+- **One pipeline for every load** (always staged, new module `oracle/oracle_06_pipeline.py`). `--fast-bulk` opts in to the old direct `COPY` for empty tables without constraints (fastest initial load; one bad row fails the file).
+- `sweep_ctl.load_rejects` added to both `sweep_meta.sql` files; new tests `tests/test_oracle_load_pipeline.py`.
+
+### Changed
+- `oracle_06_load_data.load_single_file` returns a `LoadOutcome` (status, rows, seconds, error + counts).
+- Staging temp tables live on instance-local storage, so size ~ file size; use `--fast-bulk` for very large initial loads.
+- Version 5.3.0; changelog renamed `CHANGELOG_v5.3.0.md`.
+
+---
+
 ## [5.2.1] - 2026-11-19
 
 ### Changed

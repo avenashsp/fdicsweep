@@ -274,4 +274,17 @@ DO $$ BEGIN
     END IF;
 END $$;
 
-
+-- Rows rejected during Oracle Step 06 loads (bad rows are reported, not fatal)
+CREATE TABLE IF NOT EXISTS sweep_ctl.load_rejects (
+    id            bigserial PRIMARY KEY,
+    uri           text NOT NULL,
+    target_schema text,
+    target_table  text,
+    row_no        bigint,
+    reason        text NOT NULL,
+    detail        text,
+    row_data      jsonb,
+    file_status   text DEFAULT 'LOADED',
+    rejected_at   timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sweep_load_rejects_uri ON sweep_ctl.load_rejects (uri);
