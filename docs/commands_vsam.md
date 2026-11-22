@@ -1,4 +1,6 @@
-# SWEEP CLI Command Reference - VSAM Migration Track (v5.4.0)
+# SWEEP CLI Command Reference - VSAM Migration Track (v6.0.0)
+
+> **6.0.0:** Steps 05-07 need `--layer` (Step 06 only `--layer bronze`); VSAM 04 / 05 refuse gold / gold_backup without `--allow-ddl`; VSAM 01 has `--copybook`, VSAM 04 / 05 accept `--tables` / `--schemas`, VSAM 06 accepts `--file` / `--filename` / `--exclude-tables`; every step accepts `--dry-run`; targeted runs merge their outputs. Step 06 writes `sweep_ctl.vsam_load_log` (PK `uri, target_schema`, real URI), registers a delta per destination schema (a keyless snapshot replace is registered as a full copy) and loads again when a table it loaded into is empty. Step 04 never applies a key taken from the Step 03 profile. See [layers_and_promote.md](layers_and_promote.md) and [targeting_and_outputs.md](targeting_and_outputs.md).
 
 Complete command reference for the **VSAM Migration Track** of the SWEEP Unified Data Migration Framework.
 
@@ -263,15 +265,15 @@ Per file, inside one `BEGIN ... COMMIT`:
 3. bad rows are rejected and recorded (see *Rejected rows*);
 4. typed temp table, then the upsert (keyed tables) or the snapshot replace (tables without a key);
 5. row-count check `read = inserted + updated + unchanged + rejected + duplicates`, otherwise the file rolls back;
-6. rejected rows go to `sweep_ctl.load_rejects`, the `sweep_ctl.load_log` rows (with the S3 metadata) are written, `COMMIT`.
+6. rejected rows go to `sweep_ctl.load_rejects`, the `sweep_ctl.vsam_load_log` rows (with the S3 metadata) are written and the applied delta is registered, `COMMIT`.
 
 **Keys.** Only a primary key from the copybook KEY group (every key column an ACCEPTED match) or from `korg_overrides` is applied - never a guessed one. The key is applied to the destination tables before the load; if it cannot be applied (for example duplicates in the data, or key columns missing from the file) that is an **error**: the source is not loaded (Step 03 reports `PK_ERROR`, Step 06 fails the file). A file without a copybook is loaded **without** a key.
 
 **Keyed tables** are upserted: `INSERT ... ON CONFLICT (key) DO UPDATE ... WHERE (table columns) IS DISTINCT FROM (file columns)`, so only rows that actually differ are updated (`inserted`, `updated`, `unchanged` are counted separately). Rows missing from a newer snapshot are **never deleted**.
 
-**Tables without a key (snapshot replace).** VSAM files are full snapshots, so a keyless table is **replaced**. All files that feed one keyless table are loaded in a **single transaction on one connection** (one `\copy` per file into temp tables, then `TRUNCATE` + `INSERT`, the load_log rows and `COMMIT`). If any file of the table fails, the whole transaction rolls back and the table keeps its old data (every file of the table is reported `FAILED`).
+**Tables without a key (snapshot replace).** VSAM files are full snapshots, so a keyless table is **replaced**. All files that feed one keyless table are loaded in a **single transaction on one connection** (one `\copy` per file into temp tables, then `TRUNCATE` + `INSERT`, the vsam_load_log rows and `COMMIT`). If any file of the table fails, the whole transaction rolls back and the table keeps its old data (every file of the table is reported `FAILED`).
 
-**Which files are loaded.** Only the newest version per (company, source file). A file counts as already loaded only when `sweep_ctl.load_log` has `SUCCESS` rows for it and the stored S3 `LastModified`, `ETag` and size all equal what S3 reports now (Step 06 checks the object right before loading and stores the values). A changed file is reloaded even with the same name and path; `--reload` forces a reload. A keyless shared table reloads **all** of its files whenever **any** one of them changed; keyed tables load only the changed files. A file older than a snapshot of the same source that is already loaded is `SKIPPED`.
+**Which files are loaded.** Only the newest version per (company, source file). A file counts as already loaded only when `sweep_ctl.vsam_load_log` has `SUCCESS` rows for it, the stored S3 `LastModified`, `ETag` and size all equal what S3 reports now (Step 06 checks the object right before loading and stores the values) **and every table it loaded rows into still holds rows** (a table somebody truncated by hand is loaded again). A changed file is reloaded even with the same name and path; `--reload` forces a reload. A keyless shared table reloads **all** of its files whenever **any** one of them changed; keyed tables load only the changed files. A file older than a snapshot of the same source that is already loaded is `SKIPPED`.
 
 In a **partial run** (`--company`, `--tables`, `--limit-files`) other source files of a shared keyless table may be missing, so replacing a table that already holds rows needs `--force-truncate`. Full runs need no flag.
 
@@ -347,7 +349,7 @@ python3 -m vsam.vsam_06_load_data --workers 4
 
 ### Step 07: End-to-End Validation & Parity Audit (`validate` / `verify`)
 Performs thorough reconciliation and audit:
-- Reconciles S3 files against `sweep_ctl.load_log`.
+- Reconciles S3 files against `sweep_ctl.vsam_load_log`.
 - Executes exact PostgreSQL row counts (`COUNT(*)` with `--exact-counts`).
 - Verifies column structures, data types, lengths, precision, scale, and PK constraint status against copybook specifications (or reports `TABLE_UNCONSTRAINED` if PK constraints were not deployed). Tables whose columns were inferred from the data (no copybook) are audited too.
 - A file routed entirely to the fallback `bcs` schema counts as loaded.

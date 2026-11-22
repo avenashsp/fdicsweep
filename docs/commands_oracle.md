@@ -1,4 +1,6 @@
-# SWEEP CLI Command Reference - Oracle Migration Track (v5.4.0)
+# SWEEP CLI Command Reference - Oracle Migration Track (v6.0.0)
+
+> **6.0.0:** Steps 05-08 need `--layer` (Step 06 only `--layer bronze`); Steps 04, 05 and 07 refuse gold / gold_backup without `--allow-ddl`; Oracle 05 and 07 accept `--tables`; every step accepts `--tables`, `--schemas` / `--owners`, `--exclude-tables`, `--dry-run` (Oracle 02, 03, 06 also `--file` / `--filename`); targeted runs merge their outputs. Step 06 writes `sweep_ctl.oracle_load_log`, captures the applied delta for `promote` and loads again when the target table is empty. See [layers_and_promote.md](layers_and_promote.md) and [targeting_and_outputs.md](targeting_and_outputs.md).
 
 Complete command reference for the **Oracle Migration Track** of the SWEEP Unified Data Migration Framework.
 
@@ -215,7 +217,7 @@ python3 -m oracle.oracle_05_apply_ddl --schemas BSS01001
 ```
 
 * **Inputs**: `oracle/inputs/sweep_meta.sql`, `oracle/outputs/pre_load/*_tables.sql`
-* **Target DB**: Provisions `sweep_ctl.load_log`, target schemas, and bare tables
+* **Target DB**: Provisions the `sweep_ctl` control tables (`oracle_load_log`, `vsam_load_log`, ...), target schemas, and bare tables
 * **Exit code**: non-zero if any DDL script failed (the remaining scripts are still attempted and listed in the report)
 * **Report**: `oracle/reports/<db>_oracle_05_apply_ddl_report_<timestamp>.xlsx`
 * **Log**: `oracle/logs/<db>_oracle_05_apply_ddl_<timestamp>.log`
@@ -261,13 +263,13 @@ python3 -m oracle.oracle_06_load_data --workers 4 --bg
 ```
 
 * **Inputs**: S3 CSV files, `oracle/outputs/oracle_02_s3_file_map.csv`, the foreign keys of `oracle/outputs/metadata/oracle_01_metadata_constraints.csv`, `sweep_stream.sh`
-* **Outputs**: Data committed to Aurora PostgreSQL; audit logged in `sweep_ctl.load_log`; rejected rows in `sweep_ctl.load_rejects`
+* **Outputs**: Data committed to Aurora PostgreSQL; audit logged in `sweep_ctl.oracle_load_log`; rejected rows in `sweep_ctl.load_rejects`
 * **Load order**: parent tables first. The dependency graph comes from the foreign keys extracted in Step 01 (the target tables have none yet on Day-1) plus any live foreign keys in PostgreSQL. Tables are loaded **level by level** (level 0 = tables that reference nobody); all files of a level finish before the next level starts, with parallel workers inside a level. Self-references and cycles share one level. Foreign keys stay enabled and the `FK_MISSING` check stays; the ordering removes the false orphans. With `--fast-bulk` the files are loaded smallest to largest instead.
-* **Which files**: a file counts as already loaded only when `sweep_ctl.load_log` has a `SUCCESS` row whose stored S3 `LastModified`, `ETag` and size (columns `s3_last_modified`, `s3_etag`, `s3_size`) all equal what S3 reports now. Step 02 writes them to the file map; Step 06 re-checks the object (HEAD) right before loading and stores what it saw, so a stale file map does not matter. A re-delivered file (same name and path, different metadata) is loaded again; `--reload`, `--file` and `--filename` force a load. Rows from earlier versions without metadata are treated as loaded (use `--reload` to re-verify them). `load_log` keeps one row per URI.
+* **Which files**: a file counts as already loaded only when `sweep_ctl.oracle_load_log` has a `SUCCESS` row whose stored S3 `LastModified`, `ETag` and size (columns `s3_last_modified`, `s3_etag`, `s3_size`) all equal what S3 reports now **and the target table is not empty** (a table somebody truncated by hand is loaded again). Step 02 writes them to the file map; Step 06 re-checks the object (HEAD) right before loading and stores what it saw, so a stale file map does not matter. A re-delivered file (same name and path, different metadata) is loaded again; `--reload`, `--file` and `--filename` force a load. Rows from earlier versions without metadata are treated as loaded (use `--reload` to re-verify them). `oracle_load_log` keeps one row per URI.
 * **Triggers**: switched off for the load transaction (`SET LOCAL session_replication_role = replica`, or `DISABLE TRIGGER` / `ENABLE TRIGGER` inside the transaction as a fallback - `--trigger-mode`), so audit columns are set explicitly on updates.
 * **Upsert**: `INSERT ... ON CONFLICT (key) DO UPDATE ... WHERE (target columns) IS DISTINCT FROM (file columns)` - only rows that actually differ are updated. A `modifieddate` / `modifiedby` that comes from the file is source data and counts as a change. Counts: `inserted`, `updated`, `unchanged` (identical rows, not touched), `rejected`, `duplicates` (in-file, last row wins); `read = inserted + updated + unchanged + rejected + duplicates` is checked before the commit.
 * **Bad rows**: `NOT_NULL`, `CHECK`, `BAD_VALUE`, `FK_MISSING` and `ALT_KEY_CONFLICT` rows are rejected, not fatal; they are listed in `sweep_ctl.load_rejects` and the `Reject_Summary` / `Rejected_Rows` sheets. **By default (`--max-rejects 0`) rejected rows never fail a file**; only technical errors (a row-count mismatch, a broken stream) roll it back. `--max-rejects N` fails and rolls back a file at N rejected rows.
-* **Atomicity**: each file is one transaction (staging, validation, upsert, `load_log` row, `COMMIT`); a failed or truncated stream leaves no rows behind. File names are shell-quoted, so keys with spaces, quotes or `;` are safe.
+* **Atomicity**: each file is one transaction (staging, validation, upsert, `oracle_load_log` row, delta capture, `COMMIT`); a failed or truncated stream leaves no rows behind. File names are shell-quoted, so keys with spaces, quotes or `;` are safe.
 * **Safety**: a failed "is the table empty?" / "does it have a PK?" lookup fails the file instead of guessing. Each file is bounded by `SWEEP_LOAD_TIMEOUT` (default 6 h). PostgreSQL 16 or later is required (`pg_input_is_valid`).
 * **Exit code**: non-zero if any file failed
 * **Report**: `oracle/reports/<db>_oracle_06_load_data_report_<timestamp>.xlsx`
@@ -330,7 +332,7 @@ python3 sweep.py oracle validate --file oracle/inputs/oracle_dump/oracle_master_
 python3 -m oracle.oracle_08_validate --exact-counts
 ```
 
-* **Inputs**: Oracle metadata extracts, PostgreSQL catalog, `sweep_ctl.load_log`
+* **Inputs**: Oracle metadata extracts, PostgreSQL catalog, `sweep_ctl.oracle_load_log`
 * **Outputs**: Multi-tab parity audit Excel report (10 tabs, see `docs/sweep_outputs.md`)
 * **Exit code**: `0` only when the audit verdict is `PASS - 100% PARITY ACHIEVED`; `1` otherwise
 * **Report**: `oracle/reports/<db>_oracle_08_validate_report_<timestamp>.xlsx`
@@ -349,7 +351,7 @@ python3 sweep.py status
 python3 sweep.py stop --kill-db
 
 # 3. Resume ingestion:
-# The loader automatically checks sweep_ctl.load_log and skips already loaded files!
+# The loader automatically checks sweep_ctl.oracle_load_log and skips already loaded files!
 python3 sweep.py oracle load-data --workers 4 --bg
 ```
 
@@ -365,7 +367,7 @@ python3 sweep.py oracle load-data --min-size-mb 100 --max-size-mb 1000 --workers
 python3 sweep.py oracle load-data --min-size-mb 1000 --workers 2 --bg
 ```
 
-### Step 06 options (v5.4.0)
+### Step 06 options (v6.0.0)
 
 ```bash
 python3 sweep.py oracle load-data                           # default: rejected rows never fail a file (--max-rejects 0)

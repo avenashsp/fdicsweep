@@ -490,6 +490,10 @@ def promote(from_layer, to_layer, tables=None, full=False, dry_run=False, worker
     with use_layer(tgt):
         from sweep_layers import verify_database
         verify_database(tgt)
+        try:
+            c.check_postgres_version()      # the staged script validates values with pg_input_is_valid (PostgreSQL 16+)
+        except RuntimeError as e:
+            raise LayerError(str(e))
         for lay, dbname in ((src, src.database), (tgt, tgt.database)):
             done = {int(r["version"]) for r in query_db_dicts("SELECT version FROM sweep_ctl.schema_version", dbname=dbname)} \
                 if _has_version_table(dbname) else set()

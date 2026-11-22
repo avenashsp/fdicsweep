@@ -1,4 +1,4 @@
-# SWEEP Migration Framework - Complete CLI Flags Reference (v5.4.0)
+# SWEEP Migration Framework - Complete CLI Flags Reference (v6.0.0)
 
 Complete flags reference for all CLI commands and python scripts in the **SWEEP Unified Data Migration Framework** across both **Oracle** and **VSAM** tracks.
 
@@ -16,15 +16,15 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 
 | Step | Script / Command | Available Flags |
 | :---: | :--- | :--- |
-| **01** | `oracle.oracle_01_extract_mtd`<br>`python3 sweep.py oracle extract` | `'--file FILE'`, `'--owners OWNERS'`, `'--bg'`, `'-h, --help'` |
-| **02** | `oracle.oracle_02_inventory`<br>`python3 sweep.py oracle inventory` | `'--s3 S3'`, `'--owners OWNERS'`, `'--tables TABLES'`, `'--bg'`, `'-h, --help'` |
-| **03** | `oracle.oracle_03_type_gate`<br>`python3 sweep.py oracle gate` | `'--rows ROWS'`, `'--tables TABLES'`, `'--max-tables MAX_TABLES'`, `'--bg'`, `'-h, --help'` |
-| **04** | `oracle.oracle_04_generate_ddl`<br>`python3 sweep.py oracle gen-ddl` | `'--owners OWNERS'`, `'--tables TABLES'`, `'--bg'`, `'-h, --help'` |
-| **05** | `oracle.oracle_05_apply_ddl`<br>`python3 sweep.py oracle apply-ddl` | `'--schemas SCHEMAS'`, `'--skip-meta'`, `'--bg'`, `'-h, --help'` |
-| **06** | `oracle.oracle_06_load_data`<br>`python3 sweep.py oracle load-data` | `'--workers WORKERS'`, `'--tables TABLES'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--file FILE'`, `'--filename FILENAME'`, `'--gate-pass'`, `'--limit-files LIMIT_FILES'`, `'--max-size-mb MAX_SIZE_MB'`, `'--min-size-mb MIN_SIZE_MB'`, `'--dry-run'`, `'--reload'`, `'--max-rejects MAX_REJECTS'`, `'--fast-bulk'`, `'--trigger-mode TRIGGER_MODE'`, `'--bg'`, `'-h, --help'` |
-| **07** | `oracle.oracle_07_load_objects`<br>`python3 sweep.py oracle load-obj` | `'--stage {all,pk,alter,index,fk,validate,views,triggers}'`, `'--schemas SCHEMAS'`, `'--only-loaded'`, `'--bg'`, `'-h, --help'` |
-| **08** | `oracle.oracle_08_validate`<br>`python3 sweep.py oracle validate` | `'--exact-counts'`, `'--tables TABLES'`, `'--schemas SCHEMAS'`, `'--file FILE'`, `'--bg'`, `'-h, --help'` |
-| **All** | `python3 sweep.py oracle run-all` | `'--workers WORKERS'`, `'--bg'`, `'-h, --help'` |
+| **01** | `oracle.oracle_01_extract_mtd`<br>`python3 sweep.py oracle extract` | `'-h, --help'`, `'--file FILE'`, `'--tables TABLES'`, `'--owners, --schemas SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--dry-run'` |
+| **02** | `oracle.oracle_02_inventory`<br>`python3 sweep.py oracle inventory` | `'-h, --help'`, `'--s3 S3'`, `'--tables TABLES'`, `'--owners, --schemas SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--file FILE'`, `'--filename FILENAME'`, `'--dry-run'` |
+| **03** | `oracle.oracle_03_type_gate`<br>`python3 sweep.py oracle gate` | `'-h, --help'`, `'--rows ROWS'`, `'--max-tables MAX_TABLES'`, `'--tables TABLES'`, `'--owners, --schemas SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--file FILE'`, `'--filename FILENAME'`, `'--dry-run'` |
+| **04** | `oracle.oracle_04_generate_ddl`<br>`python3 sweep.py oracle gen-ddl` | `'-h, --help'`, `'--tables TABLES'`, `'--owners, --schemas SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--dry-run'`, `'--layer LAYER'`, `'--allow-ddl'` |
+| **05** | `oracle.oracle_05_apply_ddl`<br>`python3 sweep.py oracle apply-ddl` | `'-h, --help'`, `'--skip-meta'`, `'--tables TABLES'`, `'--schemas, --owners SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--dry-run'`, `'--layer LAYER'`, `'--allow-ddl'` |
+| **06** | `oracle.oracle_06_load_data`<br>`python3 sweep.py oracle load-data` | `'-h, --help'`, `'--workers WORKERS'`, `'--tables TABLES'`, `'--owners, --schemas SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--file FILE'`, `'--filename FILENAME'`, `'--dry-run'`, `'--layer LAYER'`, `'--allow-ddl'`, `'--gate-pass'`, `'--limit-files LIMIT_FILES'`, `'--max-size-mb MAX_SIZE_MB'`, `'--min-size-mb MIN_SIZE_MB'`, `'--reload'`, `'--full'`, `'--max-rejects MAX_REJECTS'`, `'--fast-bulk'`, `'--trigger-mode {auto,replica,disable}'` |
+| **07** | `oracle.oracle_07_load_objects`<br>`python3 sweep.py oracle load-obj` | `'-h, --help'`, `'--stage {all,pk,alter,index,fk,validate,views,triggers}'`, `'--only-loaded'`, `'--tables TABLES'`, `'--schemas, --owners SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--dry-run'`, `'--layer LAYER'`, `'--allow-ddl'` |
+| **08** | `oracle.oracle_08_validate`<br>`python3 sweep.py oracle validate` | `'-h, --help'`, `'--exact-counts'`, `'--file FILE'`, `'--bg'`, `'--tables TABLES'`, `'--schemas, --owners SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--dry-run'`, `'--layer LAYER'`, `'--allow-ddl'` |
+| **All** | `python3 sweep.py oracle run-all` | `'-h, --help'`, `'--workers WORKERS'`, `'--bg'`, `'--tables TABLES'`, `'--owners, --schemas SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--dry-run'`, `'--layer LAYER'`, `'--allow-ddl'` |
 
 ---
 
@@ -32,14 +32,14 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 
 | Step | Script / Command | Available Flags |
 | :---: | :--- | :--- |
-| **01** | `vsam.vsam_01_extract_copybooks`<br>`python3 sweep.py vsam extract` | `'--bg'`, `'-h, --help'` |
-| **02** | `vsam.vsam_02_inventory`<br>`python3 sweep.py vsam inventory` | `'--s3 S3'`, `'--company COMPANY'`, `'--tbl-col {headers,copybook}'`, `'--bg'`, `'-h, --help'` |
-| **03** | `vsam.vsam_03_type_gate`<br>`python3 sweep.py vsam type-gate` | `'--workers WORKERS'`, `'--company COMPANY'`, `'--bg'`, `'-h, --help'` |
-| **04** | `vsam.vsam_04_generate_ddl`<br>`python3 sweep.py vsam gen-ddl` | `'--company COMPANY'`, `'--execute'`, `'--bg'`, `'-h, --help'` |
-| **05** | `vsam.vsam_05_apply_ddl`<br>`python3 sweep.py vsam apply-ddl` | `'--skip-meta'`, `'--bg'`, `'-h, --help'` |
-| **06** | `vsam.vsam_06_load_data`<br>`python3 sweep.py vsam load-data` | `'--workers WORKERS'`, `'--company COMPANY'`, `'--tables TABLES'`, `'--limit-files LIMIT_FILES'`, `'--force-truncate'`, `'--reload'`, `'--max-rejects MAX_REJECTS'`, `'--dry-run'`, `'--bg'`, `'-h, --help'` |
-| **07** | `vsam.vsam_07_validate`<br>`python3 sweep.py vsam validate` | `'--exact-counts'`, `'--tables TABLES'`, `'--schema SCHEMA'`, `'--bg'`, `'-h, --help'` |
-| **All** | `python3 sweep.py vsam run-all` | `'--workers WORKERS'`, `'--force-truncate'`, `'--tbl-col {headers,copybook}'`, `'--bg'`, `'-h, --help'` |
+| **01** | `vsam.vsam_01_extract_copybooks`<br>`python3 sweep.py vsam extract` | `'-h, --help'`, `'--bg'`, `'--copybook COPYBOOK'`, `'--dry-run'` |
+| **02** | `vsam.vsam_02_inventory`<br>`python3 sweep.py vsam inventory` | `'-h, --help'`, `'--s3 S3'`, `'--tables TABLES'`, `'--schemas, --owners SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--file FILE'`, `'--filename FILENAME'`, `'--company COMPANY'`, `'--dry-run'`, `'--tbl-col {headers,copybook}'`, `'--bg'` |
+| **03** | `vsam.vsam_03_type_gate`<br>`python3 sweep.py vsam type-gate` | `'-h, --help'`, `'--workers WORKERS'`, `'--bg'`, `'--tables TABLES'`, `'--schemas, --owners SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--file FILE'`, `'--filename FILENAME'`, `'--company COMPANY'`, `'--dry-run'` |
+| **04** | `vsam.vsam_04_generate_ddl`<br>`python3 sweep.py vsam gen-ddl` | `'-h, --help'`, `'--execute'`, `'--bg'`, `'--tables TABLES'`, `'--schemas, --owners SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--company COMPANY'`, `'--dry-run'`, `'--layer LAYER'`, `'--allow-ddl'` |
+| **05** | `vsam.vsam_05_apply_ddl`<br>`python3 sweep.py vsam apply-ddl` | `'-h, --help'`, `'--skip-meta'`, `'--bg'`, `'--tables TABLES'`, `'--schemas, --owners SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--dry-run'`, `'--layer LAYER'`, `'--allow-ddl'` |
+| **06** | `vsam.vsam_06_load_data`<br>`python3 sweep.py vsam load-data` | `'-h, --help'`, `'--workers WORKERS'`, `'--tables TABLES'`, `'--schemas, --owners SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--file FILE'`, `'--filename FILENAME'`, `'--company COMPANY'`, `'--dry-run'`, `'--layer LAYER'`, `'--allow-ddl'`, `'--limit-files LIMIT_FILES'`, `'--force-truncate'`, `'--reload'`, `'--full'`, `'--max-rejects MAX_REJECTS'`, `'--bg'` |
+| **07** | `vsam.vsam_07_validate`<br>`python3 sweep.py vsam validate` | `'-h, --help'`, `'--exact-counts'`, `'--bg'`, `'--tables TABLES'`, `'--schema, --schemas SCHEMA'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--company COMPANY'`, `'--dry-run'`, `'--layer LAYER'`, `'--allow-ddl'` |
+| **All** | `python3 sweep.py vsam run-all` | `'-h, --help'`, `'--workers WORKERS'`, `'--force-truncate'`, `'--tbl-col {headers,copybook}'`, `'--bg'`, `'--tables TABLES'`, `'--schemas, --owners SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--company COMPANY'`, `'--dry-run'`, `'--layer LAYER'`, `'--allow-ddl'` |
 
 ---
 
@@ -53,7 +53,7 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 | `python3 sweep.py monitor` | `'-w, --watch'`, `'--interval INTERVAL'`, `'--track {all,oracle,vsam}'`, `'--no-color'`, `'-h, --help'` |
 | `python3 sweep.py logs` | `'-f, --follow'`, `'-n, --lines LINES'`, `'--track {oracle,vsam}'`, `'--file FILE'`, `'-h, --help'` |
 | `python3 sweep.py stop` | `'--name NAME'`, `'--kill-db'`, `'-h, --help'` |
-| `python3 sweep.py run-all` | `'--track {oracle,vsam,all}'`, `'--workers WORKERS'`, `'--force-truncate'`, `'--tbl-col {headers,copybook}'`, `'--bg'`, `'-h, --help'` |
+| `python3 sweep.py run-all` | `'-h, --help'`, `'--track {oracle,vsam,all}'`, `'--workers WORKERS'`, `'--force-truncate'`, `'--tbl-col {headers,copybook}'`, `'--bg'`, `'--tables TABLES'`, `'--schemas, --owners SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--company COMPANY'`, `'--dry-run'`, `'--layer LAYER'`, `'--allow-ddl'` |
 
 ---
 
@@ -338,6 +338,57 @@ Automated end-to-end execution across tracks.
 | `--force-truncate` | flag | false | Forwarded to the VSAM load step (see Step 06) | `python3 sweep.py run-all --force-truncate` |
 | `--tbl-col MODE` | choice | `headers` | Forwarded to VSAM Step 02 | `python3 sweep.py run-all --tbl-col copybook` |
 | `--bg` | flag | false | Run full pipeline as one detached background job (stops at the first failing step) | `python3 sweep.py run-all --track all --bg` |
+
+---
+
+## 5a. New in 6.0.0: targeting flags, layers, promote, chain, migrate
+
+### Uniform targeting flags (every step)
+
+| Flag | Meaning |
+| :--- | :--- |
+| `--tables a,b` | `SCHEMA.TABLE` or bare table name, case-insensitive |
+| `--schemas s1,s2` | Schemas / owners (aliases `--owners` for Oracle steps, `--schema` for VSAM Step 07) |
+| `--exclude-tables a,b` | Tables to leave out (same syntax as `--tables`) |
+| `--file F` / `--filename F` | One S3 file (URI, key suffix or file name): Oracle 02, 03, 06; VSAM 02, 03, 06 |
+| `--company C` | VSAM company tokens |
+| `--copybook C` | VSAM Step 01 copybook files |
+| `--dry-run` | Print what would be touched; write nothing |
+
+Invalid selectors (unknown table / schema / file / company / copybook, unparseable value) end with a clear message and **exit code 2** before anything runs. See [targeting_and_outputs.md](targeting_and_outputs.md).
+
+### Layer flags (steps that touch a database)
+
+| Flag | Meaning |
+| :--- | :--- |
+| `--layer {bronze,silver,gold_backup,gold}` | **Required** (or `SWEEP_LAYER`, except for `gold`, which must always be named with `--layer gold`). Exit code 2 when missing, 3 when the connected database is not the layer's database |
+| `--allow-ddl` | Allow a DDL step (Oracle 04 / 05 / 07, VSAM 04 / 05) on a layer with `allow_ddl=false` (gold_backup, gold); ignored elsewhere |
+| `--full` (Oracle / VSAM Step 06) | Do not capture the applied delta of this load: the promote hop copies the whole table |
+
+### `python3 sweep.py promote | chain | migrate | layers`
+
+| Command | Flags |
+| :--- | :--- |
+| `promote` | `--from L`, `--to L`, `--tables`, `--full`, `--dry-run`, `--workers N`, `--transport {auto,program,stream}`, `--status`, `--purge`, `--limit N` |
+| `chain` | `--until L`, `--tracks oracle,vsam`, `--skip-load`, `--workers N`, `--transport`, `--tables`, `--dry-run` |
+| `migrate` | `--layer L` or `--all-layers`, `--dry-run` |
+| `layers init-manifests` | `--force` |
+| `layers scan-models` | `--models-dir PATH` (required) |
+| `layers reconcile` | `--from L`, `--to L` (required), `--tables`, `--exact` |
+| `layers check` | `--layer L` (default: all layers) |
+
+Details: [layers_and_promote.md](layers_and_promote.md).
+
+### Additional environment variables
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `SWEEP_LAYER` | Layer for steps without `--layer` (never selects `gold`) | unset |
+| `SWEEP_LAYERS_FILE` | Alternative layer profile file | `sweep_layers.json` |
+| `SWEEP_DELTA_RETENTION_DAYS` | Days a delta table is kept after every layer applied it (`promote --purge`) | `14` |
+| `SWEEP_PROMOTE_TRANSPORT` | `program`, `stream` or `auto` | `auto` |
+| `SWEEP_PROMOTE_DEBUG_DIR` | Keep the generated apply script and its output of every promote step in this folder | unset |
+| `SWEEP_MERGE_LOCK_TIMEOUT` | Seconds a merge waits for the lock of an output file | `60` |
 
 ---
 

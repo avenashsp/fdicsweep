@@ -32,6 +32,7 @@ vsam/outputs/
 # --- Large / customer data inputs (never commit data dumps) ---
 vsam/inputs/copybooks/
 *.csv
+!layers/*.csv
 *.csv.gz
 *.gz
 *.dat

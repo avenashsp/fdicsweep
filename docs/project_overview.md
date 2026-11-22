@@ -1,8 +1,10 @@
-# SWEEP Unified Data Migration Framework (v5.4.0)
+# SWEEP Unified Data Migration Framework (v6.0.0)
+
+> **6.0.0 - medallion layers.** The target is four databases in one Aurora cluster (bronze SWEEPB -> silver SWEEPS -> gold_backup SWEEPGB -> gold SWEEPG). S3 is read once, into bronze; `sweep.py promote` / `chain` move the applied deltas one hop at a time (strict sequence order, gated by gold_backup, never deleting rows, never touching gold's schema). Every step takes `--layer`, the uniform targeting flags and writes merge-safe outputs. See [layers_and_promote.md](layers_and_promote.md) and [targeting_and_outputs.md](targeting_and_outputs.md).
 
 ## 1. Executive Summary
 
-**SWEEP** (v5.4.0) is an enterprise-grade, high-throughput unified database migration framework built to migrate multi-terabyte financial datasets from both **Oracle SQL DDL dumps** and **VSAM flat files (COBOL copybooks)** into **AWS RDS Aurora PostgreSQL** with per-file transactional atomicity on the Oracle track, loud failures instead of silent data loss, and high ingestion velocity.
+**SWEEP** (v6.0.0) is an enterprise-grade, high-throughput unified database migration framework built to migrate multi-terabyte financial datasets from both **Oracle SQL DDL dumps** and **VSAM flat files (COBOL copybooks)** into **AWS RDS Aurora PostgreSQL** with per-file transactional atomicity on the Oracle track, loud failures instead of silent data loss, and high ingestion velocity.
 
 Unlike traditional migration tools that stage gigabytes or terabytes of CSV data onto local bastion disks or perform slow row-by-row ORM inserts, SWEEP uses a **zero-disk streaming pipeline** that pulls compressed data directly from Amazon S3, uncompresses it in memory via Unix pipes, and streams it into PostgreSQL with the CSV `\copy` protocol (Oracle track; the VSAM track routes rows by schema and sends them as batched `INSERT`s - see "Reliability & Safety Guarantees").
 
@@ -48,7 +50,7 @@ To achieve maximum ingestion velocity, heavy database constraints and indexes ar
 
 ### 3. Merged Ingestion Step in VSAM
 In the VSAM pipeline, Step 06 (`vsam load-data`) applies primary keys itself and loads with the same staged, one-transaction-per-file workflow as the Oracle track: PK constraints are applied to the destination tables before loading, bad rows (`BAD_VALUE`, `NOT_NULL`, `PK_BLANK`, `PK_SENTINEL`, `ALL_NULL`) are rejected and reported, and valid rows are upserted via `ON CONFLICT (pk_cols) DO UPDATE ... WHERE ... IS DISTINCT FROM ...`. Only the newest file version per (company, source file) is loaded.
-- **VSAM files are full snapshots.** A table **with** a primary key is upserted in place (rows missing from a newer snapshot are not deleted). A table **without** one is **replaced** by each new snapshot: all files of the table are loaded in a single transaction on one connection (temp staging, `TRUNCATE` + `INSERT`, `load_log` rows, `COMMIT`); if any file fails the table keeps its old data. Partial runs (`--company`, `--tables`, `--limit-files`) need `--force-truncate` to replace a populated table, because other source files of a shared table may be missing.
+- **VSAM files are full snapshots.** A table **with** a primary key is upserted in place (rows missing from a newer snapshot are not deleted). A table **without** one is **replaced** by each new snapshot: all files of the table are loaded in a single transaction on one connection (temp staging, `TRUNCATE` + `INSERT`, `vsam_load_log` rows, `COMMIT`); if any file fails the table keeps its old data. Partial runs (`--company`, `--tables`, `--limit-files`) need `--force-truncate` to replace a populated table, because other source files of a shared table may be missing.
 - **Keys are never guessed.** A primary key comes only from a copybook KEY/KEM group (with every key column reliably mapped) or from a person (`korg_overrides`); positional auto-discovery only produces a *candidate* that is reported, not applied. A key that cannot be applied is an error.
 - **A failed VSAM file leaves no partial data** (one transaction per file); a file is reloaded only when its S3 LastModified / ETag / size changed (or with `--reload`).
 
@@ -66,17 +68,17 @@ VSAM files always have a header row, but its names and column order differ from 
 - A copybook key that cannot be applied (duplicates in the data, key columns missing from the file) is an **error**: Step 03 reports `PK_ERROR` and Step 06 does not load that source. A file without a copybook is loaded without a key (keyless).
 - For the **AGILETIC** source company, column names and datatypes are inferred from S3 CSV headers and data.
 
-### 6. Transaction Logging & Idempotency (`sweep_ctl.load_log`)
-- **Both tracks work the same way:** each file is loaded in **one transaction** through temp staging tables - bulk `\copy` into an all-text temp table, set-based validation in SQL (`pg_input_is_valid`, NOT NULL, CHECK, FK, key rules), upsert, row-count check (`read = inserted + updated + unchanged + rejected + duplicates`), `load_rejects` and `load_log` rows, `COMMIT`. A truncated or corrupt stream, a count mismatch or any error rolls the whole file back and leaves no rows behind.
+### 6. Transaction Logging & Idempotency (`sweep_ctl.oracle_load_log` / `vsam_load_log`)
+- **Both tracks work the same way:** each file is loaded in **one transaction** through temp staging tables - bulk `\copy` into an all-text temp table, set-based validation in SQL (`pg_input_is_valid`, NOT NULL, CHECK, FK, key rules), upsert, row-count check (`read = inserted + updated + unchanged + rejected + duplicates`), `load_rejects` and load log rows, delta capture, `COMMIT`. A truncated or corrupt stream, a count mismatch or any error rolls the whole file back and leaves no rows behind.
 - **Bad rows are reported, not fatal:** they are stored in `sweep_ctl.load_rejects` and shown in the `Reject_Summary` / `Rejected_Rows` sheets. The default (`--max-rejects 0`) never fails a file for rejected rows; `--max-rejects N` fails a file that reaches N.
 - **Upserts update only rows that differ:** `ON CONFLICT (key) DO UPDATE ... WHERE (target) IS DISTINCT FROM (file)`; identical rows are counted as `unchanged` and not touched.
-- **A file is "already loaded" only while its S3 `LastModified`, `ETag` and size still equal the values stored in `load_log`** (`s3_last_modified`, `s3_etag`, `s3_size`). A re-delivered file with the same name and path is loaded again; `--reload` forces a reload.
+- **A file is "already loaded" only while its S3 `LastModified`, `ETag` and size still equal the values stored in its log row** (`s3_last_modified`, `s3_etag`, `s3_size`) **and its target table is not empty**. A re-delivered file with the same name and path is loaded again; `--reload` forces a reload.
 - **Oracle load order:** parent tables first, level by level, from the foreign keys extracted in Step 01 (plus live FKs); `--fast-bulk` loads smallest to largest instead. Triggers are switched off for the load.
-- **VSAM:** a `load_log` row per destination schema (keyed `<uri>#<schema>`) is written inside the file's transaction. Tables without a key are replaced by the newest snapshot: all files of the table load in a single transaction, or the table keeps its old data. Rows missing from a newer snapshot of a keyed table are never deleted.
+- **VSAM:** a `vsam_load_log` row per destination schema (PK `uri, target_schema`, the real URI) is written inside the file's transaction. Tables without a key are replaced by the newest snapshot: all files of the table load in a single transaction, or the table keeps its old data. Rows missing from a newer snapshot of a keyed table are never deleted.
 - PostgreSQL **16 or later** is required (`pg_input_is_valid`); the loaders and `sweep.py check` verify it.
-- The primary key of `sweep_ctl.load_log` is `uri`; see `docs/sweep_outputs.md` for the full column list.
+- The primary key of `sweep_ctl.oracle_load_log` is `uri` (`vsam_load_log`: `uri, target_schema`); see `docs/sweep_outputs.md` for the full column list.
 
-### 7. Reliability & Safety Guarantees (v5.4.0)
+### 7. Reliability & Safety Guarantees (v6.0.0)
 - **Exit codes:** every step exits non-zero when it cannot do its job (missing inputs, failed loads, failed DDL, failed validation), so `run-all` and CI stop at the first failing step.
 - **No shell injection:** S3 keys and file names are never interpolated into shell command lines. Python callers use argument lists; the one `\copy ... FROM PROGRAM '...'` command string is built with `shlex.quote`. Keys containing spaces, quotes, `;` or `$()` load correctly.
 - **Stream errors are visible:** S3 / gzip failures surface as errors (not as "empty file"); header and sample peeks check the pipeline's exit status and stderr.
@@ -96,7 +98,14 @@ VSAM files always have a header row, but its names and column order differ from 
 
 ```
 fdicsweep/
-├── sweep.py                     # Root unified CLI entrypoint (v5.4.0)
+├── sweep.py                     # Root unified CLI entrypoint (v6.0.0)
+├── sweep_layers.py / .json      # layer profiles, --layer guard, manifests
+├── sweep_promote.py             # promote / chain / status / purge
+├── sweep_delta.py               # delta capture and registry
+├── sweep_migrate.py             # versioned sweep_ctl migrations
+├── sweep_reconcile.py           # layers reconcile / check
+├── sweep_targeting.py           # uniform selectors
+├── sweep_merge.py / sweep_ddlfrag.py   # merge-safe outputs, per-table DDL fragments
 ├── sweep.env                    # Environment variables (RDS endpoint, credentials, S3 buckets) - git-ignored
 ├── sweep.env.sample             # Sample environment template
 ├── sweep_common.py              # Config/env loading, psql helpers (timeouts, retries), logging, Excel, type mapping
@@ -157,13 +166,13 @@ fdicsweep/
 │
 ├── tests/                       # pytest suite (unit + PostgreSQL integration tests)
 ├── .github/workflows/ci.yml     # CI: compile, pyflakes, pytest against PostgreSQL 16
-├── docs/                        # DOCUMENTATION (v5.4.0)
+├── docs/                        # DOCUMENTATION (v6.0.0)
 │   ├── project_overview.md      # Architecture, executive summary, design principles
 │   ├── commands_oracle.md       # Complete CLI command reference for Oracle track
 │   ├── commands_vsam.md         # Complete CLI command reference for VSAM track
 │   ├── flag_arguments.md        # Comprehensive CLI flags & environment variables reference
 │   └── sweep_outputs.md         # Operational monitoring sample outputs & Excel structures
-└── CHANGELOG_v5.4.0.md                 # Release changelog and version history (newest first)
+└── CHANGELOG_v6.0.0.md                 # Release changelog and version history (newest first)
 ```
 
 > **How steps are launched.** Steps are modules run from the repository root: `python3 -m oracle.oracle_06_load_data ...`
@@ -182,7 +191,7 @@ fdicsweep/
 | **03** | `python3 sweep.py oracle gate` | Pre-flight quality gate | `oracle_03_type_gate.json`, Excel report |
 | **04** | `python3 sweep.py oracle gen-ddl` | Generate PostgreSQL DDL | `pre_load/<schema>_tables.sql`, `post_load/*.sql` |
 | **05** | `python3 sweep.py oracle apply-ddl`| Provision DB schemas | Target schemas and bare tables in PostgreSQL |
-| **06** | `python3 sweep.py oracle load-data` | Multi-worker streaming | Data committed via `\copy`; `sweep_ctl.load_log` |
+| **06** | `python3 sweep.py oracle load-data` | Multi-worker streaming | Data committed via `\copy`; `sweep_ctl.oracle_load_log` |
 | **07** | `python3 sweep.py oracle load-obj`  | Compile DB objects | PKs, indexes, FKs, views, triggers compiled |
 | **08** | `python3 sweep.py oracle validate`  | Parity reconciliation | Multi-tab reconciliation audit Excel report |
 

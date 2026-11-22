@@ -19,7 +19,7 @@ from pathlib import Path
 
 from sweep_platform import make_symlink, group_popen_kwargs, kill_process_group
 
-__version__ = "5.4.0"
+__version__ = "6.0.0"
 
 def get_next_version(current_ver: str) -> str:
     """
