@@ -37,7 +37,6 @@ from vsam.common_config import (  # noqa: F401
     FN,
     IDENT,
     USAGE,
-    get_pipeline_mode,
 )
 from vsam.common_mapping import (  # noqa: F401
     _side_csv,
@@ -151,7 +150,6 @@ __all__ = [
     "FN",
     "IDENT",
     "USAGE",
-    "get_pipeline_mode",
     "_side_csv",
     "ref_tables",
     "get_korg_override_pkey",

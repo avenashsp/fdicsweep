@@ -142,16 +142,3 @@ IDENT = re.compile(r"^[A-Za-z][A-Za-z0-9_\-]*$")
 
 
 USAGE = re.compile(r"\b(COMPUTATIONAL-[1-5]|COMPUTATIONAL|COMP-[1-5]|COMP|BINARY|PACKED-DECIMAL)\b", re.I)
-
-
-def get_pipeline_mode(arg_mode: str = None) -> str:
-    """
-    Returns active pipeline mode:
-      - 'data': Raw data priority, NO PK constraints, TRUNCATE & LOAD, all rows loaded (incl. NULL/sentinel).
-      - 'quality': Strict data quality, active PK constraints, DYNAMIC UPSERT, purges NULL/sentinel rows.
-    Resolution: CLI argument -> VSAM_MODE env var -> default 'quality'.
-    """
-    mode = (arg_mode or os.getenv("VSAM_MODE", "quality")).strip().lower()
-    if mode in ("data", "data-priority", "raw", "truncate", "no-pk"):
-        return "data"
-    return "quality"
