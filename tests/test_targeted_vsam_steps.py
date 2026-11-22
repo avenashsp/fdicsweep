@@ -161,3 +161,19 @@ def test_step06_file_selector_loads_only_that_file_and_copybook_selector_merges_
     assert c.run_psql("SELECT count(*) FROM bcs.stg_bcsxref_rec_v", tuples_only=True, unaligned=True) == "5"
     assert c.run_psql("SELECT count(*) FROM bss01104.stg_achfile_v", tuples_only=True, unaligned=True) == "0"
     assert c.run_psql("SELECT string_agg(target_table, ',') FROM sweep_ctl.vsam_load_log", tuples_only=True, unaligned=True) == "stg_bcsxref_rec_v"
+
+
+def test_step04_never_applies_a_key_taken_from_the_step03_profile(repo):
+    d, data, env = repo
+    out = d / "vsam" / "outputs"
+    for step in STEPS[:3]:
+        run(d, env, step)
+    gate = json.loads((out / "vsam_03_type_gate.json").read_text())
+    for key, entry in gate.items():           # pretend Step 03 had (wrongly) offered a key for the source without a copybook
+        if "BCSXREF" in key.upper():
+            entry.update({"pk_cols": ["ref_id"], "pk_valid": True})
+    (out / "vsam_03_type_gate.json").write_text(json.dumps(gate))
+    run(d, env, "vsam_04_generate_ddl")
+    pk_sql = (out / "gen_ddl" / "bcs_pk.sql").read_text()
+    assert "stg_bcsxref_rec_v" not in pk_sql                  # no copybook / override key -> no primary key, whatever Step 03 says
+    assert "stg_achfile_v" in pk_sql and "PRIMARY KEY" in pk_sql   # the copybook key is still applied

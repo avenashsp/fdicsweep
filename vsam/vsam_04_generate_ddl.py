@@ -231,16 +231,12 @@ def main():
         # Check for AGILETIC source company
         is_agiletic = "AGILETIC" in str(co).upper()
 
-        # Fallback to Step 03 profile or korg_overrides if key_cols was blank
-        if is_agiletic:
-            # For AGILETIC: key columns from mapped copybook or positional auto-discovery in Step 03
-            key_cols = [norm_col(c) for c in tg.get("pk_cols", []) if c] if tg.get("pk_valid") else []
-        else:
-            if not key_cols and tg.get("pk_cols"):
-                key_cols = [norm_col(c) for c in tg["pk_cols"] if c]
-            if not key_cols:
-                first_fn = src_rows["s3_filename"].iloc[0] if "s3_filename" in src_rows.columns else ""
-                key_cols = get_korg_override_pkey(co, src, first_fn)
+        # A key is applied ONLY when it comes from the copybook KEY group (Step 02: every key column an ACCEPTED match,
+        # already in the load matrix) or from korg_overrides. Nothing is guessed and Step 03's profile is never a source
+        # of keys; a source without a trusted key is created (and loaded) without a primary key.
+        if not key_cols:
+            first_fn = src_rows["s3_filename"].iloc[0] if "s3_filename" in src_rows.columns else ""
+            key_cols = get_korg_override_pkey(co, src, first_fn)
 
         if is_agiletic:
             # For AGILETIC: directly create column names and datatype inferred from CSV in Step 03
