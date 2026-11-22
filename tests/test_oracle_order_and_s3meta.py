@@ -126,3 +126,32 @@ def test_parent_loaded_before_child_and_changed_file_is_reloaded(pg_db, tmp_path
     assert c.run_psql("SELECT v FROM oo.parent WHERE id = 1", tuples_only=True) == "p-new"
     assert c.run_psql("SELECT count(*) FROM oo.parent", tuples_only=True) == "2"
     assert c.run_psql("SELECT count(*) FROM sweep_ctl.oracle_load_log", tuples_only=True) == "2"      # still one row per URI
+
+
+@pytest.mark.integration
+def test_unchanged_file_is_reloaded_when_its_target_table_was_truncated_by_hand(pg_db, tmp_path, monkeypatch):
+    c.run_psql("CREATE SCHEMA oo; CREATE TABLE oo.parent (id int primary key, v text); CREATE TABLE oo.other (id int primary key, v text);")
+    (tmp_path / "reports").mkdir()
+    monkeypatch.setattr(o6, "ORACLE_REPORTS_DIR", tmp_path / "reports")
+    monkeypatch.setattr(order, "live_edges", lambda: {})
+    monkeypatch.setattr(order, "extracted_edges", lambda *a: {})
+    f1, f2 = tmp_path / "parent.csv.gz", tmp_path / "other.csv.gz"
+    _write_gz(f1, "id,v\n1,p\n2,q\n")
+    _write_gz(f2, "id,v\n1,o\n")
+    monkeypatch.setattr(o6, "ORACLE_OUTPUTS_DIR", _map(tmp_path, [_row(f1, "oo", "parent", 1), _row(f2, "oo", "other", 2)]))
+    assert o6.run_stream_load(workers=2) is True
+    assert c.run_psql("SELECT count(*) FROM oo.parent", tuples_only=True) == "2"
+
+    assert o6.run_stream_load(workers=2) is True                                    # nothing changed, nothing truncated: skipped
+    assert c.run_psql("SELECT count(*) FROM sweep_ctl.oracle_load_log WHERE loaded_rows > 0", tuples_only=True) == "2"
+    c.run_psql("UPDATE sweep_ctl.oracle_load_log SET loaded_at = 'epoch' ")
+    c.run_psql("TRUNCATE oo.parent")                                                 # a person empties the table by hand
+    assert o6.run_stream_load(workers=2) is True
+    assert c.run_psql("SELECT count(*) FROM oo.parent", tuples_only=True) == "2"    # same-name, same-metadata file loaded again
+    assert c.run_psql("SELECT count(*) FROM sweep_ctl.oracle_load_log WHERE loaded_at > 'epoch'", tuples_only=True) == "1"   # only that file
+
+
+def test_tables_with_rows_handles_missing_tables(pg_db):
+    from sweep_loadpipe import tables_with_rows
+    c.run_psql("CREATE SCHEMA tw; CREATE TABLE tw.full_t (a int); INSERT INTO tw.full_t VALUES (1); CREATE TABLE tw.empty_t (a int);")
+    assert tables_with_rows([("tw", "full_t"), ("tw", "empty_t"), ("tw", "missing_t")]) == {("tw", "full_t")}

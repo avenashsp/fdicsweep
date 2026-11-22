@@ -55,6 +55,7 @@ from sweep_common import (
 from sweep_common import ORACLE_OUTPUTS_DIR, layer_dir
 from sweep_ddlfrag import SCHEMA_LEVEL, FragmentStore
 from sweep_targeting import Selector, add_targeting_args, selector_or_exit, validate_or_exit
+from sweep_layers import add_layer_arg, ensure_layer, require_ddl
 
 # script kinds in the order of the old per-schema file handles, and the suffix of each assembled script
 KINDS = ("tables", "pk", "alter", "idx", "fk", "val", "views", "trg")
@@ -994,7 +995,10 @@ $$ LANGUAGE sql IMMUTABLE;
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="04_generateDDL.py - Target DDL & Partition Generator + View/Trigger Translation")
     add_targeting_args(parser, schemas="--owners")
+    add_layer_arg(parser)
     args = parser.parse_args()
+    layer = ensure_layer(args, logger, required=False, db=False)      # only names the output folder: no database is touched
+    require_ddl(layer, args, logger, "Step 04 (generate DDL)")
 
     ok = generate_ddl(selector=selector_or_exit(args, logger))
     sys.exit(0 if ok else 1)

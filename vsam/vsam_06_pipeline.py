@@ -21,6 +21,7 @@ together, so they share one transaction and one connection):
     END
 """
 from sweep_common import VSAM_LOAD_LOG_TABLE, lit, q
+from sweep_delta import capture_setup_sql, capture_spec, registry_sql
 from sweep_loadpipe import MAX_DUP_ROWS_PRINTED, MAX_REJECT_ROWS_PRINTED, REJECT_TABLE, TEXT_TYPES, upsert_statements
 from sweep_s3meta import meta_sql_values
 
@@ -164,14 +165,22 @@ def build_unit_script(unit):
             "FROM (SELECT * FROM _rej WHERE f = r.i AND reason <> 'DUP_IN_FILE' ORDER BY row_no LIMIT 5) z; "
             f"RAISE EXCEPTION 'Too many rejected rows in %: % (limit {limit}). First: %', r.name, r.n, msg; END IF; END LOOP; END $$;\n")
 
-    # apply
+    # apply. `capture` ({run_id, layer, full}): applied rows of a keyed single-file unit go to sweep_delta per destination schema;
+    # a snapshot replace (keyless) and a multi-file unit are registered as a FULL copy (the promote hop copies the whole table).
+    cap = unit.get("capture")
+    sum_kind = lambda kind, d: (f"(SELECT coalesce(sum(n), 0) FROM _c WHERE split_part(k, '|', 1) = '{kind}' AND split_part(k, '|', 3) = {lit(d)})")
+    delta_ok = bool(cap) and keyed and len(files) == 1
+    if cap:
+        for di, d in enumerate(dests):
+            add(capture_setup_sql(d, table, cap.get("full", False) or not delta_ok, name=f"_cap{di}"))
     if keyed:
         a = {"cols": arbiter}
         for f in files:
-            for d in dests:
+            for di, d in enumerate(dests):
+                spec = capture_spec(d, table, name=f"_cap{di}") if delta_ok else None
                 for stmt in upsert_statements(f"{q(d)}.{q(table)}", f["present"], cols, a, set(f["present"]), False,
                                               stg=f"_s{f['i']}", where=f"WHERE s._dest = {lit(d)}",
-                                              sfx=f"|{f['i']}|{d}", existing=f"_ex{f['i']}"):
+                                              sfx=f"|{f['i']}|{d}", existing=f"_ex{f['i']}", capture=spec):
                     add(stmt)
     else:
         for d in dests:       # snapshot replace: a destination that receives rows is emptied first
@@ -182,6 +191,13 @@ def build_unit_script(unit):
                 for stmt in upsert_statements(f"{q(d)}.{q(table)}", f["present"], cols, None, set(f["present"]), False,
                                               stg=f"_s{f['i']}", where=f"WHERE s._dest = {lit(d)}", sfx=f"|{f['i']}|{d}"):
                     add(stmt)
+
+    if cap:
+        present = files[0]["present"] if files else []
+        for di, d in enumerate(dests):
+            add(registry_sql(d, table, cap["run_id"], ";".join(f["uri"] for f in files), present, cap.get("layer"),
+                             sum_kind("inserted", d), sum_kind("updated", d), seq_sql=f"(SELECT seq FROM _cap{di})",
+                             full_sql=f"(SELECT full_copy FROM _cap{di})", keep_delta=delta_ok))
 
     # nothing may disappear silently
     add("DO $$ DECLARE raw_n bigint; acc bigint; BEGIN "

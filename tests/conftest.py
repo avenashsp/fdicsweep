@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+pytest_plugins = ["chain_support"]     # the multi-database chain_env fixture
+
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -41,6 +43,8 @@ def pg_db(pg_available, monkeypatch):
     monkeypatch.setattr(sweep_common, "PGDATABASE", name)
     meta = ROOT / "oracle" / "inputs" / "sweep_meta.sql"
     sweep_common.run_psql(meta, is_file=True)
+    import sweep_migrate
+    sweep_migrate.migrate_current_database()       # records schema version 1 like `sweep.py migrate`
     try:
         yield name
     finally:
@@ -64,3 +68,48 @@ def gz_file(tmp_path):
             fh.write(text)
         return p
     return make
+
+
+def write_layers_file(path, databases, **overrides):
+    """A sweep_layers.json for tests: {layer: database name}; per-layer overrides {layer: {key: value}}."""
+    import json
+    names = ["bronze", "silver", "gold_backup", "gold"]
+    layers = []
+    for i, n in enumerate(names):
+        entry = {"name": n, "database": databases.get(n, databases.get("bronze", "x")), "env_file": f"sweep.{n}.env.absent",
+                 "upstream": names[i - 1] if i else None, "manifest": str(Path(path).parent / "layers" / f"{n}_tables.csv"),
+                 "allow_ddl": n in ("bronze", "silver"), "trigger_mode": "auto", "lock_timeout": "5s", "statement_timeout": "0",
+                 "conflict_policy": "source_wins"}
+        entry.update(overrides.get(n, {}))
+        layers.append(entry)
+    Path(path).write_text(json.dumps({"layers": layers}))
+    return Path(path)
+
+
+def layer_env(tmp_path, db_name, layer="bronze"):
+    """Environment variables that make a step subprocess run on `layer` of a one-database test setup."""
+    f = write_layers_file(tmp_path / "sweep_layers.json", {"bronze": db_name, "silver": db_name, "gold_backup": db_name, "gold": db_name})
+    return {"SWEEP_LAYERS_FILE": str(f), "SWEEP_LAYER": layer}
+
+
+@pytest.fixture()
+def grab():
+    """grab(logger) -> list that collects that logger's messages (SWEEP loggers do not propagate to caplog)."""
+    import logging
+    attached = []
+
+    def attach(logger):
+        msgs = []
+
+        class Handler(logging.Handler):
+            def emit(self, record):
+                msgs.append(record.getMessage())
+
+        h = Handler()
+        logger.addHandler(h)
+        attached.append((logger, h))
+        return msgs
+
+    yield attach
+    for lg, h in attached:
+        lg.removeHandler(h)

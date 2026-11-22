@@ -114,6 +114,8 @@ CREATE TABLE IF NOT EXISTS sweep_ctl.delta_registry (
     rows_total      bigint DEFAULT 0,
     full_copy       boolean DEFAULT false,
     delta_table     text,
+    columns         text,
+    purged_at       timestamptz,
     status          text NOT NULL DEFAULT 'SUCCESS',
     message         text,
     created_at      timestamptz DEFAULT now(),
@@ -237,3 +239,12 @@ def migrate_current_database(dry_run=False):
         logger.info(f"applied migration {version}: {name}")
     return [m[0] for m in todo]
 
+
+
+def require_migrated(log=None):
+    """Ends the process with a clear message when the connected database has not been migrated to the current version."""
+    if LATEST_VERSION in applied_versions():
+        return
+    (log or logger).error(f"sweep_ctl of database {query_db_dicts('SELECT current_database() AS d')[0]['d']} is not at schema version "
+                          f"{LATEST_VERSION}: run `python3 sweep.py migrate --layer <layer>` first (it also copies the old load_log).")
+    raise SystemExit(2)

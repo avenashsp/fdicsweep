@@ -12,6 +12,7 @@ from pathlib import Path
 from sweep_common import layer_dir, ORACLE_OUTPUTS_DIR
 from sweep_ddlfrag import FragmentStore
 from sweep_targeting import Selector, add_targeting_args, selector_or_exit, validate_or_exit
+from sweep_layers import add_layer_arg, ensure_layer, restrict_to_manifest
 from sweep_common import (
     log_summary,
     BASE_DIR,
@@ -37,7 +38,7 @@ from sweep_common import (
 logger = get_logger("oracle_05_apply_ddl", "oracle_05_apply_ddl")
 
 
-def deploy_ddl(schemas_filter=None, skip_meta=False, selector=None):
+def deploy_ddl(schemas_filter=None, skip_meta=False, selector=None, layer=None):
     """
     Applies the generated table DDL. With --tables / --exclude-tables only the selected tables are created (from their
     per-table fragments); --schemas applies whole schema scripts; no selector applies every script.
@@ -58,7 +59,8 @@ def deploy_ddl(schemas_filter=None, skip_meta=False, selector=None):
     elif sel.tables or sel.exclude:
         logger.error("No per-table DDL found; run Step 04 before using --tables / --exclude-tables")
         return False
-    per_table = bool(sel.tables or sel.exclude)
+    manifest_driven = layer is not None and layer.manifest_path.exists()      # only the tables of the layer's manifest are created
+    per_table = bool(sel.tables or sel.exclude) or manifest_driven
 
     if sel.dry_run:
         for sc in store.schemas():
@@ -83,6 +85,7 @@ def deploy_ddl(schemas_filter=None, skip_meta=False, selector=None):
     if per_table:
         for sc in store.schemas():
             picked = [t for t in store.tables(sc) if sel.matches(sc, t)]
+            picked = [t for s_, t in restrict_to_manifest(layer, [(sc, t) for t in picked], logger, "table DDL") if s_ == sc]
             if not picked:
                 continue
             logger.info(f"Applying target DDL of {len(picked)} table(s) in {sc}...")
@@ -183,7 +186,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="05_applyDDL.py - Apply Target DDL to PostgreSQL")
     parser.add_argument("--skip-meta", action="store_true", help="Skip re-applying sweep_meta.sql")
     add_targeting_args(parser)
+    add_layer_arg(parser)
     args = parser.parse_args()
+    layer = ensure_layer(args, logger, ddl_what="Step 05 (apply DDL)")
 
-    ok = deploy_ddl(skip_meta=args.skip_meta, selector=selector_or_exit(args, logger))
+    ok = deploy_ddl(skip_meta=args.skip_meta, selector=selector_or_exit(args, logger), layer=layer)
     sys.exit(0 if ok else 1)

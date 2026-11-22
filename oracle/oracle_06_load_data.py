@@ -59,9 +59,15 @@ from oracle.oracle_06_order import plan_levels
 from sweep_streaming import read_stream_head, stream_program_literal
 from sweep_platform import atomic_write_json
 from sweep_targeting import Selector, add_targeting_args, selector_or_exit, validate_or_exit
+from sweep_layers import add_layer_arg, ensure_layer, require_bronze, restrict_to_manifest
+from sweep_delta import ensure_delta_table, fast_registry_sql
+from sweep_loadpipe import tables_with_rows
+from sweep_migrate import require_migrated
+from sweep_merge import current_run_id
 logger = get_logger("oracle_06_load_data", "oracle_06_load_data")
 LOCK = threading.Lock()
 MAX_REJECT_ROWS_IN_REPORT = 10000   # rows shown in the Rejected_Rows sheet; all are in sweep_ctl.load_rejects
+FULL_LOAD = False              # --full: promote copies the whole table instead of a captured delta
 DEFAULT_MAX_REJECTS = 0       # 0 = valid rows always load; the file fails only on technical errors (--max-rejects N to fail at N rejects)
 COL_CACHE = {}
 PK_CACHE = {}
@@ -137,6 +143,15 @@ def record_stream_end(worker_id):
         else:
             _ACTIVE_STREAMS.pop(worker_id, None)
         _flush_active_streams()
+
+
+def get_loaded_rows():
+    """{uri: rows loaded} of every SUCCESS row (used to tell an empty file from a truncated table)."""
+    try:
+        return {r["uri"]: int(r["loaded_rows"] or 0) for r in
+                query_db_dicts(f"SELECT uri, loaded_rows FROM {ORACLE_LOAD_LOG_TABLE} WHERE status = 'SUCCESS'")}
+    except (RuntimeError, ValueError, KeyError):
+        return {}
 
 
 def get_loaded_log():
@@ -262,13 +277,17 @@ def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False, max_rejec
         use_fast = fast_bulk and not has_constraints(meta) and is_table_empty(schema, table)
         if use_fast:
             logger.info(f"[Worker {worker_id}] Started stream: {name} ({format_size_actual(size_mb_val)}) -> {schema}.{table} (fast bulk - empty table without constraints)")
-            script = build_fast_script(schema, table, header_cols, stream_cmd, meta, trigger_mode, log_sql)
+            script = build_fast_script(schema, table, header_cols, stream_cmd, meta, trigger_mode,
+                                       fast_registry_sql(schema, table, current_run_id(), uri, header_cols, "bronze") + log_sql)
         else:
             how = f"upsert on {', '.join(plan['arbiter']['cols'])}" if plan["arbiter"] else "append - no key"
             logger.info(f"[Worker {worker_id}] Started stream: {name} ({format_size_actual(size_mb_val)}) -> {schema}.{table} (staged load, {how}; triggers off via {trigger_mode})")
             for skipped in plan["skipped_checks"]:
                 logger.warning(f"[Worker {worker_id}] CHECK {skipped} references columns that are not in the file; the table still enforces it")
-            script = build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trigger_mode, max_rejects, uri, log_sql)
+            ensure_delta_table(schema, table)        # applied rows are captured for `promote` (unless the table is empty / --full)
+            capture = {"run_id": current_run_id(), "layer": "bronze", "full": FULL_LOAD, "uris": uri, "downstream": True}
+            script = build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trigger_mode, max_rejects, uri, log_sql,
+                                         capture=capture)
 
         # High-performance bulk load options. psql runs in its own process group, with a hard
         # timeout (SWEEP_LOAD_TIMEOUT) that also kills the S3/gzip pipeline it spawned.
@@ -325,7 +344,7 @@ def _legacy_selector(tables_filter, exclude_tables, file_uri, filename, dry_run)
 
 
 def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=None, file_uri=None, filename=None, limit_files=None, max_size_mb=None, min_size_mb=None, dry_run=False, gate_pass=False, reload=False,
-                    max_rejects=DEFAULT_MAX_REJECTS, fast_bulk=False, trigger_mode="auto", selector=None):
+                    max_rejects=DEFAULT_MAX_REJECTS, fast_bulk=False, trigger_mode="auto", selector=None, layer=None):
     ts = get_timestamp()
     sel = selector or _legacy_selector(tables_filter, exclude_tables, file_uri, filename, dry_run)
     dry_run = dry_run or sel.dry_run
@@ -412,6 +431,10 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
                 and (not sel.files or sel.matches_file(j["uri"]) or sel.matches_file(j.get("filename", "")))]
     file_uri = filename = sel.files[0] if sel.files else None     # a named file is always loaded (like --reload)
 
+    if layer is not None and layer.manifest_path.exists():      # a layer only ever touches the tables of its own manifest
+        keep = set(restrict_to_manifest(layer, [(j["target_schema"], j["target_table"]) for j in all_jobs], logger, "the load"))
+        all_jobs = [j for j in all_jobs if (j["target_schema"], j["target_table"]) in keep]
+
     # Filter by size range if specified
     if max_size_mb is not None:
         all_jobs = [j for j in all_jobs if float(j.get("size_mb") or (int(j.get("size_bytes") or 0) / (1024**2))) <= max_size_mb]
@@ -431,16 +454,25 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
         stored_log = get_loaded_log()
         known = [j["uri"] for j in all_jobs if j["uri"] in stored_log and any(stored_log[j["uri"]].values())]
         live = head_many(known, region=AWS_REGION) if known else {}
-        pending_jobs, legacy = [], 0
+        pending_jobs, legacy, would_skip = [], 0, []
         for j in all_jobs:
             action, why = classify_job(j, stored_log.get(j["uri"]), live.get(j["uri"]))
             if action == "skip":
                 legacy += "without S3 metadata" in why
+                would_skip.append(j)
                 continue
             if action == "reload":
                 changed_count += 1
                 logger.info(f"Reloading {j['filename']}: {why}")
             pending_jobs.append(j)
+        if would_skip:     # loaded and unchanged - but only while the target table still holds rows (not truncated by hand)
+            loaded_rows = get_loaded_rows()
+            nonempty = tables_with_rows({(j["target_schema"], j["target_table"]) for j in would_skip if loaded_rows.get(j["uri"], 1) > 0})
+            for j in would_skip:
+                if loaded_rows.get(j["uri"], 1) > 0 and (j["target_schema"].lower(), j["target_table"].lower()) not in nonempty:
+                    changed_count += 1
+                    logger.info(f"Reloading {j['filename']}: target table {j['target_schema']}.{j['target_table']} is empty")
+                    pending_jobs.append(j)
         skipped_count = total_candidates - len(pending_jobs)
         if legacy:
             logger.warning(f"{legacy} file(s) were loaded before S3 metadata was recorded and are treated as loaded "
@@ -633,11 +665,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="06_loadData.py - Multi-Worker S3 Streaming Ingestion")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Parallel workers (default: {DEFAULT_WORKERS})")
     add_targeting_args(parser, schemas="--owners", file=True)
+    add_layer_arg(parser)
     parser.add_argument("--gate-pass", action="store_true", help="Load only tables that passed the pre-flight type gate")
     parser.add_argument("--limit-files", type=int, help="Limit number of files to load (for testing)")
     parser.add_argument("--max-size-mb", type=float, help="Filter files with size <= max_size_mb")
     parser.add_argument("--min-size-mb", type=float, help="Filter files with size >= min_size_mb")
     parser.add_argument("--reload", action="store_true", help="Force reloading/upserting files even if previously loaded")
+    parser.add_argument("--full", action="store_true",
+                        help="Do not capture the applied delta of this load: the promote hop copies the whole table instead")
     parser.add_argument("--max-rejects", type=int, default=DEFAULT_MAX_REJECTS,
                         help=f"Fail (and roll back) a file when this many rows are rejected (default {DEFAULT_MAX_REJECTS} = never; only technical errors fail a file)")
     parser.add_argument("--fast-bulk", action="store_true",
@@ -647,6 +682,10 @@ if __name__ == "__main__":
                              "or ALTER TABLE DISABLE TRIGGER (needs table ownership, locks the table). auto = replica if allowed")
     args = parser.parse_args()
 
+    layer = ensure_layer(args, logger)
+    require_bronze(layer, logger, "Oracle Step 06")
+    require_migrated(logger)
+    FULL_LOAD = args.full
     ok = run_stream_load(
         workers=args.workers,
         limit_files=args.limit_files,
@@ -658,5 +697,6 @@ if __name__ == "__main__":
         fast_bulk=args.fast_bulk,
         trigger_mode=args.trigger_mode,
         selector=selector_or_exit(args, logger),
+        layer=layer,
     )
     sys.exit(0 if ok else 1)

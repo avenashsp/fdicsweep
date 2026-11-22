@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 import sweep_common as c
+from conftest import layer_env
 
 pytestmark = pytest.mark.integration
 ROOT = Path(__file__).resolve().parent.parent
@@ -55,6 +56,7 @@ def repo(tmp_path, pg_db):
     data.mkdir(parents=True)
     env = dict(os.environ, PGDATABASE=pg_db, VSAM_BASE=str(tmp_path / "data"), PYTHONPATH=str(dst),
                SWEEP_CONNECT_RETRIES="0")
+    env.update(layer_env(tmp_path, pg_db))
     env.pop("VSAM_COPYBOOK_DIR", None)
     return dst, data, env
 

@@ -49,6 +49,7 @@ from sweep_ddlfrag import FragmentStore
 from sweep_merge import write_text_file
 from sweep_migrate import CTL_OBJECTS_SQL
 from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
+from sweep_layers import add_layer_arg, ensure_layer
 from vsam.vsam_common import get_all_active_schemas, get_korg_override_pkey, load_csv_safe, OUT
 
 logger = get_logger("vsam_04_generate_ddl", "vsam_04_generate_ddl")
@@ -136,8 +137,10 @@ def main():
     parser.add_argument("--execute", action="store_true", help="Apply pre-load DDL to PostgreSQL immediately")
     parser.add_argument("--bg", action="store_true", help="Run in background")
     add_targeting_args(parser, company=True)
+    add_layer_arg(parser)
     args = parser.parse_args()
     sel = selector_or_exit(args, logger)
+    ensure_layer(args, logger, required=bool(args.execute), db=bool(args.execute), ddl_what="Step 04 (generate DDL)")
     store = FragmentStore(layer_dir(VSAM_OUTPUTS_DIR / "ddl_fragments"))
 
     logger.info("=" * 75)

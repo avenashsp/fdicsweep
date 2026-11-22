@@ -1,0 +1,53 @@
+{
+  "_comment": "Medallion layers of the SWEEP migration, in chain order. One Aurora cluster, one database per layer. No secrets here: host, user and password live in the git-ignored sweep.<layer>.env files (commit only the *.sample files).",
+  "layers": [
+    {
+      "name": "bronze",
+      "database": "SWEEPB",
+      "env_file": "sweep.bronze.env",
+      "upstream": null,
+      "manifest": "layers/bronze_tables.csv",
+      "allow_ddl": true,
+      "trigger_mode": "auto",
+      "lock_timeout": "30s",
+      "statement_timeout": "0",
+      "conflict_policy": "source_wins"
+    },
+    {
+      "name": "silver",
+      "database": "SWEEPS",
+      "env_file": "sweep.silver.env",
+      "upstream": "bronze",
+      "manifest": "layers/silver_tables.csv",
+      "allow_ddl": true,
+      "trigger_mode": "auto",
+      "lock_timeout": "30s",
+      "statement_timeout": "0",
+      "conflict_policy": "source_wins"
+    },
+    {
+      "name": "gold_backup",
+      "database": "SWEEPGB",
+      "env_file": "sweep.gold_backup.env",
+      "upstream": "silver",
+      "manifest": "layers/gold_backup_tables.csv",
+      "allow_ddl": false,
+      "trigger_mode": "auto",
+      "lock_timeout": "5s",
+      "statement_timeout": "30min",
+      "conflict_policy": "source_wins"
+    },
+    {
+      "name": "gold",
+      "database": "SWEEPG",
+      "env_file": "sweep.gold.env",
+      "upstream": "gold_backup",
+      "manifest": "layers/gold_tables.csv",
+      "allow_ddl": false,
+      "trigger_mode": "auto",
+      "lock_timeout": "5s",
+      "statement_timeout": "30min",
+      "conflict_policy": "source_wins"
+    }
+  ]
+}

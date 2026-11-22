@@ -29,6 +29,7 @@ from sweep_loadpipe import (  # re-exported: the Oracle loader and its tests imp
     MAX_DUP_ROWS_PRINTED, MAX_REJECT_ROWS_PRINTED, REJECT_TABLE, REJECT_TABLE_DDL, TEXT_TYPES, _cmp,
     ensure_reject_table, load_table_meta, parse_output, persist_failed_file_rejects, probe_trigger_mode, upsert_statements,
 )
+from sweep_delta import capture_setup_sql, capture_spec, registry_sql
 from sweep_s3meta import meta_sql_values
 
 __all__ = [
@@ -101,7 +102,17 @@ def build_fast_script(schema, table, header_cols, stream_cmd, meta, trigger_mode
         + on + log_sql + "\nCOMMIT;\n")
 
 
-def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trigger_mode, max_rejects, uri, log_sql):
+def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trigger_mode, max_rejects, uri, log_sql, *,
+                        track="oracle", copy_from=None, keep_target=False, capture=None, pre_sql="", apply_pre_sql="", post_sql="",
+                        dry_run_sql=None):
+    """
+    The staged one-transaction script (see the module docstring). Besides Step 06 it is the apply script of `sweep.py promote`:
+      copy_from      replaces the `\\copy _raw ... FROM PROGRAM` line (e.g. FROM STDIN for the streamed transport)
+      keep_target    conflict policy keep_target: existing keys are not updated
+      capture        {run_id, layer, full, uris, downstream}: copy the applied delta to sweep_delta and register it
+      pre_sql        right after BEGIN (lock / statement timeouts), apply_pre_sql right before the apply (e.g. TRUNCATE)
+      post_sql       after the apply (sequences) ; dry_run_sql: report counts and ROLLBACK instead of applying
+    """
     tgt = f"{q(schema)}.{q(table)}"
     cols = meta["columns"]
     off, on = _trigger_off_on(schema, table, meta, trigger_mode)
@@ -110,9 +121,10 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
     s = []
     add = s.append
     add("\\set ON_ERROR_STOP on\n\\pset tuples_only on\n\\pset format unaligned\nBEGIN;\n")
+    add(pre_sql)
     add(off)
     add(f"CREATE TEMP TABLE _raw (_row_no bigint GENERATED ALWAYS AS IDENTITY, {raw_defs}) ON COMMIT DROP;\n")
-    add(f"\\copy _raw ({col_list}) FROM PROGRAM '{stream_cmd}' WITH (FORMAT csv, HEADER true, ENCODING 'UTF8');\n")
+    add(copy_from or f"\\copy _raw ({col_list}) FROM PROGRAM '{stream_cmd}' WITH (FORMAT csv, HEADER true, ENCODING 'UTF8');\n")
     add("CREATE TEMP TABLE _c (k text PRIMARY KEY, n bigint NOT NULL DEFAULT 0) ON COMMIT DROP;\n"
         "CREATE TEMP TABLE _rej (row_no bigint, reason text, detail text, row_data jsonb) ON COMMIT DROP;\n"
         "INSERT INTO _c SELECT 'raw', count(*) FROM _raw;\n")
@@ -198,8 +210,19 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
             "FROM (SELECT * FROM _rej WHERE reason <> 'DUP_IN_FILE' ORDER BY row_no LIMIT 5) f; "
             f"RAISE EXCEPTION 'Too many rejected rows: % (limit {int(max_rejects)}). First: %', n, msg; END IF; END $$;\n")
 
+    if dry_run_sql is not None:                       # promote --dry-run: counts only, nothing is applied
+        add(dry_run_sql)
+        add("ROLLBACK;\n")
+        return "".join(s)
+
     # 8. apply: INSERT ... ON CONFLICT on the arbiter key, updating only rows that differ
-    for stmt in upsert_statements(tgt, header_cols, cols, plan["arbiter"], plan["present"], plan["identity"]):
+    cap_spec = None
+    if capture:
+        add(capture_setup_sql(schema, table, capture.get("full", False), seq=capture.get("seq"), strict=capture.get("strict", True)))
+        cap_spec = capture_spec(schema, table) if capture.get("downstream", True) else None
+    add(apply_pre_sql)
+    for stmt in upsert_statements(tgt, header_cols, cols, plan["arbiter"], plan["present"], plan["identity"],
+                                  keep_target=keep_target, capture=cap_spec):
         add(stmt)
 
     # 9. nothing may disappear silently
@@ -213,9 +236,14 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
     # 10. persist rejects + log, restore triggers, commit
     add(f"DELETE FROM {REJECT_TABLE} WHERE uri = {lit(uri)} AND target_schema = {lit(schema)} AND target_table = {lit(table)};\n"
         f"INSERT INTO {REJECT_TABLE} (track, uri, target_schema, target_table, row_no, reason, detail, row_data, file_status) "
-        f"SELECT 'oracle', {lit(uri)}, {lit(schema)}, {lit(table)}, row_no, reason, detail, row_data, 'LOADED' FROM "
+        f"SELECT {lit(track)}, {lit(uri)}, {lit(schema)}, {lit(table)}, row_no, reason, detail, row_data, 'LOADED' FROM "
         f"(SELECT * FROM _rej WHERE reason <> 'DUP_IN_FILE' UNION ALL "
         f"(SELECT * FROM _rej WHERE reason = 'DUP_IN_FILE' ORDER BY row_no LIMIT {MAX_REJECT_ROWS_PRINTED})) z;\n")
+    if capture:
+        add(registry_sql(schema, table, capture["run_id"], capture.get("uris", uri), header_cols, capture.get("layer"),
+                         "(SELECT n FROM _c WHERE k = 'inserted')", "(SELECT n FROM _c WHERE k = 'updated')",
+                         keep_delta=capture.get("downstream", True), message=capture.get("message")))
+    add(post_sql)
     add(on)
     add(log_sql + "\nCOMMIT;\n")
     return "".join(s)

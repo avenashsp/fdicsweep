@@ -29,6 +29,7 @@ from sweep_common import (
     get_logger, get_timestamp, get_db_name, generate_excel_report, run_psql, query_db_rows, q
 )
 from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
+from sweep_layers import add_layer_arg, ensure_layer
 from vsam.common_colmap import effective_columns_meta
 from vsam.vsam_common import OUT, load_csv_safe, read_json
 
@@ -71,8 +72,10 @@ def main():
     parser.add_argument("--exact-counts", action="store_true", help="Perform exact count(*) queries on target tables")
     parser.add_argument("--bg", action="store_true", help="Run in background")
     add_targeting_args(parser, schemas="--schema", company=True)
+    add_layer_arg(parser)
     args = parser.parse_args()
     sel = selector_or_exit(args, logger)
+    ensure_layer(args, logger)
 
     logger.info("=" * 75)
     logger.info("SWEEP VSAM MIGRATION - STEP 08: VALIDATION & PARITY AUDIT")

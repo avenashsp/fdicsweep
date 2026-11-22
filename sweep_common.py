@@ -187,7 +187,8 @@ def load_env_file(filepath=None):
     Variables ALREADY present in the real process environment win over the file, so an operator
     can always override a setting with `export VAR=...` or `VAR=... python3 sweep.py ...`.
     """
-    paths_to_check = [filepath] + [BASE_DIR / n for n in ENV_FILE_NAMES]
+    layer_env = [BASE_DIR / f"sweep.{LAYER}.env"] if LAYER else []     # sweep.<layer>.env wins when a layer is selected
+    paths_to_check = [filepath] + layer_env + [BASE_DIR / n for n in ENV_FILE_NAMES]
     for p in paths_to_check:
         if p and Path(p).exists():
             with open(p, "r", encoding="utf-8") as f:
@@ -510,6 +511,7 @@ PSQL_APP_NAME = "sweep"
 # Applied to every psql session: literals are escaped the standard way (backslash is a plain
 # character), which the hand-built SQL in the loaders relies on.
 BASE_PGOPTIONS = "-c standard_conforming_strings=on"
+EXTRA_PGOPTIONS = ""        # set by sweep_layers.use_layer: the layer's lock_timeout / statement_timeout for every psql session
 DEFAULT_PSQL_TIMEOUT = int(os.getenv("SWEEP_PSQL_TIMEOUT", "7200"))
 CONNECT_RETRIES = int(os.getenv("SWEEP_CONNECT_RETRIES", "3"))
 
@@ -538,6 +540,8 @@ def psql_env(extra_env=None, options=None):
     if PGSSLMODE:
         env.setdefault("PGSSLMODE", PGSSLMODE)
     opts = [BASE_PGOPTIONS]
+    if EXTRA_PGOPTIONS:
+        opts.append(EXTRA_PGOPTIONS)
     if options:
         opts.append(options)
     if extra_env:

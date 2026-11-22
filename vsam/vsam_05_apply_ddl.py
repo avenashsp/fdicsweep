@@ -25,6 +25,7 @@ from sweep_common import (
 from sweep_common import layer_dir
 from sweep_ddlfrag import FragmentStore
 from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
+from sweep_layers import add_layer_arg, ensure_layer, restrict_to_manifest
 
 logger = get_logger("vsam_05_apply_ddl", "vsam_05_apply_ddl")
 
@@ -34,16 +35,19 @@ def main():
     parser.add_argument("--skip-meta", action="store_true", help="Skip re-deploying sweep_meta.sql control schema")
     parser.add_argument("--bg", action="store_true", help="Run in background")
     add_targeting_args(parser)
+    add_layer_arg(parser)
     args = parser.parse_args()
     sel = selector_or_exit(args, logger)
+    layer = ensure_layer(args, logger, ddl_what="Step 05 (apply DDL)")
     store = FragmentStore(layer_dir(VSAM_OUTPUTS_DIR / "ddl_fragments"))
     known = [(sc, t) for sc in store.schemas() for t in store.tables(sc)]
-    if sel.filtered:
+    manifest_driven = layer is not None and layer.manifest_path.exists()      # only the tables of the layer's manifest
+    if sel.filtered or manifest_driven:
         if not known:
             logger.error("No per-table DDL found; run 'sweep.py vsam gen-ddl' first")
             sys.exit(1)
         validate_or_exit(sel.validate_tables, known, what="the generated DDL", logger=logger)
-        picked = [(sc, t) for sc, t in known if sel.matches(sc, t)]
+        picked = restrict_to_manifest(layer, [(sc, t) for sc, t in known if sel.matches(sc, t)], logger, "table DDL")
         if sel.dry_run:
             for sc, t in picked:
                 logger.info(f"[dry-run] would apply {sc}.{t}")
@@ -65,7 +69,7 @@ def main():
             logger.info("[+] sweep_ctl & sweep_meta deployed.")
 
     # 2. Apply Pre-Load DDL (tables without PK). A targeted run applies only the selected tables' fragments.
-    if sel.filtered:
+    if sel.filtered or manifest_driven:
         for sc in sorted({sc for sc, _ in picked}):
             run_psql(store.script_for(sc, "pre", [t for s_, t in picked if s_ == sc]))
         logger.info(f"[+] {len(picked)} target table(s) provisioned.")

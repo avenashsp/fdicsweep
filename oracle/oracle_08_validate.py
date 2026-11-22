@@ -86,6 +86,7 @@ from sweep_common import (
 )
 from sweep_s3meta import has_meta, make_meta, meta_equal, meta_from_row
 from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
+from sweep_layers import add_layer_arg, ensure_layer
 from oracle.oracle_08_catalog import fetch_target_postgres_catalogs, test_db_connection
 from oracle.oracle_08_audit import (
     compare_columns, compare_constraints, compare_indexes, compare_schemas, compare_sequences,
@@ -215,6 +216,11 @@ def run_full_parity_audit(exact_counts=False, tables_filter=None, schemas_filter
     stored_files = {r["uri"]: make_meta(r.get("s3_last_modified"), r.get("s3_etag"), r.get("s3_size"))
                     for r in pg_cat.get("load_log_files", [])}
     s3_file_state = {}
+    # same rule as Step 06: an unchanged, loaded file only counts as current while its target table still holds rows
+    # (statistics show no live rows and the catalog estimate is zero = emptied by hand)
+    empty_now = {((r.get("table_schema") or "").lower(), (r.get("table_name") or "").lower())
+                 for r in pg_cat.get("tables", [])
+                 if r.get("stat_live_rows", 1) == 0 and r.get("approx_row_count", 1) <= 0 and not r.get("is_partition_child")}
     for key, files in s3_planned_files.items():
         st = {"current": 0, "changed": 0, "pending": 0}
         for uri, planned in files:
@@ -222,7 +228,10 @@ def run_full_parity_audit(exact_counts=False, tables_filter=None, schemas_filter
             if stored is None:
                 st["pending"] += 1
             elif not any(stored.values()) or not has_meta(planned) or meta_equal(stored, planned):
-                st["current"] += 1            # loaded (legacy rows without metadata count as current)
+                if key in empty_now and db_connected:
+                    st["pending"] += 1        # loaded, unchanged - but the target table is empty: Step 06 will reload it
+                else:
+                    st["current"] += 1        # loaded (legacy rows without metadata count as current)
             else:
                 st["changed"] += 1
         s3_file_state[key] = st
@@ -380,7 +389,9 @@ if __name__ == "__main__":
     parser.add_argument("--file", help="Master Oracle SQL dump file path (defaults to inputs/oracle/oracle_dump/*.sql)")
     parser.add_argument("--bg", action="store_true", help="Run detached in background supervisor")
     add_targeting_args(parser, schemas="--schemas")      # --file here is the Oracle dump, not an S3 file
+    add_layer_arg(parser)
     args = parser.parse_args()
+    ensure_layer(args, logger)
 
     sel = selector_or_exit(args, logger, use_files=False)
     try:

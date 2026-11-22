@@ -57,7 +57,11 @@ from sweep_common import (
     run_psql_script,
 )
 from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
-from sweep_loadpipe import REJECT_TABLE, ensure_reject_table, load_table_meta, parse_output, probe_trigger_mode
+from sweep_layers import add_layer_arg, ensure_layer, require_bronze, restrict_to_manifest
+from sweep_delta import ensure_delta_table
+from sweep_merge import current_run_id
+from sweep_migrate import require_migrated
+from sweep_loadpipe import REJECT_TABLE, ensure_reject_table, load_table_meta, parse_output, probe_trigger_mode, tables_with_rows
 from sweep_platform import atomic_write_json
 from sweep_s3meta import classify_loaded, head_many, make_meta, meta_from_row
 from sweep_streaming import stream_program_literal
@@ -143,6 +147,15 @@ def load_log_sql(full_path, dest_schema, table, size_bytes, rows, seconds, worke
 def write_load_log(full_path, dest_schema, table, size_bytes, rows, seconds, worker_id, status="SUCCESS", message=None):
     """Records a per-destination-schema load in sweep_ctl.vsam_load_log. Errors propagate (a lost row means a reload)."""
     run_psql(load_log_sql(full_path, dest_schema, table, size_bytes, rows, seconds, worker_id, status, message))
+
+
+def get_loaded_rows():
+    """{(file uri, destination schema): rows loaded} of every SUCCESS row of vsam_load_log."""
+    try:
+        return {(r["uri"], r["target_schema"]): int(r["loaded_rows"] or 0) for r in
+                query_db_dicts(f"SELECT uri, target_schema, loaded_rows FROM {VSAM_LOAD_LOG_TABLE} WHERE status = 'SUCCESS'")}
+    except (RuntimeError, ValueError, KeyError):
+        return {}
 
 
 def get_loaded_log():
@@ -454,7 +467,11 @@ def run_unit(table, specs, worker_id, run, tg_prof):
             s["s3_meta"] = s["s3_meta"] or run["heads"].get(s["uri"])
         route = [(k, v) for k, v in get_active_schemas_map().items()]
         unit = {"table": table, "files": specs, "dests": info["dests"], "cols": info["cols"], "arbiter": info["arbiter"],
-                "route": route, "max_rejects": run["max_rejects"], "replica": run["replica"], "encoding": PG_ENCODING}
+                "route": route, "max_rejects": run["max_rejects"], "replica": run["replica"], "encoding": PG_ENCODING,
+                "capture": run.get("capture")}
+        if run.get("capture") and info["arbiter"] and len(specs) == 1:      # applied rows are captured for `promote`
+            for d in info["dests"]:
+                ensure_delta_table(d, table)
         logger.info(f"[Worker {worker_id}] Started: {names} -> {table} ({'upsert on ' + ', '.join(info['arbiter']) if info['arbiter'] else 'snapshot replace, no key'})")
         res = run_psql_script(build_unit_script(unit), options=PSQL_LOAD_OPTIONS)
         sec = round(time.time() - t0, 2)
@@ -631,6 +648,17 @@ def classify_tasks(tasks, tg_prof, reload, heads_live):
             verdict[t["full_path"]] = ("reload", "--reload given") if reload else classify_loaded(stored.get(t["full_path"], []), current)
             if verdict[t["full_path"]][0] == "reload" and not reload:
                 logger.info(f"Reloading {t.get('s3_filename') or t['full_path']}: {verdict[t['full_path']][1]}")
+        if not reload:      # unchanged files only count as loaded while the tables they loaded rows into still hold rows
+            rows_by = get_loaded_rows()
+            want = {(sch, table) for t in group if verdict[t["full_path"]][0] == "skip"
+                    for (uri, sch), n in rows_by.items() if uri == t["full_path"] and n > 0}
+            nonempty = tables_with_rows(want) if want else set()
+            for t in group:
+                if verdict[t["full_path"]][0] == "skip" and any(
+                        n > 0 and uri == t["full_path"] and (sch.lower(), table.lower()) not in nonempty
+                        for (uri, sch), n in rows_by.items()):
+                    verdict[t["full_path"]] = ("reload", "target table is empty")
+                    logger.info(f"Reloading {t.get('s3_filename') or t['full_path']}: a table it loaded into is empty")
         keyed = table_is_keyed(table, group, tg_prof)
         any_load = any(v[0] != "skip" for v in verdict.values())
         for t in group:
@@ -645,17 +673,24 @@ def main():
     parser = argparse.ArgumentParser(description="Step 06: Stream VSAM data from S3 to PostgreSQL with staged validation, upsert and schema segregation.")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     add_targeting_args(parser, company=True, file=True)
+    add_layer_arg(parser)
     parser.add_argument("--limit-files", type=int, help="Limit number of files loaded")
     parser.add_argument("--force-truncate", action="store_true",
                         help="Tables without a primary key are replaced by the new snapshot automatically in a full run. "
                              "In a PARTIAL run (--company/--tables/--limit-files) replacing a table that already has rows "
                              "needs this flag, because other source files of the table may be missing.")
     parser.add_argument("--reload", action="store_true", help="Load files again even when their S3 LastModified/ETag/size are unchanged")
+    parser.add_argument("--full", action="store_true",
+                        help="Do not capture the applied delta of this load: the promote hop copies the whole table instead")
     parser.add_argument("--max-rejects", type=int, default=DEFAULT_MAX_REJECTS,
                         help=f"Fail (and roll back) a file when this many rows are rejected (default {DEFAULT_MAX_REJECTS} = never; only technical errors fail a file)")
     parser.add_argument("--bg", action="store_true", help="Run in background daemon mode")
     args = parser.parse_args()
     sel = selector_or_exit(args, logger)
+    layer = ensure_layer(args, logger)
+    require_bronze(layer, logger, "VSAM Step 06")
+    if not sel.dry_run:
+        require_migrated(logger)
 
     global FORCE_TRUNCATE, PARTIAL_RUN
     FORCE_TRUNCATE = args.force_truncate
@@ -685,6 +720,9 @@ def main():
                         and (not sel.files or sel.matches_file(r["s3_filename"]) or sel.matches_file(r["full_path"])), axis=1)
         picked = set(zip(lm.loc[keep, "full_path"], lm.loc[keep, "target_table"]))
         lm = lm[[(fp, t) in picked for fp, t in zip(lm["full_path"], lm["target_table"])]]
+    if layer is not None and layer.manifest_path.exists() and not lm.empty:      # only the tables of the layer's manifest
+        keep = set(restrict_to_manifest(layer, list(zip(lm["target_schema"], lm["target_table"])), logger, "the load"))
+        lm = lm[[(s_, t_) in keep for s_, t_ in zip(lm["target_schema"], lm["target_table"])]]
     if lm.empty:
         logger.warning("Load matrix is empty. Nothing to load.")
         return True
@@ -751,7 +789,8 @@ def main():
 
     # HEAD right before loading: the load_log rows store exactly what was loaded
     heads = head_many([t["full_path"] for t in tasks])
-    run = {"max_rejects": args.max_rejects, "heads": heads, "replica": probe_trigger_mode() == "replica"}
+    run = {"max_rejects": args.max_rejects, "heads": heads, "replica": probe_trigger_mode() == "replica",
+           "capture": {"run_id": current_run_id(), "layer": "bronze", "full": args.full}}
 
     results = [{"s3_filename": t.get("s3_filename"), "filename": t.get("s3_filename"), "table": t["target_table"], "uri": t["full_path"],
                 "full_path": t["full_path"], "status": "SKIPPED", "seconds": 0, "rows_loaded": 0, "records_loaded": 0,

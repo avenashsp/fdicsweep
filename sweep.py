@@ -39,6 +39,7 @@ from sweep_common import (
 )
 import sweep_bg
 from sweep_targeting import add_targeting_args
+from sweep_layers import add_layer_arg
 
 logger = get_logger("sweep_cli", to_file=False)
 
@@ -320,12 +321,28 @@ RUNALL_FLAGS = {
 }
 
 
+DB_STEPS = {"oracle_04_generate_ddl", "oracle_05_apply_ddl", "oracle_06_load_data", "oracle_07_load_objects", "oracle_08_validate",
+            "vsam_04_generate_ddl", "vsam_05_apply_ddl", "vsam_06_load_data", "vsam_07_validate"}
+
+
 def runall_targeting(args, module):
-    """Targeting flags for one step of run-all (oracle steps take tables / schemas / exclude-tables; VSAM steps differ)."""
+    """Targeting flags (and --layer for the steps that touch a database) for one step of run-all."""
     allowed = RUNALL_FLAGS.get(module, _TBL)
     out = [f for f in targeting(args, skip=tuple(n for n in TARGET_FLAGS if n not in allowed)) if f != "--dry-run"]
     if getattr(args, "dry_run", False):
         out.append("--dry-run")
+    if module in DB_STEPS:
+        out.extend(layer_flags(args))
+    return out
+
+
+def layer_flags(args):
+    """--layer / --allow-ddl for the steps that touch a database (the layer is passed down so every step guards its database)."""
+    out = []
+    if getattr(args, "layer", None):
+        out.extend(["--layer", args.layer])
+    if getattr(args, "allow_ddl", False):
+        out.append("--allow-ddl")
     return out
 
 
@@ -396,17 +413,21 @@ def handle_oracle(args):
     elif cmd in ("gen-ddl", "ddl"):
         c = step("oracle", "oracle_04_generate_ddl")
         c.extend(targeting(args))
+        c.extend(layer_flags(args))
         run_or_bg("oracle_04_generate_ddl", c, getattr(args, "bg", False))
 
     elif cmd == "apply-ddl":
         c = step("oracle", "oracle_05_apply_ddl")
         c.extend(targeting(args))
+        c.extend(layer_flags(args))
         if getattr(args, "skip_meta", False): c.append("--skip-meta")
         run_or_bg("oracle_05_apply_ddl", c, getattr(args, "bg", False))
 
     elif cmd in ("load-data", "load"):
         c = step("oracle", "oracle_06_load_data", "--workers", str(getattr(args, "workers", DEFAULT_WORKERS)))
         c.extend(targeting(args))
+        c.extend(layer_flags(args))
+        if getattr(args, "full", False): c.append("--full")
         if getattr(args, "gate_pass", False): c.append("--gate-pass")
         if getattr(args, "limit_files", None): c.extend(["--limit-files", str(args.limit_files)])
         if getattr(args, "max_size_mb", None) is not None: c.extend(["--max-size-mb", str(args.max_size_mb)])
@@ -420,6 +441,7 @@ def handle_oracle(args):
     elif cmd in ("load-obj", "post-load"):
         c = step("oracle", "oracle_07_load_objects", "--stage", getattr(args, "stage", "all"))
         c.extend(targeting(args))
+        c.extend(layer_flags(args))
         if getattr(args, "only_loaded", False): c.append("--only-loaded")
         run_or_bg("oracle_07_load_objects", c, getattr(args, "bg", False))
 
@@ -428,6 +450,7 @@ def handle_oracle(args):
         if getattr(args, "exact_counts", False): c.append("--exact-counts")
         if getattr(args, "file", None): c.extend(["--file", args.file])      # the dump file
         c.extend(targeting(args, skip=("file", "filename")))
+        c.extend(layer_flags(args))
         run_or_bg("oracle_08_validate", c, getattr(args, "bg", False))
 
     elif cmd == "run-all":
@@ -472,6 +495,7 @@ def handle_vsam(args):
     elif cmd in ("gen-ddl", "ddl"):
         c = step("vsam", "vsam_04_generate_ddl")
         c.extend(targeting(args, skip=("file", "filename")))
+        c.extend(layer_flags(args))
         if getattr(args, "execute", False): c.append("--execute")
         run_or_bg("vsam_04_generate_ddl", c, getattr(args, "bg", False))
 
@@ -479,6 +503,7 @@ def handle_vsam(args):
     elif cmd == "apply-ddl":
         c = step("vsam", "vsam_05_apply_ddl")
         c.extend(targeting(args, skip=("file", "filename", "company")))
+        c.extend(layer_flags(args))
         if getattr(args, "skip_meta", False): c.append("--skip-meta")
         run_or_bg("vsam_05_apply_ddl", c, getattr(args, "bg", False))
 
@@ -486,6 +511,8 @@ def handle_vsam(args):
     elif cmd in ("load-data", "load", "load-obj", "load-objects", "post-load"):
         c = step("vsam", "vsam_06_load_data", "--workers", str(getattr(args, "workers", DEFAULT_WORKERS)))
         c.extend(targeting(args))
+        c.extend(layer_flags(args))
+        if getattr(args, "full", False): c.append("--full")
         if getattr(args, "limit_files", None): c.extend(["--limit-files", str(args.limit_files)])
         if getattr(args, "force_truncate", False): c.append("--force-truncate")
         if getattr(args, "reload", False): c.append("--reload")
@@ -497,6 +524,7 @@ def handle_vsam(args):
         c = step("vsam", "vsam_07_validate")
         if getattr(args, "exact_counts", False): c.append("--exact-counts")
         c.extend(targeting(args, skip=("file", "filename")))
+        c.extend(layer_flags(args))
         run_or_bg("vsam_07_validate", c, getattr(args, "bg", False))
 
     elif cmd == "run-all":
@@ -506,6 +534,100 @@ def handle_vsam(args):
         commands = [step("vsam", m, *(["--workers", workers, *extra] if m == "vsam_06_load_data" else tbl if m == "vsam_02_inventory" else []), *runall_targeting(args, m)) for m in VSAM_STEPS]
         bg_cmd = [sys.executable, str(BASE_DIR / "sweep.py"), "vsam", "run-all", "--workers", str(workers), *extra, *tbl, *targeting(args, skip=("file", "filename"))]
         pipeline_or_bg("vsam_full_pipeline", "VSAM Full", commands, bg_cmd, getattr(args, "bg", False))
+
+
+# -----------------------------------------------------------------------------
+# Layer commands: promote, chain, migrate, layers
+# -----------------------------------------------------------------------------
+def _layer_error(e):
+    print(f"Error: {e}", file=sys.stderr)
+    return 2
+
+
+def cmd_promote(args):
+    import sweep_promote as sp
+    from sweep_layers import LayerError, get_layer
+    try:
+        tables = [t for t in (args.tables or "").split(",") if t.strip()]
+        if args.status:
+            rows, layers = sp.promote_status(tables=tables or None, limit=args.limit)
+            print(sp.format_status(rows, layers))
+            return 0
+        if args.purge:
+            purged = sp.purge_deltas(dry_run=args.dry_run)
+            print(f"{len(purged)} delta(s) " + ("would be purged" if args.dry_run else "purged"))
+            return 0
+        if not args.from_layer or not args.to_layer:
+            return _layer_error(LayerError("--from and --to are required (promote moves data one hop, e.g. --from bronze --to silver)"))
+        results, code = sp.promote(args.from_layer, args.to_layer, tables=tables or None, full=args.full, dry_run=args.dry_run,
+                                   workers=args.workers, transport=args.transport)
+        for r in results:
+            print(f"{r['status']:<10} {r['table']:<50} inserted {r['inserted']:>9} updated {r['updated']:>9} unchanged {r['unchanged']:>9}"
+                  + (f"  {r['message']}" if r["message"] else ""))
+        if results:
+            sp.write_promote_report(results, get_layer(args.from_layer), get_layer(args.to_layer), args.dry_run)
+        return code
+    except LayerError as e:
+        return _layer_error(e)
+
+
+def cmd_chain(args):
+    import sweep_promote as sp
+    from sweep_layers import LayerError
+    load = []
+    if not args.skip_load and not args.dry_run:
+        for track in [t.strip() for t in args.tracks.split(",") if t.strip()]:
+            if track not in ("oracle", "vsam"):
+                return _layer_error(LayerError(f"unknown track {track!r}: oracle, vsam"))
+            load.append([sys.executable, str(BASE_DIR / "sweep.py"), track, "load-data", "--layer", "bronze", "--workers", str(args.workers)])
+    try:
+        return sp.run_chain(until=args.until, load_cmds=load, workers=args.workers, transport=args.transport,
+                            tables=[t for t in (args.tables or "").split(",") if t.strip()] or None, dry_run=args.dry_run)
+    except LayerError as e:
+        return _layer_error(e)
+
+
+def cmd_migrate(args):
+    from sweep_layers import LayerError, chain as layer_chain, get_layer, use_layer, verify_database
+    import sweep_migrate
+    try:
+        if args.all_layers:
+            layers = layer_chain()
+        elif args.layer:
+            layers = [get_layer(args.layer)]
+        else:
+            return _layer_error(LayerError("give --layer <name> or --all-layers"))
+        for lay in layers:
+            with use_layer(lay):
+                verify_database(lay)
+                applied = sweep_migrate.migrate_current_database(dry_run=args.dry_run)
+                what = (("would apply " if args.dry_run else "applied ") + ", ".join(map(str, applied))) if applied else "up to date"
+                print(f"{lay.name} ({lay.database}): {what}")
+        return 0
+    except (LayerError, RuntimeError) as e:
+        return _layer_error(e)
+
+
+def cmd_layers(args):
+    from sweep_layers import LayerError
+    import sweep_layer_cmds as lc
+    try:
+        if args.layers_cmd == "init-manifests":
+            lc.init_manifests(force=args.force)
+            return 0
+        if args.layers_cmd == "scan-models":
+            lc.scan_models(args.models_dir)
+            return 0
+        if args.layers_cmd == "reconcile":
+            import sweep_reconcile as rc
+            return rc.reconcile_cmd(args.from_layer, args.to_layer, [t for t in (args.tables or "").split(",") if t.strip()] or None, args.exact)
+        if args.layers_cmd == "check":
+            import sweep_reconcile as rc
+            return rc.check_cmd(args.layer)
+        print("Usage: python3 sweep.py layers {init-manifests,scan-models,reconcile,check} ...")
+        return 0
+    except LayerError as e:
+        return _layer_error(e)
 
 
 # -----------------------------------------------------------------------------
@@ -558,6 +680,7 @@ def main():
     p_all.add_argument("--tbl-col", choices=["headers", "copybook"], help="VSAM table column names: S3 file headers (default) or copybook column names")
     p_all.add_argument("--bg", action="store_true", help="Run full pipeline as detached background daemon")
     add_targeting_args(p_all, company=True)
+    add_layer_arg(p_all)
 
     # Background operations
     subparsers.add_parser("status", help="Show live status of background migration jobs")
@@ -576,6 +699,50 @@ def main():
     p_stop = subparsers.add_parser("stop", help="Stop running migration jobs")
     p_stop.add_argument("--name", help="Specific job name to stop")
     p_stop.add_argument("--kill-db", action="store_true", help="Also terminate in-flight PostgreSQL sessions opened by SWEEP (application_name 'sweep')")
+
+    # -------------------------------------------------------------------------
+    # Layers: promote / chain / migrate / layers
+    # -------------------------------------------------------------------------
+    p_prom = subparsers.add_parser("promote", help="Move data ONE hop along bronze -> silver -> gold_backup -> gold")
+    p_prom.add_argument("--from", dest="from_layer", help="Source layer (the layer before --to)")
+    p_prom.add_argument("--to", dest="to_layer", help="Target layer")
+    p_prom.add_argument("--tables", help="Comma-separated tables (SCHEMA.TABLE or TABLE)")
+    p_prom.add_argument("--full", action="store_true", help="Copy the whole source table instead of the captured deltas (baseline / resync)")
+    p_prom.add_argument("--dry-run", action="store_true", help="Show how many rows would be inserted, updated and skipped per table; write nothing")
+    p_prom.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Parallel tables inside one dependency level")
+    p_prom.add_argument("--transport", choices=["auto", "program", "stream"], default=None,
+                        help="Cross-database transport: psql copy FROM PROGRAM (program), a pipe made by Python (stream), or auto (default)")
+    p_prom.add_argument("--status", action="store_true", help="Print the delta x layer status matrix and exit")
+    p_prom.add_argument("--purge", action="store_true", help="Remove delta tables every layer applied (plus SWEEP_DELTA_RETENTION_DAYS) and exit")
+    p_prom.add_argument("--limit", type=int, default=10, help="Deltas per table shown by --status (default 10)")
+
+    p_chain = subparsers.add_parser("chain", help="Load bronze from S3, then promote silver -> gold_backup -> gold (stops at the first failure)")
+    p_chain.add_argument("--until", help="Stop after this layer (e.g. gold_backup, to review before gold)")
+    p_chain.add_argument("--tracks", default="oracle,vsam", help="Tracks to load into bronze: oracle, vsam or both (default both)")
+    p_chain.add_argument("--skip-load", action="store_true", help="Do not load bronze (promote what bronze already holds)")
+    p_chain.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Parallel workers")
+    p_chain.add_argument("--transport", choices=["auto", "program", "stream"], default=None)
+    p_chain.add_argument("--tables", help="Comma-separated tables to promote")
+    p_chain.add_argument("--dry-run", action="store_true", help="Dry-run the promote hops (the bronze load is skipped)")
+
+    p_mig = subparsers.add_parser("migrate", help="Apply the versioned sweep_ctl migrations (idempotent, transactional)")
+    p_mig.add_argument("--layer", help="Layer to migrate")
+    p_mig.add_argument("--all-layers", action="store_true", help="Migrate every layer, in chain order")
+    p_mig.add_argument("--dry-run", action="store_true", help="Show the pending migrations; change nothing")
+
+    p_lay = subparsers.add_parser("layers", help="Layer manifests, model scan, reconcile and checks")
+    l_sub = p_lay.add_subparsers(dest="layers_cmd", help="layers subcommands")
+    l_init = l_sub.add_parser("init-manifests", help="Draft layers/<layer>_tables.csv from the inventory (existing manifests are kept)")
+    l_init.add_argument("--force", action="store_true", help="Replace existing manifests (a .bak is kept)")
+    l_scan = l_sub.add_parser("scan-models", help="Scan the data-model scripts and DRAFT the silver VSAM list and the output tables for review")
+    l_scan.add_argument("--models-dir", required=True, help="Folder with the data-model Python scripts (they are only read)")
+    l_rec = l_sub.add_parser("reconcile", help="Row counts + key hash of the tables of two layers (Excel report, exit code)")
+    l_rec.add_argument("--from", dest="from_layer", required=True)
+    l_rec.add_argument("--to", dest="to_layer", required=True)
+    l_rec.add_argument("--tables", help="Comma-separated tables")
+    l_rec.add_argument("--exact", action="store_true", help="Hash every row (default: a 1 percent sample of the keys)")
+    l_chk = l_sub.add_parser("check", help="Database reachable, PostgreSQL >= 16, privileges, sweep_ctl migrated, drift, sequences")
+    l_chk.add_argument("--layer", help="Check one layer (default: all)")
 
     # -------------------------------------------------------------------------
     # Track: ORACLE
@@ -607,12 +774,14 @@ def main():
     o_ddl.add_argument("--owners", help="Comma-separated owners")
     o_ddl.add_argument("--tables", help="Comma-separated tables")
     add_targeting_args(o_ddl, schemas="--owners")
+    add_layer_arg(o_ddl)
     o_ddl.add_argument("--bg", action="store_true", help="Run in background")
 
     o_apply = o_sub.add_parser("apply-ddl", help="Step 05: Apply DDL to PostgreSQL")
     o_apply.add_argument("--schemas", help="Comma-separated schemas")
     o_apply.add_argument("--skip-meta", action="store_true", help="Skip re-deploying sweep_meta.sql")
     add_targeting_args(o_apply)
+    add_layer_arg(o_apply)
     o_apply.add_argument("--bg", action="store_true", help="Run in background")
 
     o_load = o_sub.add_parser("load-data", aliases=["load"], help="Step 06: S3 Streaming Ingestion")
@@ -629,8 +798,10 @@ def main():
     o_load.add_argument("--reload", action="store_true", help="Force reloading/upserting files even if previously loaded")
     o_load.add_argument("--max-rejects", type=int, default=None, help="Fail a file when this many rows are rejected (default 0 = never fail; N = fail the file at N rejects)")
     o_load.add_argument("--fast-bulk", action="store_true", help="Direct COPY into empty constraint-free tables (no bad-row isolation)")
+    o_load.add_argument("--full", action="store_true", help="Do not capture the applied delta: the promote hop copies the whole table")
     o_load.add_argument("--trigger-mode", choices=["auto", "replica", "disable"], default=None, help="How triggers are switched off while loading")
     add_targeting_args(o_load, schemas="--owners", file=True)
+    add_layer_arg(o_load)
     o_load.add_argument("--bg", action="store_true", help="Run in background daemon")
 
     o_obj = o_sub.add_parser("load-obj", aliases=["post-load"], help="Step 07: Post-Load Keys, Indexes, Views, Triggers")
@@ -638,6 +809,7 @@ def main():
     o_obj.add_argument("--schemas", help="Comma-separated schemas")
     o_obj.add_argument("--only-loaded", action="store_true", help="Only load objects for tables with loaded data (default: all tables)")
     add_targeting_args(o_obj)
+    add_layer_arg(o_obj)
     o_obj.add_argument("--bg", action="store_true", help="Run in background")
 
     o_val = o_sub.add_parser("validate", aliases=["verify"], help="Step 08: Reconciliation & Audit Tally")
@@ -646,12 +818,14 @@ def main():
     o_val.add_argument("--schemas", help="Comma-separated schemas")
     o_val.add_argument("--file", help="Specific master Oracle SQL dump file path")
     add_targeting_args(o_val)
+    add_layer_arg(o_val)
     o_val.add_argument("--bg", action="store_true", help="Run in background")
 
     o_run_all = o_sub.add_parser("run-all", help="Execute complete Oracle pipeline end-to-end")
     o_run_all.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Parallel workers")
     o_run_all.add_argument("--bg", action="store_true", help="Run full Oracle pipeline in background daemon")
     add_targeting_args(o_run_all, schemas="--owners")
+    add_layer_arg(o_run_all)
 
     # -------------------------------------------------------------------------
     # Track: VSAM (7-Step Pipeline)
@@ -680,11 +854,13 @@ def main():
     v_ddl.add_argument("--company", help="Comma-separated companies")
     v_ddl.add_argument("--execute", action="store_true", help="Execute generated pre-load DDL")
     add_targeting_args(v_ddl, company=True)
+    add_layer_arg(v_ddl)
     v_ddl.add_argument("--bg", action="store_true", help="Run in background")
 
     v_apply = v_sub.add_parser("apply-ddl", help="Step 05: Apply table DDL (tables only, no PK) to PostgreSQL")
     v_apply.add_argument("--skip-meta", action="store_true", help="Skip sweep_meta.sql")
     add_targeting_args(v_apply)
+    add_layer_arg(v_apply)
     v_apply.add_argument("--bg", action="store_true", help="Run in background")
 
     v_load = v_sub.add_parser("load-data", aliases=["load"], help="Step 06: Schema-segregated S3 streaming ingestion & dynamic upsert")
@@ -694,13 +870,16 @@ def main():
     v_load.add_argument("--limit-files", type=int, help="Limit files loaded")
     v_load.add_argument("--force-truncate", action="store_true", help="Allow replacing a table that already has rows and no PK in a PARTIAL run (--company/--tables/--limit-files); full runs replace such tables automatically")
     add_targeting_args(v_load, company=True, file=True)
+    add_layer_arg(v_load)
     v_load.add_argument("--reload", action="store_true", help="Load files again even when their S3 LastModified/ETag/size are unchanged")
+    v_load.add_argument("--full", action="store_true", help="Do not capture the applied delta: the promote hop copies the whole table")
     v_load.add_argument("--max-rejects", type=int, default=None, help="Fail a file when this many rows are rejected (default 0 = never fail; N = fail the file at N rejects)")
     v_load.add_argument("--bg", action="store_true", help="Run in background daemon")
 
     v_lobj = v_sub.add_parser("load-obj", aliases=["load-objects", "post-load"], help="Legacy alias: Merged into Step 06 (load-data)")
     v_lobj.add_argument("--schema", help="Apply PK only for this schema")
     add_targeting_args(v_lobj, company=True, file=True)
+    add_layer_arg(v_lobj)
     v_lobj.add_argument("--bg", action="store_true", help="Run in background")
 
     v_val = v_sub.add_parser("validate", aliases=["verify"], help="Step 07: Row counts, column, type, PK & reconciliation audit")
@@ -708,6 +887,7 @@ def main():
     v_val.add_argument("--tables", help="Comma-separated tables")
     v_val.add_argument("--schema", help="Validate only this schema")
     add_targeting_args(v_val, schemas="--schema", company=True)
+    add_layer_arg(v_val)
     v_val.add_argument("--bg", action="store_true", help="Run in background")
 
     v_runall = v_sub.add_parser("run-all", help="Execute complete VSAM 7-step pipeline end-to-end")
@@ -716,6 +896,7 @@ def main():
     v_runall.add_argument("--tbl-col", choices=["headers", "copybook"], help="Table column names: S3 file headers (default) or copybook column names")
     v_runall.add_argument("--bg", action="store_true", help="Run full pipeline in background")
     add_targeting_args(v_runall, company=True)
+    add_layer_arg(v_runall)
 
     args = parser.parse_args()
 
@@ -725,6 +906,14 @@ def main():
 
     if args.command == "check":
         sys.exit(0 if cmd_check(args) else 1)
+    elif args.command == "promote":
+        sys.exit(cmd_promote(args))
+    elif args.command == "chain":
+        sys.exit(cmd_chain(args))
+    elif args.command == "migrate":
+        sys.exit(cmd_migrate(args))
+    elif args.command == "layers":
+        sys.exit(cmd_layers(args))
     elif args.command == "oracle":
         handle_oracle(args)
     elif args.command == "vsam":

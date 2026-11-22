@@ -7,11 +7,6 @@
 -- 1. Control & Runtime Tracking Schema (sweep_ctl)
 -- -----------------------------------------------------------------------------
 CREATE SCHEMA IF NOT EXISTS sweep_ctl;
-
--- Control objects of the 6.0.0 schema: oracle_load_log, vsam_load_log, load_rejects, load_audit, delta_registry,
--- promote_log, schema_version and the sweep_delta schema. Identical to migration 1 in sweep_migrate.py (which also
--- upgrades an existing 5.x database: `python3 sweep.py migrate`); keep both in step.
-CREATE SCHEMA IF NOT EXISTS sweep_ctl;
 CREATE SCHEMA IF NOT EXISTS sweep_delta;
 
 CREATE TABLE IF NOT EXISTS sweep_ctl.oracle_load_log (
@@ -114,6 +109,8 @@ CREATE TABLE IF NOT EXISTS sweep_ctl.delta_registry (
     rows_total      bigint DEFAULT 0,
     full_copy       boolean DEFAULT false,
     delta_table     text,
+    columns         text,
+    purged_at       timestamptz,
     status          text NOT NULL DEFAULT 'SUCCESS',
     message         text,
     created_at      timestamptz DEFAULT now(),

@@ -43,6 +43,7 @@ from sweep_common import (
 )
 
 from sweep_targeting import Selector, add_targeting_args, selector_or_exit, validate_or_exit
+from sweep_layers import add_layer_arg, ensure_layer, manifest_tables
 from oracle.oracle_07_parser import parse_sql_file_blocks, simplify_case_to_coalesce
 
 logger = get_logger("oracle_07_load_objects", "oracle_07_load_objects")
@@ -241,7 +242,7 @@ def sync_identity_sequences():
     except DB_ERRORS as e:
         logger.warning(f"Could not synchronize identity sequences: {e}")
 
-def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False, selector=None):
+def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False, selector=None, layer=None):
     """
     Executes post-load scripts selectively:
       - By default, creates objects for ALL tables.
@@ -263,6 +264,7 @@ def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False, 
         validate_or_exit(sel.validate_tables, [(r["s"], r["t"]) for r in cat], what="the database", logger=logger)
     all_script_results = []
     all_object_actions = []
+    listed = manifest_tables(layer) if (layer is not None and layer.manifest_path.exists()) else None   # None = no restriction
 
     logger.info("Connecting to target database to evaluate tables and existing objects...")
     logger.info(f"Target Database: {PGUSER}@{PGHOST}:{PGPORT}/{PGDATABASE}")
@@ -327,6 +329,9 @@ def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False, 
 
                 # --tables / --exclude-tables: only the selected tables' objects; schema-level objects (views) are
                 # left alone by a run that names tables
+                # a layer with a manifest only ever gets objects on the tables of that manifest
+                if listed is not None and obj_type != "SESSION" and (s_name.lower(), t_name.lower()) not in listed:
+                    continue
                 if sel.table_selectors:
                     if t_name and not sel.matches(s_name, t_name):
                         continue
@@ -671,9 +676,11 @@ if __name__ == "__main__":
                         help="Stage: pk (PK/Unique), alter (Check & Alter constraints), index (Concurrent indexes), fk (Foreign keys), validate (FK validate), views (Views), triggers (Triggers), all (default)")
     parser.add_argument("--only-loaded", action="store_true", help="Only load objects for tables where data has been loaded (default: load for all tables)")
     add_targeting_args(parser)
+    add_layer_arg(parser)
     args = parser.parse_args()
+    layer = ensure_layer(args, logger, ddl_what="Step 07 (keys, indexes, views, triggers)")
 
     stages = [args.stage] if args.stage != "all" else None
 
-    ok = apply_post_load(stages_to_run=stages, only_loaded=args.only_loaded, selector=selector_or_exit(args, logger))
+    ok = apply_post_load(stages_to_run=stages, only_loaded=args.only_loaded, selector=selector_or_exit(args, logger), layer=layer)
     sys.exit(0 if ok else 1)

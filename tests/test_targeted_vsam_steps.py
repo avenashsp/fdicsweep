@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import sweep_common as c
+from conftest import layer_env
 
 pytestmark = pytest.mark.integration
 ROOT = Path(__file__).resolve().parent.parent
@@ -49,6 +50,7 @@ def repo(tmp_path, pg_db):
     _write_csv(data / "FDICSWP_SWP_BCSXREF_FLAT_20240101.csv", ["ref_id", "ref_name", "ref_date"],
                [[i, f"x{i}", "2024-01-01"] for i in range(1, 6)])
     env = dict(os.environ, PGDATABASE=pg_db, VSAM_BASE=str(tmp_path / "data"), PYTHONPATH=str(dst), SWEEP_CONNECT_RETRIES="0")
+    env.update(layer_env(tmp_path, pg_db))
     env.pop("VSAM_COPYBOOK_DIR", None)
     return dst, data, env
 
@@ -105,12 +107,12 @@ def test_targeted_runs_keep_every_other_entry(repo):
     assert (out / "vsam_03_type_gate.json.bak").exists()
 
     # ---- Step 04 targeted: only the selected table's fragments are rewritten, assembled scripts hold everything
-    frag = out / "ddl_fragments" / "fragments"
+    frag = out / "ddl_fragments" / "bronze" / "fragments"
     bcs_frag = (frag / "bcs" / "stg_bcsxref_rec_v.pre.sql").read_bytes()
     run(d, env, "vsam_04_generate_ddl", "--tables", "stg_achfile_v")
     assert (frag / "bcs" / "stg_bcsxref_rec_v.pre.sql").read_bytes() == bcs_frag
-    assert "stg_bcsxref_rec_v" in (out / "gen_ddl" / "bcs.sql").read_text()
-    assert "stg_achfile_v" in (out / "gen_ddl" / "all_tables.sql").read_text() and "stg_bcsxref_rec_v" in (out / "gen_ddl" / "all_tables.sql").read_text()
+    assert "stg_bcsxref_rec_v" in (out / "gen_ddl" / "bronze" / "bcs.sql").read_text()
+    assert "stg_achfile_v" in (out / "gen_ddl" / "bronze" / "all_tables.sql").read_text() and "stg_bcsxref_rec_v" in (out / "gen_ddl" / "bronze" / "all_tables.sql").read_text()
 
 
 def test_bad_selectors_fail_before_anything_runs_with_exit_code_2(repo):
@@ -174,6 +176,55 @@ def test_step04_never_applies_a_key_taken_from_the_step03_profile(repo):
             entry.update({"pk_cols": ["ref_id"], "pk_valid": True})
     (out / "vsam_03_type_gate.json").write_text(json.dumps(gate))
     run(d, env, "vsam_04_generate_ddl")
-    pk_sql = (out / "gen_ddl" / "bcs_pk.sql").read_text()
+    pk_sql = (out / "gen_ddl" / "bronze" / "bcs_pk.sql").read_text()
     assert "stg_bcsxref_rec_v" not in pk_sql                  # no copybook / override key -> no primary key, whatever Step 03 says
     assert "stg_achfile_v" in pk_sql and "PRIMARY KEY" in pk_sql   # the copybook key is still applied
+
+
+def _q(sql):
+    return c.run_psql(sql, tuples_only=True, unaligned=True)
+
+
+def test_vsam_load_registers_full_copies_first_and_captures_deltas_afterwards(repo):
+    d, data, env = repo
+    for step in STEPS[:6]:
+        run(d, env, step)
+    reg = _q("SELECT string_agg(target_schema || '.' || target_table || '#' || seq || ':' || full_copy || ':' || rows_total, ',' ORDER BY target_schema, target_table) "
+             "FROM sweep_ctl.delta_registry")
+    # first load into EMPTY tables: registered as full copies (nothing captured), per destination schema; keyless table too
+    assert "bss01104.stg_achfile_v#1:true:5" in reg and "bss01112.stg_achfile_v#1:true:5" in reg and "bcs.stg_bcsxref_rec_v#1:true:5" in reg
+    assert _q("SELECT count(*) FROM sweep_delta.bss01104__stg_achfile_v") in ("0", "")
+
+    # a newer snapshot with one changed and one new key: only those two rows are captured, per destination schema
+    for f in data.glob("*20240101.csv"):
+        f.unlink()
+    hdr = ["status_code", "b_korg", "amount", "account_number", "effective_date"]
+    rows_ = [["A", "104" if i % 2 else "112", i * 1.5, 1000 + i, "2024-01-01"] for i in range(1, 11)]
+    rows_[0][0] = "Z"                                                   # account 1001 changed (korg 104)
+    rows_.append(["A", "104", 99.5, 1999, "2024-01-01"])                # account 1999 is new (korg 104)
+    _write_csv(data / "FDICSWP_FDIC_ACHFILE_FLAT_20240201.csv", hdr, rows_)
+    _write_csv(data / "FDICSWP_SWP_BCSXREF_FLAT_20240201.csv", ["ref_id", "ref_name", "ref_date"], [[i, f"y{i}", "2024-01-01"] for i in range(1, 7)])
+    for step in ("vsam_02_inventory", "vsam_03_type_gate", "vsam_06_load_data"):
+        run(d, env, step)
+    assert _q("SELECT seq || ':' || full_copy || ':' || rows_inserted || '/' || rows_updated FROM sweep_ctl.delta_registry "
+              "WHERE target_schema = 'bss01104' AND target_table = 'stg_achfile_v' AND seq = 2") == "2:false:1/1"
+    assert _q("SELECT string_agg(_op || account_number, ',' ORDER BY account_number) FROM sweep_delta.bss01104__stg_achfile_v WHERE _seq = 2") == "U1001,I1999"
+    assert _q("SELECT count(*) FROM sweep_ctl.delta_registry WHERE target_schema = 'bss01112' AND seq = 2") == "0"     # nothing changed there
+    # a keyless table is replaced by the snapshot: registered as a full copy again (the promote hop replaces it as a whole)
+    assert _q("SELECT seq || ':' || full_copy || ':' || rows_total FROM sweep_ctl.delta_registry WHERE target_table = 'stg_bcsxref_rec_v' AND seq = 2") == "2:true:6"
+
+
+def test_unchanged_vsam_files_are_reloaded_when_a_table_they_loaded_into_was_truncated(repo):
+    d, data, env = repo
+    for step in STEPS[:6]:
+        run(d, env, step)
+    assert _q("SELECT count(*) FROM bss01104.stg_achfile_v") == "5" and _q("SELECT count(*) FROM bcs.stg_bcsxref_rec_v") == "5"
+    r = run(d, env, "vsam_06_load_data")                                       # unchanged files, nothing truncated: skipped
+    assert "Pending: 0" in r.stdout
+    _q("TRUNCATE bss01104.stg_achfile_v")                                      # a keyed table emptied by hand
+    r = run(d, env, "vsam_06_load_data")
+    assert "is empty" in r.stdout
+    assert _q("SELECT count(*) FROM bss01104.stg_achfile_v") == "5" and _q("SELECT count(*) FROM bss01112.stg_achfile_v") == "5"
+    _q("TRUNCATE bcs.stg_bcsxref_rec_v")                                       # a keyless table emptied by hand
+    run(d, env, "vsam_06_load_data")
+    assert _q("SELECT count(*) FROM bcs.stg_bcsxref_rec_v") == "5"
