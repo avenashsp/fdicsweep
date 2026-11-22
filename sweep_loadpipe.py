@@ -18,6 +18,7 @@ TEXT_TYPES = ("text", "character varying")                  # unbounded text nee
 REJECT_TABLE_DDL = f"""
 CREATE TABLE IF NOT EXISTS {REJECT_TABLE} (
     id            bigserial PRIMARY KEY,
+    track         text,
     uri           text NOT NULL,
     target_schema text,
     target_table  text,
@@ -28,6 +29,7 @@ CREATE TABLE IF NOT EXISTS {REJECT_TABLE} (
     file_status   text DEFAULT 'LOADED',
     rejected_at   timestamptz DEFAULT now()
 );
+ALTER TABLE {REJECT_TABLE} ADD COLUMN IF NOT EXISTS track text;
 CREATE INDEX IF NOT EXISTS idx_sweep_load_rejects_uri ON {REJECT_TABLE} (uri);
 """
 
@@ -155,13 +157,13 @@ def parse_output(stdout):
     return counts, summary, rows
 
 
-def persist_failed_file_rejects(uri, schema, table, rows):
+def persist_failed_file_rejects(uri, schema, table, rows, track="oracle"):
     """When a file fails (e.g. too many rejects) its transaction rolled back; keep the reject sample for review."""
     if not rows:
         return
     values = ",\n".join(
-        f"({lit(uri)}, {lit(schema)}, {lit(table)}, {int(r['row_no'])}, {lit(r['reason'])}, {lit(r.get('detail'))}, "
+        f"({lit(track)}, {lit(uri)}, {lit(schema)}, {lit(table)}, {int(r['row_no'])}, {lit(r['reason'])}, {lit(r.get('detail'))}, "
         f"{lit(json.dumps(r.get('row')))}::jsonb, 'FILE_FAILED')" for r in rows)
     run_psql(f"DELETE FROM {REJECT_TABLE} WHERE uri = {lit(uri)} AND target_schema = {lit(schema)} AND target_table = {lit(table)};\n"
-             f"INSERT INTO {REJECT_TABLE} (uri, target_schema, target_table, row_no, reason, detail, row_data, file_status) "
+             f"INSERT INTO {REJECT_TABLE} (track, uri, target_schema, target_table, row_no, reason, detail, row_data, file_status) "
              f"VALUES {values};")

@@ -19,7 +19,9 @@ import csv
 import argparse
 from pathlib import Path
 from collections import defaultdict
+from sweep_merge import merge_csv, write_text_file
 from sweep_streaming import read_stream_head
+from sweep_targeting import Selector, add_targeting_args, selector_or_exit, validate_or_exit
 from sweep_common import (
     log_summary,
     AWS_REGION,
@@ -230,8 +232,14 @@ def check_table_sample(owner, table, target_cols, sample_records, err_msg=""):
     return findings
 
 
-def run_type_gate(sample_rows=1000, max_tables=None, tables_filter=None):
+def run_type_gate(sample_rows=1000, max_tables=None, tables_filter=None, selector=None):
+    """
+    Samples one file per selected table. A run without selectors is FULL and replaces gate_results.csv and the pass
+    list; a targeted run replaces only the rows / lines of its own tables.
+    """
     ts = get_timestamp()
+    sel = selector or Selector(tables=[(None, t.split(".")[-1].lower()) if "." not in t else tuple(t.lower().split(".", 1))
+                                       for t in (tables_filter or ())])
     map_path = ORACLE_OUTPUTS_DIR / "oracle_02_s3_file_map.csv"
     if not map_path.exists():
         map_path = ORACLE_OUTPUTS_DIR / "s3_file_map.csv"
@@ -261,23 +269,34 @@ def run_type_gate(sample_rows=1000, max_tables=None, tables_filter=None):
             })
 
     # Pick representative files to sample per table (prefer non-empty files)
-    files_to_sample = {}
     with open(map_path, "r", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            k = (r["owner"].upper(), r["table_name"].upper())
-            if tables_filter and f"{k[0]}.{k[1]}" not in tables_filter and k[1] not in tables_filter:
-                continue
-            sz = int(r.get("size_bytes") or 0)
-            if k not in files_to_sample:
-                files_to_sample[k] = (r["uri"], sz)
-            elif files_to_sample[k][1] == 0 and sz > 0:
-                # Upgrade to non-empty chunk if previous was 0 bytes
-                files_to_sample[k] = (r["uri"], sz)
+        map_rows = list(csv.DictReader(f))
+    validate_or_exit(sel.validate_tables, [(r["owner"], r["table_name"]) for r in map_rows], what="the S3 file map", logger=logger)
+    validate_or_exit(sel.validate_files, [r["uri"] for r in map_rows], what="the S3 file map", logger=logger)
+    files_to_sample = {}
+    for r in map_rows:
+        k = (r["owner"].upper(), r["table_name"].upper())
+        if not sel.matches(*k):
+            continue
+        if sel.files and not sel.matches_file(r["uri"]):
+            continue
+        sz = int(r.get("size_bytes") or 0)
+        if k not in files_to_sample:
+            files_to_sample[k] = (r["uri"], sz)
+        elif files_to_sample[k][1] == 0 and sz > 0:
+            # Upgrade to non-empty chunk if previous was 0 bytes
+            files_to_sample[k] = (r["uri"], sz)
 
     files_to_sample = {k: v[0] for k, v in files_to_sample.items()}
 
     if max_tables:
         files_to_sample = dict(list(files_to_sample.items())[:max_tables])
+
+    if sel.dry_run:
+        for (o, t), uri in files_to_sample.items():
+            logger.info(f"[dry-run] would sample {o}.{t} from {Path(uri).name}")
+        logger.info(f"[dry-run] {sel.describe()}: {len(files_to_sample)} table sample(s); nothing written")
+        return True
 
     logger.info(f"Running pre-flight data type gate on {len(files_to_sample)} table sample(s)...")
 
@@ -307,24 +326,24 @@ def run_type_gate(sample_rows=1000, max_tables=None, tables_filter=None):
             "sample_file": Path(uri).name
         })
 
-    # Save outputs/oracle_03_gate_results.csv and gate_results.csv
+    # Save outputs/oracle_03_gate_results.csv and gate_results.csv (merged by table on a targeted run)
+    full = not sel.filtered
+    gate_header = ["owner", "table_name", "sampled_rows", "findings_count", "blocks", "warns", "status", "sample_file"]
     for p_out in (ORACLE_OUTPUTS_DIR / "oracle_03_gate_results.csv", ORACLE_OUTPUTS_DIR / "gate_results.csv"):
-        with open(p_out, "w", newline="", encoding="utf-8") as f:
-            if table_summaries:
-                w = csv.DictWriter(f, fieldnames=list(table_summaries[0].keys()))
-                w.writeheader()
-                w.writerows(table_summaries)
-            else:
-                w = csv.writer(f)
-                w.writerow(["owner", "table_name", "sampled_rows", "findings_count", "blocks", "warns", "status", "sample_file"])
+        merge_csv(p_out, table_summaries, scope=None if full else sel.table_scope("owner", "table_name"), full=full,
+                  fieldnames=gate_header)
     logger.info(f"Saved: {ORACLE_OUTPUTS_DIR / 'oracle_03_gate_results.csv'}")
 
     # Save outputs/oracle_03_gate_pass_tables.txt and gate_pass_tables.txt (tables with 0 BLOCK findings, ready to load)
     passed_tables = [f"{r['owner']}.{r['table_name']}" for r in table_summaries if r["blocks"] == 0]
     for p_out in (ORACLE_OUTPUTS_DIR / "oracle_03_gate_pass_tables.txt", ORACLE_OUTPUTS_DIR / "gate_pass_tables.txt"):
-        with open(p_out, "w", encoding="utf-8") as f:
-            for pt in passed_tables:
-                f.write(pt + "\n")
+        lines = list(passed_tables)
+        if not full and p_out.exists():
+            kept = [ln for ln in p_out.read_text(encoding="utf-8").splitlines()
+                    if ln.strip() and not sel.matches(*(ln.strip().split(".", 1) if "." in ln else ("", ln.strip())))]
+            lines = sorted(set(kept) | set(passed_tables))
+            logger.info(f"targeted run: merged {len(passed_tables)} entries, kept {len(kept)} in {p_out.name}")
+        write_text_file(p_out, "".join(ln + "\n" for ln in lines))
     logger.info(f"Saved: {ORACLE_OUTPUTS_DIR / 'oracle_03_gate_pass_tables.txt'} ({len(passed_tables)} passed table(s))")
 
     # Generate Excel Report
@@ -376,10 +395,9 @@ def run_type_gate(sample_rows=1000, max_tables=None, tables_filter=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="03_typeGateway.py - Pre-Flight Type Gateway")
     parser.add_argument("--rows", type=int, default=1000, help="Number of rows to sample per file")
-    parser.add_argument("--tables", help="Comma-separated tables to check (e.g. BSS01001.BROKERACCOUNTDETAIL)")
     parser.add_argument("--max-tables", type=int, help="Limit number of tables sampled")
+    add_targeting_args(parser, schemas="--owners", file=True)
     args = parser.parse_args()
 
-    tables = {t.strip().upper() for t in args.tables.split(",")} if args.tables else None
-    ok = run_type_gate(sample_rows=args.rows, max_tables=args.max_tables, tables_filter=tables)
+    ok = run_type_gate(sample_rows=args.rows, max_tables=args.max_tables, selector=selector_or_exit(args, logger))
     sys.exit(0 if ok else 1)

@@ -22,6 +22,10 @@ from sweep_common import (
     get_logger, get_timestamp, get_db_name, generate_excel_report, run_psql, query_db_rows
 )
 
+from sweep_common import layer_dir
+from sweep_ddlfrag import FragmentStore
+from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
+
 logger = get_logger("vsam_05_apply_ddl", "vsam_05_apply_ddl")
 
 
@@ -29,7 +33,25 @@ def main():
     parser = argparse.ArgumentParser(description="Step 05: Apply pre-load DDL (tables only, no PK) to PostgreSQL.")
     parser.add_argument("--skip-meta", action="store_true", help="Skip re-deploying sweep_meta.sql control schema")
     parser.add_argument("--bg", action="store_true", help="Run in background")
+    add_targeting_args(parser)
     args = parser.parse_args()
+    sel = selector_or_exit(args, logger)
+    store = FragmentStore(layer_dir(VSAM_OUTPUTS_DIR / "ddl_fragments"))
+    known = [(sc, t) for sc in store.schemas() for t in store.tables(sc)]
+    if sel.filtered:
+        if not known:
+            logger.error("No per-table DDL found; run 'sweep.py vsam gen-ddl' first")
+            sys.exit(1)
+        validate_or_exit(sel.validate_tables, known, what="the generated DDL", logger=logger)
+        picked = [(sc, t) for sc, t in known if sel.matches(sc, t)]
+        if sel.dry_run:
+            for sc, t in picked:
+                logger.info(f"[dry-run] would apply {sc}.{t}")
+            logger.info(f"[dry-run] {sel.describe()}: {len(picked)} table(s); nothing applied")
+            return True
+    elif sel.dry_run:
+        logger.info(f"[dry-run] would apply the whole DDL script ({len(known)} table fragment(s)); nothing applied")
+        return True
 
     logger.info("=" * 75)
     logger.info("SWEEP VSAM MIGRATION - STEP 05: TARGET DDL DEPLOYMENT (TABLES ONLY)")
@@ -42,23 +64,28 @@ def main():
             run_psql(SWEEP_META_SQL, is_file=True)
             logger.info("[+] sweep_ctl & sweep_meta deployed.")
 
-    # 2. Apply Pre-Load DDL (tables without PK)
-    ddl_file = (
-        VSAM_GEN_DDL_DIR / "vsam_04_all.sql" if (VSAM_GEN_DDL_DIR / "vsam_04_all.sql").exists() else
-        VSAM_GEN_DDL_DIR / "all_tables.sql"
-    )
-    if not ddl_file.exists():
-        ddl_file = VSAM_PRE_LOAD_DIR / "all_tables.sql"
-    if not ddl_file.exists():
-        ddl_file = VSAM_OUTPUTS_DIR / "ddl" / "all.sql"
+    # 2. Apply Pre-Load DDL (tables without PK). A targeted run applies only the selected tables' fragments.
+    if sel.filtered:
+        for sc in sorted({sc for sc, _ in picked}):
+            run_psql(store.script_for(sc, "pre", [t for s_, t in picked if s_ == sc]))
+        logger.info(f"[+] {len(picked)} target table(s) provisioned.")
+    else:
+        ddl_file = (
+            VSAM_GEN_DDL_DIR / "vsam_04_all.sql" if (VSAM_GEN_DDL_DIR / "vsam_04_all.sql").exists() else
+            VSAM_GEN_DDL_DIR / "all_tables.sql"
+        )
+        if not ddl_file.exists():
+            ddl_file = VSAM_PRE_LOAD_DIR / "all_tables.sql"
+        if not ddl_file.exists():
+            ddl_file = VSAM_OUTPUTS_DIR / "ddl" / "all.sql"
 
-    if not ddl_file.exists():
-        logger.error(f"DDL file not found at {ddl_file}. Run 'sweep.py vsam gen-ddl' first.")
-        sys.exit(1)
+        if not ddl_file.exists():
+            logger.error(f"DDL file not found at {ddl_file}. Run 'sweep.py vsam gen-ddl' first.")
+            sys.exit(1)
 
-    logger.info(f"Executing table DDL: {ddl_file}...")
-    run_psql(ddl_file, is_file=True)
-    logger.info("[+] Target tables and schemas provisioned.")
+        logger.info(f"Executing table DDL: {ddl_file}...")
+        run_psql(ddl_file, is_file=True)
+        logger.info("[+] Target tables and schemas provisioned.")
     logger.info("[i] Primary key constraints are managed in Step 06 (load-data) for fresh tables or upserts.")
 
     # 3. Catalog verification

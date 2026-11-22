@@ -19,6 +19,7 @@ Generates:
   - outputs/post_load/<schema>_triggers.sql
   - reports/04_generateDDL_report_<timestamp>.xlsx
 """
+import io
 import re
 import sys
 import csv
@@ -50,6 +51,16 @@ from sweep_common import (
     child_name,
     FILE_READ_ERRORS,
 )
+
+from sweep_common import ORACLE_OUTPUTS_DIR, layer_dir
+from sweep_ddlfrag import SCHEMA_LEVEL, FragmentStore
+from sweep_targeting import Selector, add_targeting_args, selector_or_exit, validate_or_exit
+
+# script kinds in the order of the old per-schema file handles, and the suffix of each assembled script
+KINDS = ("tables", "pk", "alter", "idx", "fk", "val", "views", "trg")
+KIND_SUFFIX = {"tables": "_tables.sql", "pk": "_unique_and_pk.sql", "alter": "_alter_statements.sql", "idx": "_indexes.sql",
+               "fk": "_fk_not_valid.sql", "val": "_fk_validate.sql", "views": "_views.sql", "trg": "_triggers.sql"}
+DDL_FRAGMENT_ROOT = layer_dir(ORACLE_OUTPUTS_DIR / "ddl_fragments")
 
 logger = get_logger("oracle_04_generate_ddl", "oracle_04_generate_ddl")
 
@@ -528,7 +539,12 @@ def translate_trigger_ddl(owner, trg_name, raw_ddl):
     return pg_ddl
 
 
-def generate_ddl(owners_filter=None, tables_filter=None):
+def generate_ddl(owners_filter=None, tables_filter=None, selector=None):
+    """
+    DDL is written per table (fragments + manifest, see sweep_ddlfrag) and the per-schema scripts in
+    outputs/pre_load and outputs/post_load are assembled from the fragments. A targeted run (selector) rewrites only
+    its own fragments; a run without selectors is FULL and prunes fragments of tables that no longer exist.
+    """
     ts = get_timestamp()
     dd_path = META_TABLES_CSV
     if not dd_path.exists():
@@ -581,23 +597,40 @@ def generate_ddl(owners_filter=None, tables_filter=None):
     if fk_bigint_cols:
         logger.info(f"Identified {len(fk_bigint_cols)} child column(s) referencing parent identity columns to align as BIGINT.")
 
+    store = FragmentStore(DDL_FRAGMENT_ROOT)
+    sel = selector or Selector(schemas={o.lower() for o in (owners_filter or ())},
+                               tables=[(None, t.split(".")[-1].lower()) if "." not in t else tuple(t.lower().split(".", 1))
+                                       for t in (tables_filter or ())])
+    validate_or_exit(sel.validate_tables, [(r["owner"], r["table_name"]) for r in reader], what="the Oracle metadata", logger=logger)
+    if sel.dry_run:
+        picked = sorted({(r["owner"].upper().strip(), r["table_name"].upper().strip()) for r in reader
+                         if sel.matches(r["owner"], r["table_name"])})
+        for o, t in picked:
+            logger.info(f"[dry-run] would generate DDL for {o}.{t}")
+        logger.info(f"[dry-run] {sel.describe()}: DDL of {len(picked)} table(s) would be (re)written; nothing written")
+        return True
+    full = not sel.filtered
+    owner_objects_ok = lambda o: (not sel.schemas or o.lower() in sel.schemas) and not sel.tables
+    touched = set()
+
     grouped_tables = groupby(reader, key=lambda r: (r["owner"].upper().strip(), r["table_name"].upper().strip()))
 
-    file_handles = {}
+    preambles = {}
 
-    def get_handles(schema_name, owner_name):
-        if schema_name not in file_handles:
+    def get_preambles(schema_name, owner_name):
+        """Constant script headers of a schema (CREATE SCHEMA + sequences, audit function, Oracle helpers ...)."""
+        if schema_name not in preambles:
             # Table DDL placed into ORACLE_PRE_LOAD_DIR (outputs/pre_load)
-            s_tables = open(ORACLE_PRE_LOAD_DIR / f"{schema_name}_tables.sql", "w", encoding="utf-8")
+            s_tables = io.StringIO()
 
             # Post-load scripts placed into ORACLE_POST_LOAD_DIR (outputs/post_load)
-            s_pk = open(ORACLE_POST_LOAD_DIR / f"{schema_name}_unique_and_pk.sql", "w", encoding="utf-8")
-            s_alter = open(ORACLE_POST_LOAD_DIR / f"{schema_name}_alter_statements.sql", "w", encoding="utf-8")
-            s_idx = open(ORACLE_POST_LOAD_DIR / f"{schema_name}_indexes.sql", "w", encoding="utf-8")
-            s_fk = open(ORACLE_POST_LOAD_DIR / f"{schema_name}_fk_not_valid.sql", "w", encoding="utf-8")
-            s_val = open(ORACLE_POST_LOAD_DIR / f"{schema_name}_fk_validate.sql", "w", encoding="utf-8")
-            s_views = open(ORACLE_POST_LOAD_DIR / f"{schema_name}_views.sql", "w", encoding="utf-8")
-            s_trg = open(ORACLE_POST_LOAD_DIR / f"{schema_name}_triggers.sql", "w", encoding="utf-8")
+            s_pk = io.StringIO()
+            s_alter = io.StringIO()
+            s_idx = io.StringIO()
+            s_fk = io.StringIO()
+            s_val = io.StringIO()
+            s_views = io.StringIO()
+            s_trg = io.StringIO()
 
             # Header configurations
             s_tables.write(f"-- Target DDL for Schema: {schema_name}\n")
@@ -668,24 +701,26 @@ RETURNS date AS $$
 $$ LANGUAGE sql IMMUTABLE;
 
 """)
-            file_handles[schema_name] = (s_tables, s_pk, s_alter, s_idx, s_fk, s_val, s_views, s_trg)
-        return file_handles[schema_name]
+            preambles[schema_name] = {k: h.getvalue() for k, h in zip(KINDS, (s_tables, s_pk, s_alter, s_idx, s_fk, s_val, s_views, s_trg))}
+        return preambles[schema_name]
 
     generated_tables_summary = []
+    manifest_entries = {}
     generated_partitions_summary = []
     synth_cons_counts = defaultdict(int)
 
     for (owner, table), cols_iter in grouped_tables:
-        if owners_filter and owner not in owners_filter:
-            continue
-        if tables_filter and f"{owner}.{table}" not in tables_filter and table not in tables_filter:
+        if not sel.matches(owner, table):
             continue
 
         schema = owner.lower()
         t_clean = norm_col(table)
         cols = list(cols_iter)
 
-        h_tables, h_pk, h_alter, h_idx, h_fk, h_val, h_views, h_trg = get_handles(schema, owner)
+        get_preambles(schema, owner)
+        tbufs = {k: io.StringIO() for k in KINDS}
+        h_tables, h_pk, h_alter, h_idx, h_fk, h_val, h_views, h_trg = (tbufs[k] for k in KINDS)
+        touched.add(schema)
 
         # Check existing columns
         existing_cols = {norm_col(c_col["column_name"]) for c_col in cols}
@@ -851,6 +886,9 @@ $$ LANGUAGE sql IMMUTABLE;
             else:
                 h_idx.write(f"CREATE {unq}INDEX CONCURRENTLY IF NOT EXISTS {q(i_name)} ON {q(schema)}.{q(t_clean)} ({target_cols});\n")
 
+        written = [k for k in KINDS if store.write(schema, t_clean, k, tbufs[k].getvalue())]
+        manifest_entries[f"{schema}.{t_clean}"] = {"schema": schema, "table": t_clean, "source": f"{owner}.{table}", "kinds": written}
+
         generated_tables_summary.append({
             "schema": schema,
             "table_name": t_clean,
@@ -867,10 +905,12 @@ $$ LANGUAGE sql IMMUTABLE;
 
     all_owners = set(views_by_owner.keys()) | set(triggers_by_owner.keys()) | set(sequences.keys())
     for s_owner in sorted(all_owners):
-        if owners_filter and s_owner not in owners_filter:
+        if not owner_objects_ok(s_owner):
             continue
         s_clean = s_owner.lower()
-        h_tables, h_pk, h_alter, h_idx, h_fk, h_val, h_views, h_trg = get_handles(s_clean, s_owner)
+        get_preambles(s_clean, s_owner)
+        touched.add(s_clean)
+        h_views, h_trg = io.StringIO(), io.StringIO()
 
         # Views for this schema
         base_s = s_clean[:-5] if s_clean.endswith("_code") else s_clean
@@ -898,10 +938,21 @@ $$ LANGUAGE sql IMMUTABLE;
                 "status": "TRANSLATED"
             })
 
-    # Close all files
-    for handles in file_handles.values():
-        for h in handles:
-            h.close()
+        store.write(s_clean, SCHEMA_LEVEL, "views", h_views.getvalue())
+        store.write(s_clean, SCHEMA_LEVEL, "trg", h_trg.getvalue())
+
+    # Assemble the per-schema scripts from the fragments (all tables of the schema, not only this run's)
+    if full:
+        pruned = store.prune({tuple(k.split(".", 1)) for k in manifest_entries})
+        if pruned:
+            logger.info(f"full run: removed {pruned} stale DDL fragment(s)")
+        touched |= set(store.schemas())
+    store.record(manifest_entries, full=full)
+    for schema_name in sorted(touched):
+        pre = get_preambles(schema_name, schema_name.upper())
+        for kind in KINDS:
+            out_dir = ORACLE_PRE_LOAD_DIR if kind == "tables" else ORACLE_POST_LOAD_DIR
+            store.assemble(schema_name, kind, pre[kind], out_dir / f"{schema_name}{KIND_SUFFIX[kind]}")
 
     logger.info(f"Generated DDL for {len(generated_tables_summary)} table(s) in outputs/pre_load/ and outputs/post_load/")
 
@@ -929,7 +980,7 @@ $$ LANGUAGE sql IMMUTABLE;
     logger.info(f"Excel report generated: {report_file}")
     
     log_summary(logger, Path(__file__).name, [
-        ('schemas processed', len(file_handles)),
+        ('schemas processed', len(touched)),
         ('tables generated', len(generated_tables_summary)),
         ('partitioned tables', len(generated_partitions_summary)),
         ('child partitions generated', sum(r['partition_count'] for r in generated_partitions_summary)),
@@ -942,12 +993,8 @@ $$ LANGUAGE sql IMMUTABLE;
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="04_generateDDL.py - Target DDL & Partition Generator + View/Trigger Translation")
-    parser.add_argument("--owners", help="Comma-separated owners to generate (e.g. BSS01001,BSS01104)")
-    parser.add_argument("--tables", help="Comma-separated tables to generate (e.g. BSS01001.BROKERACCOUNTDETAIL)")
+    add_targeting_args(parser, schemas="--owners")
     args = parser.parse_args()
 
-    owners = {o.strip().upper() for o in args.owners.split(",")} if args.owners else None
-    tables = {t.strip().upper() for t in args.tables.split(",")} if args.tables else None
-
-    ok = generate_ddl(owners_filter=owners, tables_filter=tables)
+    ok = generate_ddl(selector=selector_or_exit(args, logger))
     sys.exit(0 if ok else 1)

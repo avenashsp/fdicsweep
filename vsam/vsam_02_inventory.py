@@ -63,7 +63,9 @@ from vsam.vsam_common import (
     S3File,
 )
 
+from sweep_merge import merge_csv
 from sweep_s3meta import canon_etag, canon_time
+from sweep_targeting import add_targeting_args, exit_bad_selection, selector_or_exit, validate_or_exit
 
 logger = get_logger("vsam_02_inventory", "vsam_02_inventory")
 
@@ -330,7 +332,7 @@ def token_matches_copybook(token, cb_set):
 def main():
     parser = argparse.ArgumentParser(description="Step 02: Discover and map VSAM files to PostgreSQL tables.")
     parser.add_argument("--s3", default=VSAM_S3_BUCKET, help="Target S3 URI prefix")
-    parser.add_argument("--company", help="Comma-separated company tokens to filter")
+    add_targeting_args(parser, company=True, file=True)
     parser.add_argument("--tbl-col", choices=TBL_COL_CHOICES, default=None,
                         help="Table column names: 'headers' = S3 file headers (default, or VSAM_TBL_COL env) or "
                              "'copybook' = names of the mapped copybook columns. Datatypes always come from the "
@@ -339,7 +341,7 @@ def main():
     args = parser.parse_args()
     tbl_col = resolve_tbl_col(args.tbl_col)
 
-    filter_companies = [c.strip().upper() for c in args.company.split(",")] if args.company else None
+    sel = selector_or_exit(args, logger)
 
     logger.info("=" * 75)
     logger.info("SWEEP VSAM MIGRATION - STEP 02: S3 DISCOVERY & INVENTORY MAPPING")
@@ -371,6 +373,50 @@ def main():
     for fld, s3_file in s3_discovered:
         s3_by_folder[fld].append(s3_file)
 
+    # 1b. Which logical sources (company token, source file) does this run cover? Validated before any work.
+    def folder_files(folder):
+        fp = BASE / folder if folder else BASE
+        local = [x for x in fp.iterdir() if x.is_file() and x.name.lower().endswith((".csv", ".csv.gz"))] if fp.exists() and fp.is_dir() else []
+        return sorted(local + s3_by_folder.get(folder, []), key=lambda x: x.name)
+
+    def early_table(tok, src):
+        """Target table NAME of a source (before schemas are resolved)."""
+        m = match_source(tok, src, korg)
+        mi = master_info.get(src.upper()) or master_info.get(src.lower(), {})
+        tbl = mi.get("table") or (m[1] if m else "") or f"stg_{norm_col(src).lower()}_v"
+        return (tbl.split(".", 1)[1] if "." in tbl else tbl).lower()
+
+    unit_files = defaultdict(list)
+    for fld in folders:
+        for f in folder_files(fld):
+            parsed = parse_filename(f.name)
+            if parsed:
+                unit_files[(parsed[0].upper(), parsed[1].upper())].append(f)
+    all_names = [f.name for fs in unit_files.values() for f in fs]
+    selected_units = None                       # None = every unit (a full run)
+    if sel.filtered:
+        validate_or_exit(sel.validate_companies, {t for t, _ in unit_files}, what="S3", logger=logger)
+        validate_or_exit(sel.validate_files, all_names, what="S3", logger=logger)
+        for fname in sel.files:                  # a named file whose name cannot be parsed is an error, not a silent skip
+            hits = [f for fld in folders for f in folder_files(fld) if sel.matches_file(f.name) and sel.matches_file_single(fname, f.name)]
+            if hits and not any(parse_filename(f.name) for f in hits):
+                exit_bad_selection(f"cannot parse the file name '{fname}' (expected <company>_<source>_<date>.csv)", logger)
+        selected_units = set()
+        for (tok, src), files in unit_files.items():
+            if sel.companies and tok not in sel.companies:
+                continue
+            if sel.files and not any(sel.matches_file(f.name) or sel.matches_file(str(f)) for f in files):
+                continue
+            if sel.table_selectors and not sel.matches_table_name(early_table(tok, src)):
+                continue
+            selected_units.add((tok, src))
+        # sources that feed the same table are processed together so their columns stay unified
+        shared = {early_table(t, s) for t, s in selected_units}
+        selected_units |= {u for u in unit_files if early_table(*u) in shared}
+        if not selected_units:
+            exit_bad_selection(f"nothing matches the selectors ({sel.describe()})", logger)
+        logger.info(f"Targeted run ({sel.describe()}): {len(selected_units)} logical source(s)")
+
     # 2. Iterate across discovered folders
     for folder in folders:
         fp = BASE / folder if folder else BASE
@@ -399,7 +445,7 @@ def main():
         header_tokens_cache = {}
 
         for (g_tok, g_src), g_files in groups.items():
-            if filter_companies and g_tok not in filter_companies:
+            if selected_units is not None and (g_tok, g_src) not in selected_units:
                 continue
 
             m = match_source(g_tok, g_src, korg)
@@ -482,6 +528,8 @@ def main():
             issues = []
             parsed = parse_filename(p.name)
             if not parsed:
+                if sel.filtered:
+                    continue            # unparseable names are only (re)reported by a full run
                 inv.append({
                     "folder": folder, "s3_filename": p.name, "full_path": str(p),
                     "company_token": "", "source_company": "", "source_filename": "",
@@ -503,7 +551,7 @@ def main():
                         company = c_cand
                         break
 
-            if filter_companies and company and company.upper() not in filter_companies:
+            if selected_units is not None and (tok.upper(), src.upper()) not in selected_units:
                 continue
 
             schemas = schemas_ref.get(company, []) if company else []
@@ -742,16 +790,39 @@ def main():
     df = pd.DataFrame(inv) if inv else pd.DataFrame(columns=inv_cols)
     lm = pd.DataFrame(loads) if loads else pd.DataFrame(columns=lm_cols)
 
+    # --tables / --schemas / --exclude-tables: keep only the sources that really load into a selected table
+    if sel.table_selectors:
+        validate_or_exit(sel.validate_tables, [(l["target_schema"], l["target_table"]) for l in loads], what="the inventory", logger=logger)
+        keep = {(l["source_company"].upper(), l["source_filename"].upper()) for l in loads if sel.matches(l["target_schema"], l["target_table"])}
+        inv = [r for r in inv if ((r["source_company"] or "").upper(), r["source_filename"].upper()) in keep]
+        loads = [l for l in loads if sel.matches(l["target_schema"], l["target_table"])]
+        latest_headers_records = [h for h in latest_headers_records if any((h["company_token"], h["source_filename"]) == (r["company_token"].upper(), r["source_filename"].upper()) for r in inv)]
+        column_map_rows = [r for r in column_map_rows if ((r.get("source_company") or "").upper(), (r.get("source_filename") or "").upper()) in keep]
+        df = pd.DataFrame(inv) if inv else pd.DataFrame(columns=inv_cols)
+        lm = pd.DataFrame(loads) if loads else pd.DataFrame(columns=lm_cols)
+
     if not lm.empty:      # VSAM files are full snapshots: only the newest version per (company, source file) is loaded
         orig_count = len(lm)
         lm = filter_latest_versions(lm, ["source_company", "source_filename"])
         logger.info(f"Filtered to latest file versions: {len(lm)} tasks (was {orig_count})")
 
+    if sel.dry_run:
+        for r in lm.to_dict(orient="records"):
+            logger.info(f"[dry-run] would map {r.get('s3_filename')} -> {r.get('target_schema')}.{r.get('target_table')}")
+        logger.info(f"[dry-run] {sel.describe()}: {len(df)} file(s), {len(lm)} target mapping(s); nothing written")
+        return True
+
+    # Outputs: a full run replaces the files; a targeted run replaces only the rows of its own sources
+    full = not sel.filtered
+    run_keys_co = {((r["source_company"] or "").upper(), r["source_filename"].upper()) for r in inv}
+    run_keys_tok = {((r["company_token"] or "").upper(), r["source_filename"].upper()) for r in inv}
+    in_tok = lambda r: ((r.get("company_token") or "").upper(), (r.get("source_filename") or "").upper()) in run_keys_tok
+    in_co = lambda r: ((r.get("source_company") or "").upper(), (r.get("source_filename") or "").upper()) in run_keys_co
     OUT.mkdir(parents=True, exist_ok=True)
-    df.to_csv(OUT / "vsam_02_inventory.csv", index=False)
-    df.to_csv(OUT / "inventory.csv", index=False)
-    lm.to_csv(OUT / "vsam_02_load_matrix.csv", index=False)
-    lm.to_csv(OUT / "load_matrix.csv", index=False)
+    for name in ("vsam_02_inventory.csv", "inventory.csv"):
+        merge_csv(OUT / name, inv, full=full, scope=None if full else in_tok, fieldnames=inv_cols)
+    for name in ("vsam_02_load_matrix.csv", "load_matrix.csv"):
+        merge_csv(OUT / name, lm.to_dict(orient="records"), full=full, scope=None if full else in_co, fieldnames=lm_cols)
 
     unify_shared_table_columns(inv, colmap_cache)
     for ck, refs in row_refs.items():            # keys follow any column renamed by the unification
@@ -762,7 +833,7 @@ def main():
             if new_keys and new_keys != cached[0]:
                 for r in refs:
                     r["key_columns"] = ", ".join(new_keys)
-    write_column_map(column_map_rows)
+    write_column_map(column_map_rows, scope=None if full else in_co, full=full)
     logger.info(f"Saved column map: {OUT / 'vsam_02_column_map.csv'} ({len(column_map_rows)} rows, tbl-col={tbl_col})")
 
     hdr_cols = [
@@ -771,8 +842,8 @@ def main():
         "matched_copybook_columns", "unmatched_columns", "full_path"
     ]
     hdf = pd.DataFrame(latest_headers_records) if latest_headers_records else pd.DataFrame(columns=hdr_cols)
-    hdf.to_csv(OUT / "vsam_02_latest_file_headers.csv", index=False)
-    hdf.to_csv(OUT / "latest_file_headers.csv", index=False)
+    for name in ("vsam_02_latest_file_headers.csv", "latest_file_headers.csv"):
+        merge_csv(OUT / name, latest_headers_records, full=full, scope=None if full else in_tok, fieldnames=hdr_cols)
     logger.info(f"Saved latest file headers: {OUT / 'vsam_02_latest_file_headers.csv'} ({len(hdf)} tables)")
 
     # Excel report - FileInventory with the exact requested columns

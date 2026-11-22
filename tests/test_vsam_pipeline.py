@@ -113,5 +113,5 @@ def test_keyless_table_files_replace_it_together_or_not_at_all(pg_db, tmp_path):
     res = v6.run_unit("kk", files("a,b\n20,ok\n", "a,b\nnot-int,bad\n"), 1, run_strict, {})
     assert [r["status"] for r in res] == ["FAILED", "FAILED"] and "rolled back together" in res[0]["error"]
     assert c.run_psql("SELECT string_agg(b, ',') FROM bcs.kk", tuples_only=True) == "new,new"       # old snapshot kept
-    assert c.run_psql("SELECT count(*) FROM sweep_ctl.load_log WHERE status = 'SUCCESS' AND uri LIKE '%#bcs'", tuples_only=True) == "4"   # no row for the failed attempt
-    assert c.run_psql("SELECT count(*) FROM sweep_ctl.load_log WHERE status = 'FAILED'", tuples_only=True) == "2"
+    assert c.run_psql("SELECT count(*) FROM sweep_ctl.vsam_load_log WHERE status = 'SUCCESS' AND target_schema = 'bcs'", tuples_only=True) == "4"   # no row for the failed attempt
+    assert c.run_psql("SELECT count(*) FROM sweep_ctl.vsam_load_log WHERE status = 'FAILED'", tuples_only=True) == "2"

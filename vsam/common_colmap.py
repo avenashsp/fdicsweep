@@ -550,10 +550,15 @@ def load_previous_map(path=None):
     return prev
 
 
-def write_column_map(rows, path=None):
+def write_column_map(rows, path=None, scope=None, full=True):
+    """
+    Writes the column map. A full run replaces the file; a targeted run (full=False) replaces only the rows for which
+    `scope(row)` is true and keeps every other row (sweep_merge).
+    """
+    from sweep_merge import merge_csv
     path = path or COLMAP_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows, columns=COLMAP_FIELDS).to_csv(path, index=False)
+    merge_csv(path, rows, scope=None if full else scope, full=full, fieldnames=COLMAP_FIELDS)
     _MAP_CACHE.clear()
     return path
 

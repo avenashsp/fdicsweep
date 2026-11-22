@@ -62,7 +62,7 @@ def test_oracle_load_handles_hostile_filenames_without_executing_them(pg_db, gz_
     assert (out.status, out.error) == ("SUCCESS", "") and out.rows == 2
     assert not (tmp_path / "PWNED").exists()
     assert c.run_psql("SELECT count(*) FROM s1.logs", tuples_only=True) == "2"
-    assert c.run_psql(f"SELECT count(*) FROM {c.LOAD_LOG_TABLE}", tuples_only=True) == "1"
+    assert c.run_psql(f"SELECT count(*) FROM {c.ORACLE_LOAD_LOG_TABLE}", tuples_only=True) == "1"
 
 
 def test_oracle_load_is_atomic_when_stream_is_truncated(pg_db, tmp_path):
@@ -74,7 +74,7 @@ def test_oracle_load_is_atomic_when_stream_is_truncated(pg_db, tmp_path):
     out = o6.load_single_file(_job(bad, "s1", "t"), worker_id=1)
     assert out.status == "FAILED" and out.error
     assert c.run_psql("SELECT count(*) FROM s1.t", tuples_only=True) == "0"            # nothing committed
-    assert c.run_psql(f"SELECT count(*) FROM {c.LOAD_LOG_TABLE}", tuples_only=True) == "0"
+    assert c.run_psql(f"SELECT count(*) FROM {c.ORACLE_LOAD_LOG_TABLE}", tuples_only=True) == "0"
 
 
 def test_oracle_load_missing_column_fails_cleanly(pg_db, gz_file):
@@ -96,18 +96,18 @@ def test_lookup_failures_are_not_mistaken_for_empty_or_pkless(pg_db, monkeypatch
     assert not o6.PK_CACHE                                       # failure was not cached as "no PK"
 
 
-def test_vsam_load_log_rows_use_uri_hash_schema_keys(pg_db):
+def test_vsam_load_log_rows_are_keyed_by_uri_and_schema(pg_db):
     from vsam import vsam_06_load_data as v6
     v6.write_load_log("s3://b/f.csv", "bss01104", "t", 10, 5, 0.5, 1)
     v6.write_load_log("s3://b/f.csv", "bcs", "t", 10, 7, 0.5, 1)
     v6.write_load_log("s3://b/f.csv", "bcs", "t", 10, 9, 0.5, 1)          # upsert, not a duplicate
-    rows = sorted(c.query_db_rows(f"SELECT uri || '|' || loaded_rows FROM {c.CTL_SCHEMA}.load_log"))
-    assert rows == ["s3://b/f.csv#bcs|9", "s3://b/f.csv#bss01104|5"]
+    rows = sorted(c.query_db_rows(f"SELECT uri || '|' || target_schema || '|' || loaded_rows FROM {c.VSAM_LOAD_LOG_TABLE}"))
+    assert rows == ["s3://b/f.csv|bcs|9", "s3://b/f.csv|bss01104|5"]      # the real uri, no '#schema' suffix
 
 
 def test_vsam_failed_log_write_raises(pg_db):
     from vsam import vsam_06_load_data as v6
-    c.run_psql(f"DROP TABLE {c.CTL_SCHEMA}.load_log")
+    c.run_psql(f"DROP TABLE {c.VSAM_LOAD_LOG_TABLE}")
     with pytest.raises(RuntimeError):
         v6.write_load_log("s3://b/f.csv", "bcs", "t", 1, 1, 0.1, 1)
 

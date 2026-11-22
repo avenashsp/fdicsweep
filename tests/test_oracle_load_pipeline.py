@@ -113,7 +113,7 @@ def test_file_fails_at_reject_limit_and_rolls_back(gz_file):
     o = _load(gz_file, "a.csv.gz", body, "p9", "t", max_rejects=10)
     assert o.status == "FAILED" and "Too many rejected rows" in o.error
     assert _q("SELECT count(*) FROM p9.t") == "0"
-    assert _q(f"SELECT count(*) FROM {c.LOAD_LOG_TABLE}") == "0"
+    assert _q(f"SELECT count(*) FROM {c.ORACLE_LOAD_LOG_TABLE}") == "0"
     assert int(_q(f"SELECT count(*) FROM {pl.REJECT_TABLE}")) >= 10                 # kept for diagnosis
     # 9 rejects is below the limit -> file succeeds
     body = "id,v\n" + "".join(f"{i},\n" for i in range(9)) + "100,ok\n"

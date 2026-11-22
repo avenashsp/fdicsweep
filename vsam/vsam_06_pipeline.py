@@ -17,10 +17,10 @@ together, so they share one transaction and one connection):
       keyed:    INSERT ... ON CONFLICT (key) DO UPDATE ... WHERE (target) IS DISTINCT FROM (file)
       keyless:  TRUNCATE the destination tables, INSERT the new snapshot
       row-count check: read = inserted + updated + unchanged + rejected + duplicates, else roll back
-      rejected rows -> sweep_ctl.load_rejects, load_log rows (with the S3 metadata), COMMIT
+      rejected rows -> sweep_ctl.load_rejects, vsam_load_log rows (with the S3 metadata), COMMIT
     END
 """
-from sweep_common import CTL_SCHEMA, lit, q
+from sweep_common import VSAM_LOAD_LOG_TABLE, lit, q
 from sweep_loadpipe import MAX_DUP_ROWS_PRINTED, MAX_REJECT_ROWS_PRINTED, REJECT_TABLE, TEXT_TYPES, upsert_statements
 from sweep_s3meta import meta_sql_values
 
@@ -196,15 +196,15 @@ def build_unit_script(unit):
     for f in files:
         i, uri = f["i"], f["uri"]
         add(f"DELETE FROM {REJECT_TABLE} WHERE uri = {lit(uri)} AND target_table = {lit(table)};\n"
-            f"INSERT INTO {REJECT_TABLE} (uri, target_schema, target_table, row_no, reason, detail, row_data, file_status) "
-            f"SELECT {lit(uri)}, dest, {lit(table)}, row_no, reason, detail, row_data, 'LOADED' FROM "
+            f"INSERT INTO {REJECT_TABLE} (track, uri, target_schema, target_table, row_no, reason, detail, row_data, file_status) "
+            f"SELECT 'vsam', {lit(uri)}, dest, {lit(table)}, row_no, reason, detail, row_data, 'LOADED' FROM "
             f"(SELECT * FROM _rej WHERE f = {i} AND reason <> 'DUP_IN_FILE' UNION ALL "
             f"(SELECT * FROM _rej WHERE f = {i} AND reason = 'DUP_IN_FILE' ORDER BY row_no LIMIT {MAX_REJECT_ROWS_PRINTED})) z;\n")
         lm, etag, sz = meta_sql_values(f["s3_meta"])
-        add(f"DELETE FROM {CTL_SCHEMA}.load_log WHERE uri = {lit(uri)} OR starts_with(uri, {lit(uri + '#')});\n"
-            f"INSERT INTO {CTL_SCHEMA}.load_log (uri, target_schema, target_table, size_bytes, loaded_rows, seconds, worker_id, "
+        add(f"DELETE FROM {VSAM_LOAD_LOG_TABLE} WHERE uri = {lit(uri)};\n"
+            f"INSERT INTO {VSAM_LOAD_LOG_TABLE} (uri, target_schema, target_table, size_bytes, loaded_rows, seconds, worker_id, "
             f"status, message, s3_last_modified, s3_etag, s3_size, loaded_at) "
-            f"SELECT {lit(uri + '#')} || d, d, {lit(table)}, {int(f['size_bytes'])}, n, 0, {int(f['worker_id'])}, 'SUCCESS', "
+            f"SELECT {lit(uri)}, d, {lit(table)}, {int(f['size_bytes'])}, n, 0, {int(f['worker_id'])}, 'SUCCESS', "
             f"{lit(f['snapshot_msg'])}, {lm}, {etag}, {sz}, now() FROM ("
             f"SELECT d, n FROM (SELECT split_part(k, '|', 3) AS d, sum(n) AS n FROM _c WHERE split_part(k, '|', 1) IN {done_kinds} "
             f"AND split_part(k, '|', 2) = '{i}' GROUP BY 1) a WHERE n > 0 "

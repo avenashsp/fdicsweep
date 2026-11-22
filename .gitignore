@@ -50,3 +50,11 @@ sweep_latest.log
 
 # Generated hand-over document (base64 zip of the repo)
 package/
+
+# Merge-safe outputs: locks and the one-version backup (sweep_merge.py)
+*.lock
+*.bak
+
+# Per-layer environment files hold passwords (commit only the *.sample files)
+sweep.*.env
+!sweep.*.env.sample

@@ -322,7 +322,7 @@ python3 sweep.py vsam load-data --tables vsamkorg,stg_ftxref_v --workers 4
 python3 -m vsam.vsam_06_load_data --workers 4
 ```
 
-#### Generated Excel Workbook (`vsam/reports/<db>_vsam_06_load_data_report_<timestamp>.xlsx`, plus `vsam/outputs/vsam_06_load_log_<run_id>.csv`):
+#### Generated Excel Workbook (`vsam/reports/<db>_vsam_06_load_data_report_<timestamp>.xlsx`, plus `vsam/outputs/<db>_vsam_06_load_log_<run_id>.csv`):
 1. **`LoadSummary` Sheet**:
    - `s3 filename`, `tablename`, `copybook` (name or `NO_COPYBOOK`), `korg column` (name or `NO_KORG`)
    - `total recs`: records read from the file

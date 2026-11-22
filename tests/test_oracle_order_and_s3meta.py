@@ -107,15 +107,15 @@ def test_parent_loaded_before_child_and_changed_file_is_reloaded(pg_db, tmp_path
     # child is smaller-named/first in the map on purpose: ordering must come from the FK graph, not the map
     monkeypatch.setattr(o6, "ORACLE_OUTPUTS_DIR", _map(tmp_path, [_row(child, "oo", "child", 1), _row(parent, "oo", "parent", 2)]))
     assert o6.run_stream_load(workers=2) is True
-    order_rows = c.run_psql("SELECT target_table FROM sweep_ctl.load_log ORDER BY loaded_at, uri", tuples_only=True).split()
+    order_rows = c.run_psql("SELECT target_table FROM sweep_ctl.oracle_load_log ORDER BY loaded_at, uri", tuples_only=True).split()
     assert order_rows == ["parent", "child"]
     assert c.run_psql("SELECT count(*) FROM oo.child", tuples_only=True) == "1"      # no false FK_MISSING reject
-    stored = c.run_psql("SELECT s3_etag IS NOT NULL AND s3_last_modified IS NOT NULL AND s3_size > 0 FROM sweep_ctl.load_log LIMIT 1", tuples_only=True)
+    stored = c.run_psql("SELECT s3_etag IS NOT NULL AND s3_last_modified IS NOT NULL AND s3_size > 0 FROM sweep_ctl.oracle_load_log LIMIT 1", tuples_only=True)
     assert stored == "t"
 
     # second run: nothing changed -> skipped
     assert o6.run_stream_load(workers=2) is True
-    assert c.run_psql("SELECT count(*) FROM sweep_ctl.load_log WHERE loaded_rows > 0", tuples_only=True) == "2"
+    assert c.run_psql("SELECT count(*) FROM sweep_ctl.oracle_load_log WHERE loaded_rows > 0", tuples_only=True) == "2"
 
     # re-delivered file (same name and path, new content) -> loaded again
     time.sleep(1.1)
@@ -125,4 +125,4 @@ def test_parent_loaded_before_child_and_changed_file_is_reloaded(pg_db, tmp_path
     assert o6.run_stream_load(workers=2) is True
     assert c.run_psql("SELECT v FROM oo.parent WHERE id = 1", tuples_only=True) == "p-new"
     assert c.run_psql("SELECT count(*) FROM oo.parent", tuples_only=True) == "2"
-    assert c.run_psql("SELECT count(*) FROM sweep_ctl.load_log", tuples_only=True) == "2"      # still one row per URI
+    assert c.run_psql("SELECT count(*) FROM sweep_ctl.oracle_load_log", tuples_only=True) == "2"      # still one row per URI

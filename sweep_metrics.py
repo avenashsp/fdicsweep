@@ -10,7 +10,8 @@ import subprocess
 from datetime import datetime
 from sweep_common import (
     BASE_DIR,
-    LOAD_LOG_TABLE,
+    ORACLE_LOAD_LOG_TABLE,
+    VSAM_LOAD_LOG_TABLE,
     LOGS_DIR,
     ORACLE_LOGS_DIR,
     ORACLE_OUTPUTS_DIR,
@@ -146,23 +147,19 @@ def get_track_metrics(track_name, jobs=None):
     gb_loaded = 0.0
     speed = 0
 
-    track_filter = (
-        "(target_table ILIKE 'stg_%' OR uri ILIKE '%/vsam/%' OR uri ILIKE '%#%')"
-        if is_vsam else
-        "NOT (target_table ILIKE 'stg_%' OR uri ILIKE '%/vsam/%' OR uri ILIKE '%#%')"
-    )
+    log_table = VSAM_LOAD_LOG_TABLE if is_vsam else ORACLE_LOAD_LOG_TABLE
 
     try:
         sql_log = (
             f"SELECT COUNT(*), COALESCE(SUM(loaded_rows), 0), "
             f"COALESCE(ROUND(SUM(file_bytes)/1073741824.0, 2), 0) "
             f"FROM ("
-            f"    SELECT split_part(uri, '#', 1) AS s3_file, "
+            f"    SELECT uri AS s3_file, "
             f"           MAX(size_bytes) AS file_bytes, "
             f"           SUM(loaded_rows) AS loaded_rows "
-            f"    FROM {LOAD_LOG_TABLE} "
-            f"    WHERE status = 'SUCCESS' AND {track_filter} "
-            f"    GROUP BY split_part(uri, '#', 1)"
+            f"    FROM {log_table} "
+            f"    WHERE status = 'SUCCESS' "
+            f"    GROUP BY uri"
             f") sub;"
         )
         rows_log = query_db_rows(sql_log)
@@ -180,8 +177,8 @@ def get_track_metrics(track_name, jobs=None):
             f"SELECT COALESCE(ROUND(AVG(CASE WHEN seconds > 0 THEN loaded_rows / seconds ELSE rows_per_sec END)), 0) "
             f"FROM ("
             f"    SELECT loaded_rows, seconds, COALESCE(rows_per_sec, 0) AS rows_per_sec "
-            f"    FROM {LOAD_LOG_TABLE} "
-            f"    WHERE status = 'SUCCESS' AND (loaded_rows > 0 OR seconds > 0) AND {track_filter} "
+            f"    FROM {log_table} "
+            f"    WHERE status = 'SUCCESS' AND (loaded_rows > 0 OR seconds > 0) "
             f"    ORDER BY loaded_at DESC LIMIT 10"
             f") spd_sub;"
         )
@@ -399,51 +396,36 @@ def get_top_completed(limit=5, track_filter=None):
     Returns the top recently completed table loads with track indicator.
     """
     completed = []
-    where_extra = ""
-    if track_filter == "vsam":
-        where_extra = " AND (target_table ILIKE 'stg_%' OR uri ILIKE '%/vsam/%' OR uri ILIKE '%#%')"
-    elif track_filter == "oracle":
-        where_extra = " AND NOT (target_table ILIKE 'stg_%' OR uri ILIKE '%/vsam/%' OR uri ILIKE '%#%')"
-
+    selects = []
+    for track, table in (("oracle", ORACLE_LOAD_LOG_TABLE), ("vsam", VSAM_LOAD_LOG_TABLE)):
+        if track_filter in (None, "all", track):
+            selects.append(
+                f"(SELECT uri, COALESCE(target_schema, ''), COALESCE(target_table, ''), COALESCE(loaded_rows, 0), "
+                f"COALESCE(seconds, 0), COALESCE(ROUND(CASE WHEN seconds > 0 THEN loaded_rows / seconds ELSE 0 END), 0), "
+                f"'{track.upper()}' AS track, loaded_at FROM {table} WHERE status = 'SUCCESS' "
+                f"ORDER BY loaded_at DESC LIMIT {limit})")
     try:
-        sql = (
-            f"SELECT "
-            f"    uri, "
-            f"    COALESCE(target_schema, ''), "
-            f"    COALESCE(target_table, ''), "
-            f"    COALESCE(loaded_rows, 0) AS rows, "
-            f"    COALESCE(seconds, 0) AS duration, "
-            f"    COALESCE(ROUND(CASE WHEN seconds > 0 THEN loaded_rows / seconds ELSE 0 END), 0) AS speed, "
-            f"    CASE WHEN target_table ILIKE 'stg_%' OR uri ILIKE '%/vsam/%' OR uri ILIKE '%#%' THEN 'VSAM' ELSE 'ORACLE' END AS track "
-            f"FROM {LOAD_LOG_TABLE} "
-            f"WHERE status = 'SUCCESS'{where_extra} "
-            f"ORDER BY loaded_at DESC "
-            f"LIMIT {limit};"
-        )
+        sql = ("SELECT uri, target_schema, target_table, rows, seconds, speed, track FROM ("
+               + " UNION ALL ".join(selects) +
+               f") x(uri, target_schema, target_table, rows, seconds, speed, track, loaded_at) ORDER BY loaded_at DESC LIMIT {limit};")
         for r in query_db_rows(sql):
             parts = r.split("|")
-            if len(parts) >= 6:
+            if len(parts) >= 7:
                 full_uri = parts[0].strip()
                 t_schema = parts[1].strip()
                 t_table = parts[2].strip()
-                r_count = int(parts[3].strip() or 0)
-                sec_val = float(parts[4].strip() or 0.0)
-                spd_val = int(float(parts[5].strip() or 0.0))
-                t_track = parts[6].strip() if len(parts) > 6 else ("VSAM" if "stg_" in t_table else "ORACLE")
-
                 if t_schema and t_table:
                     disp_name = f"{t_schema}.{t_table}".lower()
                 elif t_table:
                     disp_name = t_table.lower()
                 else:
-                    disp_name = os.path.basename(full_uri.split("#")[0])
-
+                    disp_name = os.path.basename(full_uri)
                 completed.append({
-                    "track": t_track,
+                    "track": parts[6].strip(),
                     "filename": disp_name,
-                    "rows": r_count,
-                    "time": sec_val,
-                    "speed": spd_val
+                    "rows": int(parts[3].strip() or 0),
+                    "time": float(parts[4].strip() or 0.0),
+                    "speed": int(float(parts[5].strip() or 0.0)),
                 })
     except DB_ERRORS:
         pass

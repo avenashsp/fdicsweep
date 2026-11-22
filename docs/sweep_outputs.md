@@ -180,7 +180,7 @@ Rows with status `REVIEW` or `UNMAPPED` are the ones to check; correct them in t
 ---
 
 ### 2.2 VSAM Step 06: Ingestion Load Report
-* **Path:** `vsam/reports/<db>_vsam_06_load_data_report_<timestamp>.xlsx` (plus `vsam/outputs/vsam_06_load_log_<run_id>.csv`)
+* **Path:** `vsam/reports/<db>_vsam_06_load_data_report_<timestamp>.xlsx` (plus `vsam/outputs/<db>_vsam_06_load_log_<run_id>.csv`)
 * **Sheets:** `LoadSummary` (Master File Execution), `SchemaBreakdown` (Cross-Tabulation Matrix) and `RunOverview` (run id, task / success / failed counts, rows loaded and skipped, workers).
 
 #### Sheet 1: `LoadSummary` (17 Columns)

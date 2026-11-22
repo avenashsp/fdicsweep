@@ -38,6 +38,7 @@ from sweep_common import (
     DEFAULT_WORKERS, PSQL_BIN, check_postgres_version, get_logger, run_psql
 )
 import sweep_bg
+from sweep_targeting import add_targeting_args
 
 logger = get_logger("sweep_cli", to_file=False)
 
@@ -292,6 +293,46 @@ def child_env():
     return env
 
 
+TARGET_FLAGS = ("tables", "schemas", "exclude_tables", "file", "filename", "company", "copybook")
+
+
+def targeting(args, *, skip=()):
+    """Command line flags for the uniform targeting options the user gave (--tables, --schemas, ... --dry-run)."""
+    out = []
+    schemas = getattr(args, "schemas", None) or getattr(args, "owners", None) or getattr(args, "schema", None)
+    values = {name: getattr(args, name, None) for name in TARGET_FLAGS}
+    values["schemas"] = schemas
+    for name in TARGET_FLAGS:
+        if name in skip or not values[name]:
+            continue
+        out.extend([f"--{name.replace('_', '-')}", str(values[name])])
+    if getattr(args, "dry_run", False):
+        out.append("--dry-run")
+    return out
+
+
+# flags each step accepts when run-all passes the targeting options on (--file is never passed: it is ambiguous across steps)
+_TBL = ("tables", "schemas", "exclude_tables")
+RUNALL_FLAGS = {
+    "vsam_01_extract_copybooks": ("copybook",),
+    "vsam_02_inventory": _TBL + ("company",), "vsam_03_type_gate": _TBL + ("company",), "vsam_04_generate_ddl": _TBL + ("company",),
+    "vsam_05_apply_ddl": _TBL, "vsam_06_load_data": _TBL + ("company",), "vsam_07_validate": _TBL + ("company",),
+}
+
+
+def runall_targeting(args, module):
+    """Targeting flags for one step of run-all (oracle steps take tables / schemas / exclude-tables; VSAM steps differ)."""
+    allowed = RUNALL_FLAGS.get(module, _TBL)
+    out = [f for f in targeting(args, skip=tuple(n for n in TARGET_FLAGS if n not in allowed)) if f != "--dry-run"]
+    if getattr(args, "dry_run", False):
+        out.append("--dry-run")
+    return out
+
+
+def selectors_given(args):
+    return bool(targeting(args, skip=("file", "filename"))) or bool(getattr(args, "file", None) or getattr(args, "filename", None))
+
+
 def run_or_bg(job_name, cmd_args, run_in_bg=False):
     """Executes a command synchronously (exit code propagated) or spawns a background daemon supervisor."""
     if run_in_bg:
@@ -336,46 +377,40 @@ def handle_oracle(args):
 
     if cmd == "extract":
         c = step("oracle", "oracle_01_extract_mtd")
-        if getattr(args, "file", None): c.extend(["--file", args.file])
-        if getattr(args, "owners", None): c.extend(["--owners", args.owners])
+        if getattr(args, "file", None): c.extend(["--file", args.file])      # the dump file, not an S3 file
+        c.extend(targeting(args, skip=("file", "filename")))
         run_or_bg("oracle_01_extract_mtd", c, getattr(args, "bg", False))
 
     elif cmd == "inventory":
         c = step("oracle", "oracle_02_inventory")
         if getattr(args, "s3", None): c.extend(["--s3", args.s3])
-        if getattr(args, "owners", None): c.extend(["--owners", args.owners])
-        if getattr(args, "tables", None): c.extend(["--tables", args.tables])
+        c.extend(targeting(args))
         run_or_bg("oracle_02_inventory", c, getattr(args, "bg", False))
 
     elif cmd == "gate":
         c = step("oracle", "oracle_03_type_gate", "--rows", str(getattr(args, "rows", 1000)))
-        if getattr(args, "tables", None): c.extend(["--tables", args.tables])
+        c.extend(targeting(args))
         if getattr(args, "max_tables", None): c.extend(["--max-tables", str(args.max_tables)])
         run_or_bg("oracle_03_type_gate", c, getattr(args, "bg", False))
 
     elif cmd in ("gen-ddl", "ddl"):
         c = step("oracle", "oracle_04_generate_ddl")
-        if getattr(args, "owners", None): c.extend(["--owners", args.owners])
-        if getattr(args, "tables", None): c.extend(["--tables", args.tables])
+        c.extend(targeting(args))
         run_or_bg("oracle_04_generate_ddl", c, getattr(args, "bg", False))
 
     elif cmd == "apply-ddl":
         c = step("oracle", "oracle_05_apply_ddl")
-        if getattr(args, "schemas", None): c.extend(["--schemas", args.schemas])
+        c.extend(targeting(args))
         if getattr(args, "skip_meta", False): c.append("--skip-meta")
         run_or_bg("oracle_05_apply_ddl", c, getattr(args, "bg", False))
 
     elif cmd in ("load-data", "load"):
         c = step("oracle", "oracle_06_load_data", "--workers", str(getattr(args, "workers", DEFAULT_WORKERS)))
-        if getattr(args, "tables", None): c.extend(["--tables", args.tables])
-        if getattr(args, "exclude_tables", None): c.extend(["--exclude-tables", args.exclude_tables])
-        if getattr(args, "file", None): c.extend(["--file", args.file])
-        if getattr(args, "filename", None): c.extend(["--filename", args.filename])
+        c.extend(targeting(args))
         if getattr(args, "gate_pass", False): c.append("--gate-pass")
         if getattr(args, "limit_files", None): c.extend(["--limit-files", str(args.limit_files)])
         if getattr(args, "max_size_mb", None) is not None: c.extend(["--max-size-mb", str(args.max_size_mb)])
         if getattr(args, "min_size_mb", None) is not None: c.extend(["--min-size-mb", str(args.min_size_mb)])
-        if getattr(args, "dry_run", False): c.append("--dry-run")
         if getattr(args, "reload", False): c.append("--reload")
         if getattr(args, "max_rejects", None) is not None: c.extend(["--max-rejects", str(args.max_rejects)])
         if getattr(args, "fast_bulk", False): c.append("--fast-bulk")
@@ -384,22 +419,21 @@ def handle_oracle(args):
 
     elif cmd in ("load-obj", "post-load"):
         c = step("oracle", "oracle_07_load_objects", "--stage", getattr(args, "stage", "all"))
-        if getattr(args, "schemas", None): c.extend(["--schemas", args.schemas])
+        c.extend(targeting(args))
         if getattr(args, "only_loaded", False): c.append("--only-loaded")
         run_or_bg("oracle_07_load_objects", c, getattr(args, "bg", False))
 
     elif cmd in ("validate", "verify"):
         c = step("oracle", "oracle_08_validate")
         if getattr(args, "exact_counts", False): c.append("--exact-counts")
-        if getattr(args, "tables", None): c.extend(["--tables", args.tables])
-        if getattr(args, "schemas", None): c.extend(["--schemas", args.schemas])
-        if getattr(args, "file", None): c.extend(["--file", args.file])
+        if getattr(args, "file", None): c.extend(["--file", args.file])      # the dump file
+        c.extend(targeting(args, skip=("file", "filename")))
         run_or_bg("oracle_08_validate", c, getattr(args, "bg", False))
 
     elif cmd == "run-all":
         workers = getattr(args, "workers", DEFAULT_WORKERS)
-        commands = [step("oracle", m, *(["--workers", workers] if m == "oracle_06_load_data" else [])) for m in ORACLE_STEPS]
-        bg_cmd = [sys.executable, str(BASE_DIR / "sweep.py"), "oracle", "run-all", "--workers", str(workers)]
+        commands = [step("oracle", m, *(["--workers", workers] if m == "oracle_06_load_data" else []), *runall_targeting(args, m)) for m in ORACLE_STEPS]
+        bg_cmd = [sys.executable, str(BASE_DIR / "sweep.py"), "oracle", "run-all", "--workers", str(workers), *targeting(args, skip=("file", "filename", "company", "copybook"))]
         pipeline_or_bg("oracle_full_pipeline", "Oracle Full", commands, bg_cmd, getattr(args, "bg", False))
 
 
@@ -416,13 +450,14 @@ def handle_vsam(args):
     # Step 01: Extract copybook metadata
     if cmd in ("extract", "extract-copybooks"):
         c = step("vsam", "vsam_01_extract_copybooks")
+        c.extend(targeting(args))
         run_or_bg("vsam_01_extract_copybooks", c, getattr(args, "bg", False))
 
     # Step 02: Inventory & S3 mapping
     elif cmd == "inventory":
         c = step("vsam", "vsam_02_inventory")
         if getattr(args, "s3", None): c.extend(["--s3", args.s3])
-        if getattr(args, "company", None): c.extend(["--company", args.company])
+        c.extend(targeting(args))
         if getattr(args, "tbl_col", None): c.extend(["--tbl-col", args.tbl_col])
         run_or_bg("vsam_02_inventory", c, getattr(args, "bg", False))
 
@@ -430,30 +465,29 @@ def handle_vsam(args):
     elif cmd in ("type-gate", "gate"):
         c = step("vsam", "vsam_03_type_gate")
         if getattr(args, "workers", None): c.extend(["--workers", str(args.workers)])
-        if getattr(args, "company", None): c.extend(["--company", args.company])
+        c.extend(targeting(args))
         run_or_bg("vsam_03_type_gate", c, getattr(args, "bg", False))
 
     # Step 04: Generate DDL (pre_load + post_load)
     elif cmd in ("gen-ddl", "ddl"):
         c = step("vsam", "vsam_04_generate_ddl")
-        if getattr(args, "company", None): c.extend(["--company", args.company])
+        c.extend(targeting(args, skip=("file", "filename")))
         if getattr(args, "execute", False): c.append("--execute")
         run_or_bg("vsam_04_generate_ddl", c, getattr(args, "bg", False))
 
     # Step 05: Apply pre-load DDL (tables only, no PK)
     elif cmd == "apply-ddl":
         c = step("vsam", "vsam_05_apply_ddl")
+        c.extend(targeting(args, skip=("file", "filename", "company")))
         if getattr(args, "skip_meta", False): c.append("--skip-meta")
         run_or_bg("vsam_05_apply_ddl", c, getattr(args, "bg", False))
 
     # Step 06: Load data with dynamic upsert and schema segregation (includes PK application in default mode)
     elif cmd in ("load-data", "load", "load-obj", "load-objects", "post-load"):
         c = step("vsam", "vsam_06_load_data", "--workers", str(getattr(args, "workers", DEFAULT_WORKERS)))
-        if getattr(args, "company", None): c.extend(["--company", args.company])
-        if getattr(args, "tables", None): c.extend(["--tables", args.tables])
+        c.extend(targeting(args))
         if getattr(args, "limit_files", None): c.extend(["--limit-files", str(args.limit_files)])
         if getattr(args, "force_truncate", False): c.append("--force-truncate")
-        if getattr(args, "dry_run", False): c.append("--dry-run")
         if getattr(args, "reload", False): c.append("--reload")
         if getattr(args, "max_rejects", None) is not None: c.extend(["--max-rejects", str(args.max_rejects)])
         run_or_bg("vsam_06_load_data", c, getattr(args, "bg", False))
@@ -462,16 +496,15 @@ def handle_vsam(args):
     elif cmd in ("validate", "verify"):
         c = step("vsam", "vsam_07_validate")
         if getattr(args, "exact_counts", False): c.append("--exact-counts")
-        if getattr(args, "tables", None): c.extend(["--tables", args.tables])
-        if getattr(args, "schema", None): c.extend(["--schema", args.schema])
+        c.extend(targeting(args, skip=("file", "filename")))
         run_or_bg("vsam_07_validate", c, getattr(args, "bg", False))
 
     elif cmd == "run-all":
         workers = getattr(args, "workers", DEFAULT_WORKERS)
         extra = ["--force-truncate"] if getattr(args, "force_truncate", False) else []
         tbl = ["--tbl-col", args.tbl_col] if getattr(args, "tbl_col", None) else []
-        commands = [step("vsam", m, *(["--workers", workers, *extra] if m == "vsam_06_load_data" else tbl if m == "vsam_02_inventory" else [])) for m in VSAM_STEPS]
-        bg_cmd = [sys.executable, str(BASE_DIR / "sweep.py"), "vsam", "run-all", "--workers", str(workers), *extra, *tbl]
+        commands = [step("vsam", m, *(["--workers", workers, *extra] if m == "vsam_06_load_data" else tbl if m == "vsam_02_inventory" else []), *runall_targeting(args, m)) for m in VSAM_STEPS]
+        bg_cmd = [sys.executable, str(BASE_DIR / "sweep.py"), "vsam", "run-all", "--workers", str(workers), *extra, *tbl, *targeting(args, skip=("file", "filename"))]
         pipeline_or_bg("vsam_full_pipeline", "VSAM Full", commands, bg_cmd, getattr(args, "bg", False))
 
 
@@ -488,6 +521,10 @@ def cmd_run_all(args):
         args.vsam_cmd = "run-all"
         handle_vsam(args)
     else:
+        if selectors_given(args):
+            print("Selectors (--tables, --schemas, --company ...) name tables of ONE track: use `run-all --track oracle` or "
+                  "`--track vsam` when targeting.", file=sys.stderr)
+            sys.exit(2)
         logger.info("Executing End-to-End Migration for BOTH Oracle and VSAM tracks...")
         extra = ["--force-truncate"] if getattr(args, "force_truncate", False) else []
         tbl = ["--tbl-col", args.tbl_col] if getattr(args, "tbl_col", None) else []
@@ -520,6 +557,7 @@ def main():
     p_all.add_argument("--force-truncate", action="store_true", help="Pass --force-truncate to the VSAM load step")
     p_all.add_argument("--tbl-col", choices=["headers", "copybook"], help="VSAM table column names: S3 file headers (default) or copybook column names")
     p_all.add_argument("--bg", action="store_true", help="Run full pipeline as detached background daemon")
+    add_targeting_args(p_all, company=True)
 
     # Background operations
     subparsers.add_parser("status", help="Show live status of background migration jobs")
@@ -548,28 +586,33 @@ def main():
     o_ext = o_sub.add_parser("extract", help="Step 01: Extract metadata from master Oracle SQL dump")
     o_ext.add_argument("--file", help="Specific dump file path")
     o_ext.add_argument("--owners", help="Comma-separated owners to filter")
+    add_targeting_args(o_ext, schemas="--owners")
     o_ext.add_argument("--bg", action="store_true", help="Run in background")
 
     o_inv = o_sub.add_parser("inventory", help="Step 02: S3 Discovery & Small-to-Large Ordering")
     o_inv.add_argument("--s3", help="Target S3 prefix")
     o_inv.add_argument("--owners", help="Comma-separated owners")
     o_inv.add_argument("--tables", help="Comma-separated tables")
+    add_targeting_args(o_inv, schemas="--owners", file=True)
     o_inv.add_argument("--bg", action="store_true", help="Run in background")
 
     o_gate = o_sub.add_parser("gate", help="Step 03: Pre-flight Data Type Gate")
     o_gate.add_argument("--rows", type=int, default=1000, help="Rows to sample per file")
     o_gate.add_argument("--tables", help="Comma-separated tables")
     o_gate.add_argument("--max-tables", type=int, help="Limit number of tables tested")
+    add_targeting_args(o_gate, schemas="--owners", file=True)
     o_gate.add_argument("--bg", action="store_true", help="Run in background")
 
     o_ddl = o_sub.add_parser("gen-ddl", aliases=["ddl"], help="Step 04: Generate Bare Tables & Partitions")
     o_ddl.add_argument("--owners", help="Comma-separated owners")
     o_ddl.add_argument("--tables", help="Comma-separated tables")
+    add_targeting_args(o_ddl, schemas="--owners")
     o_ddl.add_argument("--bg", action="store_true", help="Run in background")
 
     o_apply = o_sub.add_parser("apply-ddl", help="Step 05: Apply DDL to PostgreSQL")
     o_apply.add_argument("--schemas", help="Comma-separated schemas")
     o_apply.add_argument("--skip-meta", action="store_true", help="Skip re-deploying sweep_meta.sql")
+    add_targeting_args(o_apply)
     o_apply.add_argument("--bg", action="store_true", help="Run in background")
 
     o_load = o_sub.add_parser("load-data", aliases=["load"], help="Step 06: S3 Streaming Ingestion")
@@ -587,12 +630,14 @@ def main():
     o_load.add_argument("--max-rejects", type=int, default=None, help="Fail a file when this many rows are rejected (default 0 = never fail; N = fail the file at N rejects)")
     o_load.add_argument("--fast-bulk", action="store_true", help="Direct COPY into empty constraint-free tables (no bad-row isolation)")
     o_load.add_argument("--trigger-mode", choices=["auto", "replica", "disable"], default=None, help="How triggers are switched off while loading")
+    add_targeting_args(o_load, schemas="--owners", file=True)
     o_load.add_argument("--bg", action="store_true", help="Run in background daemon")
 
     o_obj = o_sub.add_parser("load-obj", aliases=["post-load"], help="Step 07: Post-Load Keys, Indexes, Views, Triggers")
     o_obj.add_argument("--stage", choices=["all", "pk", "alter", "index", "fk", "validate", "views", "triggers"], default="all")
     o_obj.add_argument("--schemas", help="Comma-separated schemas")
     o_obj.add_argument("--only-loaded", action="store_true", help="Only load objects for tables with loaded data (default: all tables)")
+    add_targeting_args(o_obj)
     o_obj.add_argument("--bg", action="store_true", help="Run in background")
 
     o_val = o_sub.add_parser("validate", aliases=["verify"], help="Step 08: Reconciliation & Audit Tally")
@@ -600,11 +645,13 @@ def main():
     o_val.add_argument("--tables", help="Comma-separated tables")
     o_val.add_argument("--schemas", help="Comma-separated schemas")
     o_val.add_argument("--file", help="Specific master Oracle SQL dump file path")
+    add_targeting_args(o_val)
     o_val.add_argument("--bg", action="store_true", help="Run in background")
 
     o_run_all = o_sub.add_parser("run-all", help="Execute complete Oracle pipeline end-to-end")
     o_run_all.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Parallel workers")
     o_run_all.add_argument("--bg", action="store_true", help="Run full Oracle pipeline in background daemon")
+    add_targeting_args(o_run_all, schemas="--owners")
 
     # -------------------------------------------------------------------------
     # Track: VSAM (7-Step Pipeline)
@@ -614,25 +661,30 @@ def main():
 
     v_ext = v_sub.add_parser("extract", aliases=["extract-copybooks"], help="Step 01: Extract copybook metadata (fields, types, keys)")
     v_ext.add_argument("--bg", action="store_true", help="Run in background")
+    add_targeting_args(v_ext, tables=False, schemas=None, exclude=False, copybook=True)
 
     v_inv = v_sub.add_parser("inventory", help="Step 02: S3 Discovery & Source-to-Target Mapping")
     v_inv.add_argument("--s3", help="Target S3 prefix")
     v_inv.add_argument("--company", help="Comma-separated companies")
     v_inv.add_argument("--tbl-col", choices=["headers", "copybook"], help="Table column names: S3 file headers (default) or mapped copybook column names")
+    add_targeting_args(v_inv, company=True, file=True)
     v_inv.add_argument("--bg", action="store_true", help="Run in background")
 
     v_gate = v_sub.add_parser("type-gate", aliases=["gate"], help="Step 03: PK uniqueness verification & schema column detection")
     v_gate.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Parallel workers")
     v_gate.add_argument("--company", help="Comma-separated company tokens to filter")
+    add_targeting_args(v_gate, company=True, file=True)
     v_gate.add_argument("--bg", action="store_true", help="Run in background")
 
     v_ddl = v_sub.add_parser("gen-ddl", aliases=["ddl"], help="Step 04: Generate DDL (tables + PK in gen_ddl)")
     v_ddl.add_argument("--company", help="Comma-separated companies")
     v_ddl.add_argument("--execute", action="store_true", help="Execute generated pre-load DDL")
+    add_targeting_args(v_ddl, company=True)
     v_ddl.add_argument("--bg", action="store_true", help="Run in background")
 
     v_apply = v_sub.add_parser("apply-ddl", help="Step 05: Apply table DDL (tables only, no PK) to PostgreSQL")
     v_apply.add_argument("--skip-meta", action="store_true", help="Skip sweep_meta.sql")
+    add_targeting_args(v_apply)
     v_apply.add_argument("--bg", action="store_true", help="Run in background")
 
     v_load = v_sub.add_parser("load-data", aliases=["load"], help="Step 06: Schema-segregated S3 streaming ingestion & dynamic upsert")
@@ -641,19 +693,21 @@ def main():
     v_load.add_argument("--tables", help="Comma-separated tables")
     v_load.add_argument("--limit-files", type=int, help="Limit files loaded")
     v_load.add_argument("--force-truncate", action="store_true", help="Allow replacing a table that already has rows and no PK in a PARTIAL run (--company/--tables/--limit-files); full runs replace such tables automatically")
-    v_load.add_argument("--dry-run", action="store_true", help="List the files that would be loaded without writing to the database")
+    add_targeting_args(v_load, company=True, file=True)
     v_load.add_argument("--reload", action="store_true", help="Load files again even when their S3 LastModified/ETag/size are unchanged")
     v_load.add_argument("--max-rejects", type=int, default=None, help="Fail a file when this many rows are rejected (default 0 = never fail; N = fail the file at N rejects)")
     v_load.add_argument("--bg", action="store_true", help="Run in background daemon")
 
     v_lobj = v_sub.add_parser("load-obj", aliases=["load-objects", "post-load"], help="Legacy alias: Merged into Step 06 (load-data)")
     v_lobj.add_argument("--schema", help="Apply PK only for this schema")
+    add_targeting_args(v_lobj, company=True, file=True)
     v_lobj.add_argument("--bg", action="store_true", help="Run in background")
 
     v_val = v_sub.add_parser("validate", aliases=["verify"], help="Step 07: Row counts, column, type, PK & reconciliation audit")
     v_val.add_argument("--exact-counts", action="store_true", help="Exact row count queries")
     v_val.add_argument("--tables", help="Comma-separated tables")
     v_val.add_argument("--schema", help="Validate only this schema")
+    add_targeting_args(v_val, schemas="--schema", company=True)
     v_val.add_argument("--bg", action="store_true", help="Run in background")
 
     v_runall = v_sub.add_parser("run-all", help="Execute complete VSAM 7-step pipeline end-to-end")
@@ -661,6 +715,7 @@ def main():
     v_runall.add_argument("--force-truncate", action="store_true", help="Pass --force-truncate to the VSAM load step")
     v_runall.add_argument("--tbl-col", choices=["headers", "copybook"], help="Table column names: S3 file headers (default) or copybook column names")
     v_runall.add_argument("--bg", action="store_true", help="Run full pipeline in background")
+    add_targeting_args(v_runall, company=True)
 
     args = parser.parse_args()
 

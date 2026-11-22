@@ -44,6 +44,11 @@ from sweep_common import (
     norm_col,
 )
 from vsam.common_colmap import effective_columns_meta
+from sweep_common import layer_dir
+from sweep_ddlfrag import FragmentStore
+from sweep_merge import write_text_file
+from sweep_migrate import CTL_OBJECTS_SQL
+from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
 from vsam.vsam_common import get_all_active_schemas, get_korg_override_pkey, load_csv_safe, OUT
 
 logger = get_logger("vsam_04_generate_ddl", "vsam_04_generate_ddl")
@@ -57,25 +62,7 @@ AUDIT_COLS = [
     '  "createdby_m" character varying(40) NOT NULL DEFAULT CURRENT_USER',
 ]
 
-CTL_DDL = """CREATE SCHEMA IF NOT EXISTS sweep_ctl;
-CREATE TABLE IF NOT EXISTS sweep_ctl.load_log (
-    uri             text PRIMARY KEY,
-    target_schema   text NOT NULL,
-    target_table    text NOT NULL,
-    size_bytes      bigint DEFAULT 0,
-    loaded_rows     bigint DEFAULT 0,
-    seconds         numeric DEFAULT 0,
-    file_format     text DEFAULT 'csv',
-    worker_id       int DEFAULT 1,
-    status          text DEFAULT 'SUCCESS',
-    message         text,
-    loaded_at       timestamptz DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_sweep_vsam_target ON sweep_ctl.load_log (target_schema, target_table);
-ALTER TABLE sweep_ctl.load_log ADD COLUMN IF NOT EXISTS s3_last_modified text;
-ALTER TABLE sweep_ctl.load_log ADD COLUMN IF NOT EXISTS s3_etag          text;
-ALTER TABLE sweep_ctl.load_log ADD COLUMN IF NOT EXISTS s3_size          bigint;
-"""
+CTL_DDL = CTL_OBJECTS_SQL      # control schema objects (oracle_load_log / vsam_load_log, rejects, delta registry ...)
 
 
 AUDIT_COL_NAMES = {
@@ -137,12 +124,21 @@ def build_table_ddl(schema, table, columns, key_cols):
     return pre_sql, post_sql
 
 
+def _add_fragment(bucket, schema, table, sql):
+    """Collects the distinct statements generated for one (schema, table) during the run."""
+    stmts = bucket.setdefault((schema, table), [])
+    if sql not in stmts:
+        stmts.append(sql)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Step 04: Generate PostgreSQL DDL for VSAM tables.")
     parser.add_argument("--execute", action="store_true", help="Apply pre-load DDL to PostgreSQL immediately")
-    parser.add_argument("--company", help="Comma-separated company filter")
     parser.add_argument("--bg", action="store_true", help="Run in background")
+    add_targeting_args(parser, company=True)
     args = parser.parse_args()
+    sel = selector_or_exit(args, logger)
+    store = FragmentStore(layer_dir(VSAM_OUTPUTS_DIR / "ddl_fragments"))
 
     logger.info("=" * 75)
     logger.info("SWEEP VSAM MIGRATION - STEP 04: TARGET DDL GENERATION")
@@ -151,9 +147,9 @@ def main():
     # Load Step 02 load matrix
     lm_file = OUT / "vsam_02_load_matrix.csv" if (OUT / "vsam_02_load_matrix.csv").exists() else OUT / "load_matrix.csv"
     lm = load_csv_safe(lm_file)
-    if args.company:
-        cos = [c.strip().upper() for c in args.company.split(",")]
-        lm = lm[lm["source_company"].isin(cos)]
+    if sel.filtered and not lm.empty:
+        validate_or_exit(sel.validate_companies, lm["source_company"].astype(str).unique(), what="the load matrix", logger=logger)
+        validate_or_exit(sel.validate_tables, list(zip(lm["target_schema"], lm["target_table"])), what="the load matrix", logger=logger)
 
     # Load Step 01 copybook extracts
     cb_csv = OUT / "vsam_01_copybook_extracts.csv"
@@ -170,29 +166,34 @@ def main():
     if tg_file.exists():
         tg_prof = json.loads(tg_file.read_text(encoding="utf-8"))
 
-    # Prepare output directories
+    # Prepare output directories (nothing is cleaned: a targeted run must not destroy the DDL of other tables)
     VSAM_GEN_DDL_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Clean old SQL files in gen_ddl
-    for old in VSAM_GEN_DDL_DIR.glob("*.sql"):
-        try:
-            old.unlink()
-        except OSError as exc:
-            logger.debug(f"Could not remove old DDL file {old}: {exc}")
-
-    # Remove obsolete pre_load and post_load directories if they exist
-    for obsolete_dir in [VSAM_OUTPUTS_DIR / "pre_load", VSAM_OUTPUTS_DIR / "post_load"]:
-        if obsolete_dir.exists():
-            try:
-                shutil.rmtree(obsolete_dir)
-                logger.info(f"Removed legacy directory: {obsolete_dir}")
-            except OSError as e:
-                logger.debug(f"Could not remove {obsolete_dir}: {e}")
+    full = not sel.filtered
+    if full:      # legacy folders of older versions
+        for obsolete_dir in [VSAM_OUTPUTS_DIR / "pre_load", VSAM_OUTPUTS_DIR / "post_load"]:
+            if obsolete_dir.exists():
+                try:
+                    shutil.rmtree(obsolete_dir)
+                    logger.info(f"Removed legacy directory: {obsolete_dir}")
+                except OSError as e:
+                    logger.debug(f"Could not remove {obsolete_dir}: {e}")
 
     src_col = "source_filename" if "source_filename" in lm.columns else "source_file"
     targets = lm.drop_duplicates(["target_schema", "target_table"])
-    per_schema_pre = {}   # schema -> [pre_sql, ...]
+    if sel.filtered:
+        companies_of = lm.groupby(["target_schema", "target_table"])["source_company"].apply(lambda x: {str(v).upper() for v in x})
+        targets = targets[[sel.matches(r.target_schema, r.target_table)
+                           and (not sel.companies or bool(companies_of[(r.target_schema, r.target_table)] & sel.companies))
+                           for r in targets.itertuples()]]
+    if sel.dry_run:
+        for r in targets.itertuples():
+            logger.info(f"[dry-run] would generate DDL for {r.target_schema}.{r.target_table}")
+        logger.info(f"[dry-run] {sel.describe()}: DDL of {len(targets)} table(s); nothing written")
+        return True
+    per_schema_pre = {}   # schema -> [pre_sql, ...]   (this run's tables)
     per_schema_post = {}  # schema -> [post_sql, ...]
+    frag_pre, frag_post = {}, {}       # (schema, table) -> [distinct statements]
+    manifest_entries = {}
     report = []
 
     for r in targets.itertuples():
@@ -280,8 +281,10 @@ def main():
 
         pre_sql, post_sql = build_table_ddl(schema, table, effective_cols, key_cols)
         per_schema_pre.setdefault(schema, []).append(pre_sql)
+        _add_fragment(frag_pre, schema, table, pre_sql)
         if post_sql:
             per_schema_post.setdefault(schema, []).append(post_sql)
+            _add_fragment(frag_post, schema, table, post_sql)
 
         # Provision table across ALL active schemas and 'bcs' fallback schema
         # (Ensures cross-company active schema records e.g. 110 in FDIC file have destination table ready)
@@ -290,8 +293,10 @@ def main():
             act_pre_sql, act_post_sql = build_table_ddl(act_s, table, effective_cols, key_cols)
             if act_pre_sql not in act_tables:
                 act_tables.append(act_pre_sql)
+                _add_fragment(frag_pre, act_s, table, act_pre_sql)
                 if act_post_sql:
                     per_schema_post.setdefault(act_s, []).append(act_post_sql)
+                    _add_fragment(frag_post, act_s, table, act_post_sql)
 
         data_cols = [c for c in effective_cols if c.get("is_filler") != "YES"]
         pk_desc = f"pk={','.join(key_cols)}" if key_cols else "NO_PK"
@@ -305,32 +310,38 @@ def main():
             "detail": f"{pk_desc} | korg={sc_display} | copybook={cb_display}"
         })
 
-    # Write per-schema table SQL files inside gen_ddl
-    all_pre_sql = [CTL_DDL]
-    for s, stmts in sorted(per_schema_pre.items()):
-        body = f"CREATE SCHEMA IF NOT EXISTS {q(s)};\n\n" + "\n\n".join(stmts) + "\n"
-        (VSAM_GEN_DDL_DIR / f"{s}.sql").write_text(body, encoding="utf-8")
-        all_pre_sql.append(body)
+    # Per-table fragments (only this run's tables), then the per-schema scripts assembled from ALL fragments
+    for (sch, tbl), stmts in frag_pre.items():
+        kinds = ["pre"] if store.write(sch, tbl, "pre", "\n\n".join(stmts) + "\n") else []
+        if store.write(sch, tbl, "pk", "\n\n".join(frag_post.get((sch, tbl), [])) + "\n" if frag_post.get((sch, tbl)) else ""):
+            kinds.append("pk")
+        manifest_entries[f"{sch}.{tbl}"] = {"schema": sch, "table": tbl, "kinds": kinds}
+    if full:
+        pruned = store.prune(set(frag_pre))
+        if pruned:
+            logger.info(f"full run: removed {pruned} stale DDL fragment(s)")
+    store.record(manifest_entries, full=full)
+    touched = sorted({s_ for s_, _ in frag_pre}) if not full else store.schemas()
+    for s_ in touched:
+        store.assemble(s_, "pre", f"CREATE SCHEMA IF NOT EXISTS {q(s_)};\n\n", VSAM_GEN_DDL_DIR / f"{s_}.sql")
+        store.assemble(s_, "pk", "", VSAM_GEN_DDL_DIR / f"{s_}_pk.sql")
+    all_pre_sql = [CTL_DDL] + [(VSAM_GEN_DDL_DIR / f"{s_}.sql").read_text(encoding="utf-8") for s_ in store.schemas()
+                               if (VSAM_GEN_DDL_DIR / f"{s_}.sql").exists()]
+    all_post_sql = [t for t in ((VSAM_GEN_DDL_DIR / f"{s_}_pk.sql").read_text(encoding="utf-8") for s_ in store.schemas()
+                                if (VSAM_GEN_DDL_DIR / f"{s_}_pk.sql").exists()) if t.strip()]
 
     all_pre_file = VSAM_GEN_DDL_DIR / "all_tables.sql"
-    all_pre_file.write_text("\n".join(all_pre_sql), encoding="utf-8")
-    (VSAM_GEN_DDL_DIR / "vsam_04_all.sql").write_text("\n".join(all_pre_sql), encoding="utf-8")
-
-    # Write per-schema PK SQL files inside gen_ddl
-    all_post_sql = []
-    for s, stmts in sorted(per_schema_post.items()):
-        body = "\n\n".join(stmts) + "\n"
-        (VSAM_GEN_DDL_DIR / f"{s}_pk.sql").write_text(body, encoding="utf-8")
-        all_post_sql.append(body)
+    write_text_file(all_pre_file, "\n".join(all_pre_sql))
+    write_text_file(VSAM_GEN_DDL_DIR / "vsam_04_all.sql", "\n".join(all_pre_sql))
 
     all_post_file = VSAM_GEN_DDL_DIR / "all_pk.sql"
     if all_post_sql:
-        all_post_file.write_text("\n".join(all_post_sql), encoding="utf-8")
-        (VSAM_GEN_DDL_DIR / "vsam_04_all_pk.sql").write_text("\n".join(all_post_sql), encoding="utf-8")
+        write_text_file(all_post_file, "\n".join(all_post_sql))
+        write_text_file(VSAM_GEN_DDL_DIR / "vsam_04_all_pk.sql", "\n".join(all_post_sql))
     else:
-        empty_note = "-- Mode DATA / No PKs: Primary key constraints bypassed for raw truncate-and-load ingestion.\n"
-        all_post_file.write_text(empty_note, encoding="utf-8")
-        (VSAM_GEN_DDL_DIR / "vsam_04_all_pk.sql").write_text(empty_note, encoding="utf-8")
+        empty_note = "-- No primary keys: tables without a copybook / override key load keyless (snapshot replace).\n"
+        write_text_file(all_post_file, empty_note)
+        write_text_file(VSAM_GEN_DDL_DIR / "vsam_04_all_pk.sql", empty_note)
 
     ts = get_timestamp()
     report_file = VSAM_REPORTS_DIR / f"{get_db_name()}_vsam_04_generate_ddl_report_{ts}.xlsx"
@@ -350,7 +361,10 @@ def main():
 
     if args.execute:
         logger.info("Executing pre-load DDL in PostgreSQL...")
-        run_psql(all_pre_file, is_file=True)
+        if full:
+            run_psql(all_pre_file, is_file=True)
+        else:      # a targeted run applies only its own tables
+            run_psql(CTL_DDL + "\n" + "\n".join(store.script_for(s_, "pre", sorted(t_ for ss_, t_ in frag_pre if ss_ == s_)) for s_ in touched))
         logger.info("[+] Pre-load DDL executed successfully.")
     else:
         logger.info("Dry run complete. Use --execute or 'sweep.py vsam apply-ddl' to provision tables.")

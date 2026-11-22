@@ -24,7 +24,7 @@ rows can break the same rules everywhere):
 Rejected rows never fail the file unless their number reaches `max_rejects` (default 0 = never).
 `fast_bulk` keeps the old direct COPY for an empty, constraint-free table (no bad-row isolation).
 """
-from sweep_common import LOAD_LOG_TABLE, lit, q
+from sweep_common import ORACLE_LOAD_LOG_TABLE, lit, q
 from sweep_loadpipe import (  # re-exported: the Oracle loader and its tests import these from here
     MAX_DUP_ROWS_PRINTED, MAX_REJECT_ROWS_PRINTED, REJECT_TABLE, REJECT_TABLE_DDL, TEXT_TYPES, _cmp,
     ensure_reject_table, load_table_meta, parse_output, persist_failed_file_rejects, probe_trigger_mode, upsert_statements,
@@ -212,8 +212,8 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
 
     # 10. persist rejects + log, restore triggers, commit
     add(f"DELETE FROM {REJECT_TABLE} WHERE uri = {lit(uri)} AND target_schema = {lit(schema)} AND target_table = {lit(table)};\n"
-        f"INSERT INTO {REJECT_TABLE} (uri, target_schema, target_table, row_no, reason, detail, row_data, file_status) "
-        f"SELECT {lit(uri)}, {lit(schema)}, {lit(table)}, row_no, reason, detail, row_data, 'LOADED' FROM "
+        f"INSERT INTO {REJECT_TABLE} (track, uri, target_schema, target_table, row_no, reason, detail, row_data, file_status) "
+        f"SELECT 'oracle', {lit(uri)}, {lit(schema)}, {lit(table)}, row_no, reason, detail, row_data, 'LOADED' FROM "
         f"(SELECT * FROM _rej WHERE reason <> 'DUP_IN_FILE' UNION ALL "
         f"(SELECT * FROM _rej WHERE reason = 'DUP_IN_FILE' ORDER BY row_no LIMIT {MAX_REJECT_ROWS_PRINTED})) z;\n")
     add(on)
@@ -224,7 +224,7 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
 def load_log_insert(uri, schema, table, size_bytes, file_format, worker_id, s3_meta=None):
     """load_log row of the file (one row per URI, refreshed on a reload) incl. the S3 metadata it was loaded with."""
     lm, etag, size = meta_sql_values(s3_meta)
-    return (f"INSERT INTO {LOAD_LOG_TABLE} (uri, target_schema, target_table, size_bytes, file_format, worker_id, status, "
+    return (f"INSERT INTO {ORACLE_LOAD_LOG_TABLE} (uri, target_schema, target_table, size_bytes, file_format, worker_id, status, "
             f"s3_last_modified, s3_etag, s3_size) "
             f"VALUES ({lit(uri)}, {lit(schema)}, {lit(table)}, {size_bytes}, {lit(file_format)}, {worker_id}, 'SUCCESS', "
             f"{lm}, {etag}, {size}) "

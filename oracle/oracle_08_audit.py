@@ -227,7 +227,7 @@ def compare_tables(db_connected, discrepancies, meta, pg_cat, schemas_filter, ta
     table_comparison = []
 
     for s, t in all_table_keys:
-        if tables_filter and f"{s}.{t}" not in tables_filter and t not in tables_filter:
+        if tables_filter and not tables_filter.matches(s, t):
             continue
         if schemas_filter and s not in schemas_filter:
             continue
@@ -309,7 +309,7 @@ def compare_columns(db_connected, discrepancies, meta, pg_cat, schemas_filter, t
     evaluated_tables = set(oracle_cols_map.keys()) | set(pg_cols_map.keys())
 
     for s, t in sorted(evaluated_tables):
-        if tables_filter and f"{s}.{t}" not in tables_filter and t not in tables_filter:
+        if tables_filter and not tables_filter.matches(s, t):
             continue
         if schemas_filter and s not in schemas_filter:
             continue
@@ -439,7 +439,7 @@ def compare_constraints(db_connected, discrepancies, meta, pg_cat, schemas_filte
     all_cons_tables = sorted(set(oracle_cons_map.keys()) | set(pg_cons_map.keys()))
 
     for s, t in all_cons_tables:
-        if tables_filter and f"{s}.{t}" not in tables_filter and t not in tables_filter:
+        if tables_filter and not tables_filter.matches(s, t):
             continue
         if schemas_filter and s not in schemas_filter:
             continue
@@ -533,7 +533,7 @@ def compare_indexes(db_connected, discrepancies, meta, pg_cat, schemas_filter, t
     all_idx_tables = sorted(set(oracle_idx_map.keys()) | set(pg_idx_map.keys()))
 
     for s, t in all_idx_tables:
-        if tables_filter and f"{s}.{t}" not in tables_filter and t not in tables_filter:
+        if tables_filter and not tables_filter.matches(s, t):
             continue
         if schemas_filter and s not in schemas_filter:
             continue
@@ -765,7 +765,7 @@ def reconcile_row_counts(db_connected, discrepancies, exact_counts, meta, oracle
     all_audit_tables = sorted(set(oracle_tables.keys()) | set(s3_planned_map.keys()) | set(s3_loaded_map.keys()))
 
     for s, t in all_audit_tables:
-        if tables_filter and f"{s}.{t}" not in tables_filter and t not in tables_filter:
+        if tables_filter and not tables_filter.matches(s, t):
             continue
         if schemas_filter and s not in schemas_filter:
             continue

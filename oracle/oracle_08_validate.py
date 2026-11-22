@@ -85,6 +85,7 @@ from sweep_common import (
     PGUSER,
 )
 from sweep_s3meta import has_meta, make_meta, meta_equal, meta_from_row
+from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
 from oracle.oracle_08_catalog import fetch_target_postgres_catalogs, test_db_connection
 from oracle.oracle_08_audit import (
     compare_columns, compare_constraints, compare_indexes, compare_schemas, compare_sequences,
@@ -376,19 +377,28 @@ def run_full_parity_audit(exact_counts=False, tables_filter=None, schemas_filter
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="08_validate.py - Full-Fledged Oracle Dump vs PostgreSQL Parity Audit")
     parser.add_argument("--exact-counts", action="store_true", help="Perform exact live COUNT(*) queries instead of catalog approximations")
-    parser.add_argument("--tables", help="Comma-separated tables to audit (e.g. brokeraccountdetail,transactions)")
-    parser.add_argument("--schemas", help="Comma-separated schemas to audit (e.g. bss01001,bss01104)")
     parser.add_argument("--file", help="Master Oracle SQL dump file path (defaults to inputs/oracle/oracle_dump/*.sql)")
     parser.add_argument("--bg", action="store_true", help="Run detached in background supervisor")
+    add_targeting_args(parser, schemas="--schemas")      # --file here is the Oracle dump, not an S3 file
     args = parser.parse_args()
 
-    tables = {t.strip().lower() for t in args.tables.split(",")} if args.tables else None
-    schemas = {s.strip().lower() for s in args.schemas.split(",")} if args.schemas else None
+    sel = selector_or_exit(args, logger, use_files=False)
+    try:
+        with open(META_TABLES_CSV, "r", encoding="utf-8") as fh:
+            known = {(r["owner"], r["table_name"]) for r in csv.DictReader(fh)}
+    except OSError:
+        known = set()
+    if known:
+        validate_or_exit(sel.validate_tables, sorted(known), what="the Oracle metadata", logger=logger)
+    if sel.dry_run:
+        picked = [k for k in sorted(known) if sel.matches(*k)] if known else []
+        logger.info(f"[dry-run] {sel.describe()}: the audit would cover {len(picked) if known else 'all'} table(s); no report written")
+        sys.exit(0)
 
     ok = run_full_parity_audit(
         exact_counts=args.exact_counts,
-        tables_filter=tables,
-        schemas_filter=schemas,
+        tables_filter=sel if sel.table_selectors else None,
+        schemas_filter=set(sel.schemas) or None,
         dump_file=args.file
     )
     sys.exit(0 if ok else 1)

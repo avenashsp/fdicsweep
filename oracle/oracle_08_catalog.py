@@ -6,7 +6,7 @@ One small function per catalog (schemas, tables, columns, constraints, indexes, 
 views, triggers, load log, exact counts) feeding `fetch_target_postgres_catalogs`.
 """
 
-from sweep_common import DB_ERRORS, get_logger, LOAD_LOG_TABLE, PGDATABASE, PGHOST, PGPORT, PGUSER
+from sweep_common import DB_ERRORS, get_logger, ORACLE_LOAD_LOG_TABLE, PGDATABASE, PGHOST, PGPORT, PGUSER
 
 logger = get_logger("oracle_08_validate", "oracle_08_validate")
 
@@ -267,20 +267,20 @@ def fetch_load_log(catalog):
             SUM(loaded_rows) AS s3_loaded_rows,
             SUM(size_bytes) AS s3_bytes_loaded,
             ROUND(SUM(seconds), 2) AS total_load_seconds
-        FROM {LOAD_LOG_TABLE}
+        FROM {ORACLE_LOAD_LOG_TABLE}
         WHERE status = 'SUCCESS'
         GROUP BY LOWER(target_schema), LOWER(target_table);
     """
     try:
         catalog["load_log"] = execute_db_query(sql_load_log)
     except DB_ERRORS as e:
-        logger.warning(f"Could not query {LOAD_LOG_TABLE}: {e}")
+        logger.warning(f"Could not query {ORACLE_LOAD_LOG_TABLE}: {e}")
     # per-file S3 metadata (LastModified / ETag / size) as loaded, for the re-delivered-file comparison
     try:
         catalog["load_log_files"] = execute_db_query(
-            f"SELECT uri, s3_last_modified, s3_etag, s3_size FROM {LOAD_LOG_TABLE} WHERE status = 'SUCCESS'")
+            f"SELECT uri, s3_last_modified, s3_etag, s3_size FROM {ORACLE_LOAD_LOG_TABLE} WHERE status = 'SUCCESS'")
     except DB_ERRORS as e:
-        logger.warning(f"Could not read S3 metadata from {LOAD_LOG_TABLE} ({e}); re-delivered files cannot be detected")
+        logger.warning(f"Could not read S3 metadata from {ORACLE_LOAD_LOG_TABLE} ({e}); re-delivered files cannot be detected")
         catalog["load_log_files"] = []
 
 
@@ -291,7 +291,7 @@ def fetch_exact_counts(catalog, exact_counts, schemas_filter, tables_filter):
         for tbl in catalog["tables"]:
             s = tbl["table_schema"].lower()
             t = tbl["table_name"].lower()
-            if tables_filter and f"{s}.{t}" not in tables_filter and t not in tables_filter:
+            if tables_filter and not tables_filter.matches(s, t):
                 continue
             if schemas_filter and s not in schemas_filter:
                 continue

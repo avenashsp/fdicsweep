@@ -43,6 +43,8 @@ from sweep_common import (
     FILE_READ_ERRORS,
     norm_col,
 )
+from sweep_merge import merge_csv, merge_json
+from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
 from vsam.common_colmap import effective_columns_meta
 from vsam.vsam_common import (
     _opener,
@@ -58,7 +60,6 @@ from vsam.vsam_common import (
     load_copybook_korg_mapping,
     load_csv_safe,
     OUT,
-    write_json,
 )
 
 logger = get_logger("vsam_03_type_gate", "vsam_03_type_gate")
@@ -721,9 +722,10 @@ def profile_source(source_key, rows, key_cols, target_schemas, columns_meta, mod
 def main():
     parser = argparse.ArgumentParser(description="Step 03: Type Gate, PK verification and schema column detection.")
     parser.add_argument("--workers", type=int, default=int(os.getenv("VSAM_WORKERS", str(min(4, os.cpu_count() or 1)))))
-    parser.add_argument("--company", help="Comma-separated company tokens to filter")
     parser.add_argument("--bg", action="store_true", help="Run in background")
+    add_targeting_args(parser, company=True, file=True)
     args = parser.parse_args()
+    sel = selector_or_exit(args, logger)
 
     logger.info("=" * 75)
     logger.info("SWEEP VSAM MIGRATION - STEP 03: TYPE GATE & PK VERIFICATION")
@@ -733,9 +735,20 @@ def main():
     lm_file = OUT / "vsam_02_load_matrix.csv" if (OUT / "vsam_02_load_matrix.csv").exists() else OUT / "load_matrix.csv"
     lm = load_csv_safe(lm_file)
 
-    if args.company:
-        cos = [c.strip().upper() for c in args.company.split(",")]
-        lm = lm[lm["source_company"].isin(cos)]
+    lm_all = lm
+    if sel.filtered and not lm.empty:
+        validate_or_exit(sel.validate_companies, lm["source_company"].astype(str).unique(), what="the load matrix", logger=logger)
+        validate_or_exit(sel.validate_tables, list(zip(lm["target_schema"], lm["target_table"])), what="the load matrix", logger=logger)
+        validate_or_exit(sel.validate_files, list(lm["s3_filename"]) + list(lm["full_path"]), what="the load matrix", logger=logger)
+        hit = lm.apply(lambda r: sel.matches_company(r["source_company"]) and sel.matches(r["target_schema"], r["target_table"])
+                       and (not sel.files or sel.matches_file(r["s3_filename"]) or sel.matches_file(r["full_path"])), axis=1)
+        units = set(zip(lm.loc[hit, "source_company"], lm.loc[hit, "source_filename"]))
+        lm = lm[[(c, f) in units for c, f in zip(lm["source_company"], lm["source_filename"])]]
+    if sel.dry_run:
+        for (c_, s_), g_ in lm.groupby(["source_company", "source_filename"]):
+            logger.info(f"[dry-run] would profile {c_} | {s_} ({len(g_)} load row(s))")
+        logger.info(f"[dry-run] {sel.describe()}: {lm.groupby(['source_company', 'source_filename']).ngroups} source(s); nothing written")
+        return True
 
     if not lm.empty:      # always on: VSAM files are full snapshots
         orig_count = len(lm)
@@ -908,13 +921,21 @@ def main():
 
     # Save outputs
     OUT.mkdir(parents=True, exist_ok=True)
-    write_json("vsam_03_type_gate.json", all_results)
-    write_json("type_gate.json", all_results)
-    lm.to_csv(OUT / "vsam_02_load_matrix.csv", index=False)
-    lm.to_csv(OUT / "load_matrix.csv", index=False)
+    # a targeted run updates only the "company|source" entries / rows of its own sources (see sweep_merge)
+    full = not sel.filtered
+    for name in ("vsam_03_type_gate.json", "type_gate.json"):
+        merge_json(OUT / name, all_results, full=full)
+    run_units = {(str(c_), str(s_)) for c_, s_ in zip(lm["source_company"], lm[src_col])} if not lm.empty else set()
+    in_units = lambda r: (r.get("source_company", ""), r.get(src_col, "")) in run_units
+    lm_fields = list(lm_all.columns)
+    for name in ("vsam_02_load_matrix.csv", "load_matrix.csv"):
+        merge_csv(OUT / name, lm.to_dict(orient="records"), full=full, scope=None if full else in_units, fieldnames=lm_fields)
 
     status_df = pd.DataFrame(type_gate_summary_rows)
-    status_df.to_csv(OUT / "vsam_03_type_gate_status.csv", index=False)
+    run_keys = {f"{c_} | {s_}" for c_, s_ in run_units}
+    merge_csv(OUT / "vsam_03_type_gate_status.csv", type_gate_summary_rows, full=full,
+              scope=None if full else (lambda r: r.get("source key") in run_keys),
+              fieldnames=list(status_df.columns) if len(status_df.columns) else None)
 
     ts = get_timestamp()
     report_file = VSAM_REPORTS_DIR / f"{get_db_name()}_vsam_03_type_gate_report_{ts}.xlsx"

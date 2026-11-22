@@ -32,7 +32,7 @@ from sweep_common import (
     ORACLE_LOGS_DIR,
     AWS_REGION,
     DEFAULT_WORKERS,
-    LOAD_LOG_TABLE,
+    ORACLE_LOAD_LOG_TABLE,
     has_db_auth,
     AUTH_HELP,
     check_postgres_version,
@@ -58,6 +58,7 @@ from sweep_s3meta import classify_loaded, head_many, head_object, make_meta, met
 from oracle.oracle_06_order import plan_levels
 from sweep_streaming import read_stream_head, stream_program_literal
 from sweep_platform import atomic_write_json
+from sweep_targeting import Selector, add_targeting_args, selector_or_exit, validate_or_exit
 logger = get_logger("oracle_06_load_data", "oracle_06_load_data")
 LOCK = threading.Lock()
 MAX_REJECT_ROWS_IN_REPORT = 10000   # rows shown in the Rejected_Rows sheet; all are in sweep_ctl.load_rejects
@@ -144,16 +145,16 @@ def get_loaded_log():
     metadata columns existed carry empty metadata (see classify_job).
     """
     try:
-        rows = query_db_dicts(f"SELECT uri, s3_last_modified, s3_etag, s3_size FROM {LOAD_LOG_TABLE} WHERE status = 'SUCCESS'")
+        rows = query_db_dicts(f"SELECT uri, s3_last_modified, s3_etag, s3_size FROM {ORACLE_LOAD_LOG_TABLE} WHERE status = 'SUCCESS'")
         return {r["uri"]: make_meta(r.get("s3_last_modified"), r.get("s3_etag"), r.get("s3_size")) for r in rows}
     except DB_ERRORS as e:
-        logger.warning(f"Could not read S3 metadata from {LOAD_LOG_TABLE} ({e}); falling back to URIs only. "
+        logger.warning(f"Could not read S3 metadata from {ORACLE_LOAD_LOG_TABLE} ({e}); falling back to URIs only. "
                        f"Apply the control DDL (Step 05) to add the s3_* columns.")
     try:
         return {r["uri"]: make_meta("", "", "")
-                for r in query_db_dicts(f"SELECT uri FROM {LOAD_LOG_TABLE} WHERE status = 'SUCCESS'")}
+                for r in query_db_dicts(f"SELECT uri FROM {ORACLE_LOAD_LOG_TABLE} WHERE status = 'SUCCESS'")}
     except DB_ERRORS as e:
-        logger.warning(f"Could not read loaded URIs from {LOAD_LOG_TABLE} (table might be new): {e}")
+        logger.warning(f"Could not read loaded URIs from {ORACLE_LOAD_LOG_TABLE} (table might be new): {e}")
         return {}
 
 
@@ -299,7 +300,7 @@ def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False, max_rejec
 
         # Update loaded_rows and seconds
         try:
-            update_sql = f"UPDATE {LOAD_LOG_TABLE} SET loaded_rows = {rows}, seconds = {sec} WHERE uri = {lit(uri)};"
+            update_sql = f"UPDATE {ORACLE_LOAD_LOG_TABLE} SET loaded_rows = {rows}, seconds = {sec} WHERE uri = {lit(uri)};"
             run_psql(update_sql)
         except RuntimeError as e:
             # Data and its load_log row are already committed; only the stats update failed.
@@ -316,9 +317,18 @@ def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False, max_rejec
         record_stream_end(worker_id)
 
 
+def _legacy_selector(tables_filter, exclude_tables, file_uri, filename, dry_run):
+    """Selector for callers that still pass the old set / string arguments."""
+    ref = lambda t: (None, t.lower()) if "." not in t else tuple(t.lower().split(".", 1))
+    return Selector(tables=[ref(t) for t in (tables_filter or ())], exclude=[ref(t) for t in (exclude_tables or ())],
+                    files=[f for f in (file_uri, filename) if f], dry_run=bool(dry_run))
+
+
 def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=None, file_uri=None, filename=None, limit_files=None, max_size_mb=None, min_size_mb=None, dry_run=False, gate_pass=False, reload=False,
-                    max_rejects=DEFAULT_MAX_REJECTS, fast_bulk=False, trigger_mode="auto"):
+                    max_rejects=DEFAULT_MAX_REJECTS, fast_bulk=False, trigger_mode="auto", selector=None):
     ts = get_timestamp()
+    sel = selector or _legacy_selector(tables_filter, exclude_tables, file_uri, filename, dry_run)
+    dry_run = dry_run or sel.dry_run
     if not has_db_auth():
         logger.error(AUTH_HELP)
         return False
@@ -393,25 +403,14 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
                     or f"{j['target_schema']}.{j['target_table']}".upper() in passed_tables
                     or j['table_name'].upper() in passed_tables]
 
-    # Filter tables if specified
-    if tables_filter:
-        all_jobs = [j for j in all_jobs if f"{j['owner']}.{j['table_name']}".upper() in tables_filter
-                    or f"{j['target_schema']}.{j['target_table']}".lower() in tables_filter
-                    or j['table_name'].upper() in tables_filter]
-
-    # Exclude tables if specified
-    if exclude_tables:
-        all_jobs = [j for j in all_jobs if f"{j['owner']}.{j['table_name']}".upper() not in exclude_tables
-                    and f"{j['target_schema']}.{j['target_table']}".lower() not in exclude_tables
-                    and j['table_name'].upper() not in exclude_tables]
-
-    # Filter single file by URI or filename if specified
-    if file_uri:
-        all_jobs = [j for j in all_jobs if j["uri"].strip().lower() == file_uri.strip().lower()]
-
-    if filename:
-        all_jobs = [j for j in all_jobs if j.get("filename", "").strip().lower() == filename.strip().lower()
-                    or Path(j["uri"]).name.lower() == filename.strip().lower()]
+    # Selectors (--tables / --schemas / --exclude-tables / --file / --filename): validated BEFORE anything runs
+    names = [(j["owner"], j["table_name"]) for j in all_jobs] + [(j["target_schema"], j["target_table"]) for j in all_jobs]
+    validate_or_exit(sel.validate_tables, names, what="the file map", logger=logger)
+    validate_or_exit(sel.validate_files, [j["uri"] for j in all_jobs], what="the file map", logger=logger)
+    all_jobs = [j for j in all_jobs
+                if (sel.matches(j["owner"], j["table_name"]) or sel.matches(j["target_schema"], j["target_table"]))
+                and (not sel.files or sel.matches_file(j["uri"]) or sel.matches_file(j.get("filename", "")))]
+    file_uri = filename = sel.files[0] if sel.files else None     # a named file is always loaded (like --reload)
 
     # Filter by size range if specified
     if max_size_mb is not None:
@@ -633,15 +632,11 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="06_loadData.py - Multi-Worker S3 Streaming Ingestion")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Parallel workers (default: {DEFAULT_WORKERS})")
-    parser.add_argument("--tables", help="Comma-separated tables to load (e.g. BSS01001.BROKERACCOUNTDETAIL)")
-    parser.add_argument("--exclude-tables", help="Comma-separated tables to exclude from load")
-    parser.add_argument("--file", help="Specific S3 URI to load")
-    parser.add_argument("--filename", help="Specific S3 filename/basename to load")
+    add_targeting_args(parser, schemas="--owners", file=True)
     parser.add_argument("--gate-pass", action="store_true", help="Load only tables that passed the pre-flight type gate")
     parser.add_argument("--limit-files", type=int, help="Limit number of files to load (for testing)")
     parser.add_argument("--max-size-mb", type=float, help="Filter files with size <= max_size_mb")
     parser.add_argument("--min-size-mb", type=float, help="Filter files with size >= min_size_mb")
-    parser.add_argument("--dry-run", action="store_true", help="Dry run: show what would be loaded without database writes")
     parser.add_argument("--reload", action="store_true", help="Force reloading/upserting files even if previously loaded")
     parser.add_argument("--max-rejects", type=int, default=DEFAULT_MAX_REJECTS,
                         help=f"Fail (and roll back) a file when this many rows are rejected (default {DEFAULT_MAX_REJECTS} = never; only technical errors fail a file)")
@@ -652,22 +647,16 @@ if __name__ == "__main__":
                              "or ALTER TABLE DISABLE TRIGGER (needs table ownership, locks the table). auto = replica if allowed")
     args = parser.parse_args()
 
-    tables = {t.strip().upper() for t in args.tables.split(",")} if args.tables else None
-    exclude_tbls = {t.strip().upper() for t in args.exclude_tables.split(",")} if args.exclude_tables else None
     ok = run_stream_load(
         workers=args.workers,
-        tables_filter=tables,
-        exclude_tables=exclude_tbls,
-        file_uri=args.file,
-        filename=args.filename,
         limit_files=args.limit_files,
         max_size_mb=args.max_size_mb,
         min_size_mb=args.min_size_mb,
-        dry_run=args.dry_run,
         gate_pass=args.gate_pass,
         reload=args.reload,
         max_rejects=args.max_rejects,
         fast_bulk=args.fast_bulk,
         trigger_mode=args.trigger_mode,
+        selector=selector_or_exit(args, logger),
     )
     sys.exit(0 if ok else 1)

@@ -19,7 +19,7 @@ bulk \\copy, set-based validation in SQL, one transaction per file (see vsam/vsa
      never deleted.
 
 Generates:
-  - outputs/vsam/vsam_06_load_log_<run_id>.csv
+  - outputs/vsam/<db>_vsam_06_load_log_<run_id>.csv
   - reports/vsam/<db>_vsam_06_load_data_report_<ts>.xlsx
 =============================================================================
 """
@@ -37,7 +37,7 @@ from pathlib import Path
 import pandas as pd
 
 from sweep_common import (
-    CTL_SCHEMA,
+    VSAM_LOAD_LOG_TABLE,
     DEFAULT_WORKERS,
     check_postgres_version,
     VSAM_LOGS_DIR,
@@ -56,6 +56,7 @@ from sweep_common import (
     run_psql,
     run_psql_script,
 )
+from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
 from sweep_loadpipe import REJECT_TABLE, ensure_reject_table, load_table_meta, parse_output, probe_trigger_mode
 from sweep_platform import atomic_write_json
 from sweep_s3meta import classify_loaded, head_many, make_meta, meta_from_row
@@ -125,50 +126,50 @@ def record_stream_end(worker_id):
 # load_log helpers
 # -----------------------------------------------------------------------------
 def load_log_sql(full_path, dest_schema, table, size_bytes, rows, seconds, worker_id, status="SUCCESS", message=None):
-    """One load_log row (keyed `<uri>#<schema>`, which Step 07 strips)."""
+    """One vsam_load_log row (PK uri + destination schema)."""
     msg_cols = ", message" if message else ""
     msg_val = f", {lit(message)}" if message else ""
     msg_upd = f", message={lit(message)}" if message else ""
     return (
-        f"INSERT INTO {CTL_SCHEMA}.load_log "
+        f"INSERT INTO {VSAM_LOAD_LOG_TABLE} "
         f"(uri, target_schema, target_table, size_bytes, loaded_rows, seconds, worker_id, status{msg_cols}, loaded_at) "
-        f"VALUES ({lit(f'{full_path}#{dest_schema}')}, {lit(dest_schema)}, {lit(table)}, {size_bytes}, "
+        f"VALUES ({lit(full_path)}, {lit(dest_schema)}, {lit(table)}, {size_bytes}, "
         f"{int(rows)}, {seconds}, {worker_id}, {lit(status)}{msg_val}, now()) "
-        f"ON CONFLICT (uri) DO UPDATE SET status={lit(status)}, loaded_rows={int(rows)}, "
+        f"ON CONFLICT (uri, target_schema) DO UPDATE SET status={lit(status)}, loaded_rows={int(rows)}, "
         f"seconds={seconds}, loaded_at=now(){msg_upd};"
     )
 
 
 def write_load_log(full_path, dest_schema, table, size_bytes, rows, seconds, worker_id, status="SUCCESS", message=None):
-    """Records a per-destination-schema load in sweep_ctl.load_log. Errors propagate (a lost row means a reload)."""
+    """Records a per-destination-schema load in sweep_ctl.vsam_load_log. Errors propagate (a lost row means a reload)."""
     run_psql(load_log_sql(full_path, dest_schema, table, size_bytes, rows, seconds, worker_id, status, message))
 
 
 def get_loaded_log():
     """{file uri: [S3 metadata stored with its SUCCESS rows]} - one entry per destination schema of the file."""
     try:
-        rows = query_db_dicts(f"SELECT uri, s3_last_modified, s3_etag, s3_size FROM {CTL_SCHEMA}.load_log WHERE status = 'SUCCESS'")
+        rows = query_db_dicts(f"SELECT uri, s3_last_modified, s3_etag, s3_size FROM {VSAM_LOAD_LOG_TABLE} WHERE status = 'SUCCESS'")
     except RuntimeError as e:
-        logger.warning(f"Could not read S3 metadata from load_log ({e}); falling back to URIs only. "
+        logger.warning(f"Could not read S3 metadata from vsam_load_log ({e}); falling back to URIs only. "
                        f"Apply the control DDL (Step 05) to add the s3_* columns.")
         try:
-            rows = query_db_dicts(f"SELECT uri FROM {CTL_SCHEMA}.load_log WHERE status = 'SUCCESS'")
+            rows = query_db_dicts(f"SELECT uri FROM {VSAM_LOAD_LOG_TABLE} WHERE status = 'SUCCESS'")
         except RuntimeError as e2:
-            logger.warning(f"Could not read load_log (table might be new): {e2}")
+            logger.warning(f"Could not read vsam_load_log (table might be new): {e2}")
             return {}
     out = defaultdict(list)
     for r in rows:
-        out[r["uri"].rsplit("#", 1)[0]].append(make_meta(r.get("s3_last_modified"), r.get("s3_etag"), r.get("s3_size")))
+        out[r["uri"]].append(make_meta(r.get("s3_last_modified"), r.get("s3_etag"), r.get("s3_size")))
     return out
 
 
 def newer_snapshot_loaded(table, source_key, version):
-    """True when load_log already holds a snapshot of this source that is newer than `version`."""
+    """True when vsam_load_log already holds a snapshot of this source that is newer than `version`."""
     if not version:
         return False
     try:
         rows = query_db_rows(
-            f"SELECT message FROM {CTL_SCHEMA}.load_log WHERE target_table = {lit(table)} "
+            f"SELECT message FROM {VSAM_LOAD_LOG_TABLE} WHERE target_table = {lit(table)} "
             f"AND message LIKE {lit(f'source={source_key};snapshot=%')}")
     except RuntimeError:
         return False
@@ -419,10 +420,10 @@ def persist_failed_rejects(specs, table, rows):
         if not sample:
             continue
         values = ",\n".join(
-            f"({lit(s['uri'])}, {lit(r.get('dest') or 'bcs')}, {lit(table)}, {int(r['row_no'])}, {lit(r['reason'])}, "
+            f"('vsam', {lit(s['uri'])}, {lit(r.get('dest') or 'bcs')}, {lit(table)}, {int(r['row_no'])}, {lit(r['reason'])}, "
             f"{lit(r.get('detail'))}, {lit(json.dumps(r.get('row')))}::jsonb, 'FILE_FAILED')" for r in sample)
         run_psql(f"DELETE FROM {REJECT_TABLE} WHERE uri = {lit(s['uri'])} AND target_table = {lit(table)};\n"
-                 f"INSERT INTO {REJECT_TABLE} (uri, target_schema, target_table, row_no, reason, detail, row_data, file_status) "
+                 f"INSERT INTO {REJECT_TABLE} (track, uri, target_schema, target_table, row_no, reason, detail, row_data, file_status) "
                  f"VALUES {values};")
 
 
@@ -469,8 +470,8 @@ def run_unit(table, specs, worker_id, run, tg_prof):
         # per-schema seconds (the in-transaction rows were written with 0)
         try:
             for s in specs:
-                run_psql(f"UPDATE {CTL_SCHEMA}.load_log SET seconds = {round(sec / len(specs), 2)} "
-                         f"WHERE uri = {lit(s['uri'])} OR starts_with(uri, {lit(s['uri'] + '#')});")
+                run_psql(f"UPDATE {VSAM_LOAD_LOG_TABLE} SET seconds = {round(sec / len(specs), 2)} "
+                         f"WHERE uri = {lit(s['uri'])};")
         except RuntimeError as e:
             logger.warning(f"Could not record load seconds: {e}")
         results = [_file_result(s, "SUCCESS", round(sec / len(specs), 2), "", info, counts, summary, rows, worker_id, _mapped_set(s)) for s in specs]
@@ -488,10 +489,10 @@ def run_unit(table, specs, worker_id, run, tg_prof):
         for s in specs:
             try:
                 run_psql(
-                    f"INSERT INTO {CTL_SCHEMA}.load_log (uri, target_schema, target_table, size_bytes, loaded_rows, seconds, worker_id, "
+                    f"INSERT INTO {VSAM_LOAD_LOG_TABLE} (uri, target_schema, target_table, size_bytes, loaded_rows, seconds, worker_id, "
                     f"status, message, loaded_at) VALUES ({lit(s['uri'])}, {lit(','.join(info['dests']) if info else 'bcs')}, {lit(table)}, "
                     f"{s['size_bytes']}, 0, {sec}, {worker_id}, 'FAILED', {lit(err)}, now()) "
-                    f"ON CONFLICT (uri) DO UPDATE SET status='FAILED', message={lit(err)}, loaded_at=now();")
+                    f"ON CONFLICT (uri, target_schema) DO UPDATE SET status='FAILED', message={lit(err)}, loaded_at=now();")
             except RuntimeError as log_err:
                 logger.error(f"[Worker {worker_id}] Could not record FAILED status for {s['name']}: {log_err}")
         return _failed_results(specs, err, sec, worker_id, info)
@@ -643,8 +644,7 @@ def classify_tasks(tasks, tg_prof, reload, heads_live):
 def main():
     parser = argparse.ArgumentParser(description="Step 06: Stream VSAM data from S3 to PostgreSQL with staged validation, upsert and schema segregation.")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
-    parser.add_argument("--company", help="Comma-separated company filter")
-    parser.add_argument("--tables", help="Comma-separated tables to load")
+    add_targeting_args(parser, company=True, file=True)
     parser.add_argument("--limit-files", type=int, help="Limit number of files loaded")
     parser.add_argument("--force-truncate", action="store_true",
                         help="Tables without a primary key are replaced by the new snapshot automatically in a full run. "
@@ -653,13 +653,13 @@ def main():
     parser.add_argument("--reload", action="store_true", help="Load files again even when their S3 LastModified/ETag/size are unchanged")
     parser.add_argument("--max-rejects", type=int, default=DEFAULT_MAX_REJECTS,
                         help=f"Fail (and roll back) a file when this many rows are rejected (default {DEFAULT_MAX_REJECTS} = never; only technical errors fail a file)")
-    parser.add_argument("--dry-run", action="store_true", help="List the files and tables that would be loaded, then exit without writing")
     parser.add_argument("--bg", action="store_true", help="Run in background daemon mode")
     args = parser.parse_args()
+    sel = selector_or_exit(args, logger)
 
     global FORCE_TRUNCATE, PARTIAL_RUN
     FORCE_TRUNCATE = args.force_truncate
-    PARTIAL_RUN = bool(args.company or args.tables or args.limit_files)
+    PARTIAL_RUN = bool(sel.filtered or args.limit_files)
 
     run_id = get_timestamp()
     logger.info("=" * 75)
@@ -674,12 +674,17 @@ def main():
 
     lm_file = OUT / "vsam_02_load_matrix.csv" if (OUT / "vsam_02_load_matrix.csv").exists() else OUT / "load_matrix.csv"
     lm = load_csv_safe(lm_file)
-    if args.company:
-        cos = [c.strip().upper() for c in args.company.split(",")]
-        lm = lm[lm["source_company"].isin(cos)]
-    if args.tables:
-        tbls = [t.strip().lower() for t in args.tables.split(",")]
-        lm = lm[lm["target_table"].isin(tbls)]
+    if sel.filtered and not lm.empty:      # validated BEFORE anything runs
+        validate_or_exit(sel.validate_companies, lm["source_company"].astype(str).unique(), what="the load matrix", logger=logger)
+        validate_or_exit(sel.validate_tables, list(zip(lm["target_schema"], lm["target_table"])), what="the load matrix", logger=logger)
+        validate_or_exit(sel.validate_files, list(lm["s3_filename"]) + list(lm["full_path"]), what="the load matrix", logger=logger)
+        if sel.schemas:
+            logger.warning("--schemas selects the files that load into those schemas; each selected file is loaded completely "
+                           "(all of its destination schemas)")
+        keep = lm.apply(lambda r: sel.matches_company(r["source_company"]) and sel.matches(r["target_schema"], r["target_table"])
+                        and (not sel.files or sel.matches_file(r["s3_filename"]) or sel.matches_file(r["full_path"])), axis=1)
+        picked = set(zip(lm.loc[keep, "full_path"], lm.loc[keep, "target_table"]))
+        lm = lm[[(fp, t) in picked for fp, t in zip(lm["full_path"], lm["target_table"])]]
     if lm.empty:
         logger.warning("Load matrix is empty. Nothing to load.")
         return True
@@ -708,7 +713,7 @@ def main():
         tasks.append(rec)
     total_tasks = len(tasks)
 
-    if args.dry_run:
+    if sel.dry_run:
         for t in tasks:
             logger.info(f"[DRY-RUN] {t.get('s3_filename') or Path(t['full_path']).name} -> "
                         f"{','.join(t.get('target_schemas') or [])}.{t['target_table']} ({t.get('size_mb', 0)} MB)")
@@ -814,7 +819,7 @@ def main():
     record_stream_end(None)
 
     ts = get_timestamp()
-    log_csv = OUT / f"vsam_06_load_log_{run_id}.csv"
+    log_csv = OUT / f"{get_db_name()}_vsam_06_load_log_{run_id}.csv"
     load_summary_rows = build_load_summary(results)
     schema_breakdown_rows = build_schema_breakdown(results)
     reject_summary, rejected_rows = build_reject_sheets(results)

@@ -38,10 +38,11 @@ from sweep_common import (
     has_db_auth,
     AUTH_HELP,
     CTL_SCHEMA,
-    LOAD_LOG_TABLE,
+    ORACLE_LOAD_LOG_TABLE,
     DB_ERRORS,
 )
 
+from sweep_targeting import Selector, add_targeting_args, selector_or_exit, validate_or_exit
 from oracle.oracle_07_parser import parse_sql_file_blocks, simplify_case_to_coalesce
 
 logger = get_logger("oracle_07_load_objects", "oracle_07_load_objects")
@@ -68,7 +69,7 @@ def get_loaded_tables():
     loaded = set()
     sql_check = (
         "DO $$ BEGIN "
-        f"IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = '{CTL_SCHEMA}' AND table_name = 'load_log') THEN "
+        f"IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = '{CTL_SCHEMA}' AND table_name = 'oracle_load_log') THEN "
         f"  PERFORM 1; "
         "END IF; END $$;"
     )
@@ -80,7 +81,7 @@ def get_loaded_tables():
     sql_loaded = (
         "WITH raw_loaded AS ( "
         f"    SELECT DISTINCT LOWER(target_schema) || '.' || LOWER(target_table) AS tbl "
-        f"    FROM {LOAD_LOG_TABLE} "
+        f"    FROM {ORACLE_LOAD_LOG_TABLE} "
         f"    WHERE status = 'SUCCESS' "
         "    UNION "
         "    SELECT LOWER(schemaname) || '.' || LOWER(relname) AS tbl "
@@ -240,7 +241,7 @@ def sync_identity_sequences():
     except DB_ERRORS as e:
         logger.warning(f"Could not synchronize identity sequences: {e}")
 
-def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False):
+def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False, selector=None):
     """
     Executes post-load scripts selectively:
       - By default, creates objects for ALL tables.
@@ -251,6 +252,15 @@ def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False):
     if not has_db_auth():
         logger.error(AUTH_HELP)
         return False
+    sel = selector or Selector(schemas={s.lower() for s in (schemas_filter or ())})
+    if sel.table_selectors:
+        try:
+            cat = query_db_dicts("SELECT table_schema AS s, table_name AS t FROM information_schema.tables "
+                                 "WHERE table_schema NOT IN ('pg_catalog', 'information_schema', 'sweep_ctl', 'sweep_meta', 'sweep_delta')")
+        except RuntimeError as e:
+            logger.error(f"Cannot validate the selectors: {e}")
+            return False
+        validate_or_exit(sel.validate_tables, [(r["s"], r["t"]) for r in cat], what="the database", logger=logger)
     all_script_results = []
     all_object_actions = []
 
@@ -290,7 +300,7 @@ def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False):
 
         for sf in stage_files:
             schema_name = sf.name[:-len(f"_{file_suffix}")]
-            if schemas_filter and schema_name.lower() not in schemas_filter:
+            if not sel.matches_schema(schema_name):
                 continue
 
             blocks = parse_sql_file_blocks(sf, stage_code)
@@ -314,6 +324,14 @@ def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False):
                     continue
 
                 target_table_id = f"{s_name}.{t_name}" if t_name else ""
+
+                # --tables / --exclude-tables: only the selected tables' objects; schema-level objects (views) are
+                # left alone by a run that names tables
+                if sel.table_selectors:
+                    if t_name and not sel.matches(s_name, t_name):
+                        continue
+                    if not t_name and sel.tables:
+                        continue
 
                 # -------------------------------------------------------------
                 # RULE 0: Do not validate CHECK constraints (skipped by policy)
@@ -400,6 +418,14 @@ def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False):
             # Execute Filtered Statements
             # -----------------------------------------------------------------
             script_t0 = time.time()
+            if sel.dry_run:
+                logger.info(f"[dry-run] {sf.name}: {len(stmts_to_execute)} statement(s) would be executed "
+                            f"({skipped_exists_count} already exist); nothing executed")
+                all_script_results.append({"stage": stage_code, "description": description, "schema": schema_name, "file_name": sf.name,
+                                           "status": "DRY_RUN", "applied": 0, "skipped_already_exists": skipped_exists_count,
+                                           "skipped_no_data": skipped_no_data_count, "duration_seconds": 0.0,
+                                           "message": f"{len(stmts_to_execute)} statement(s) pending"})
+                continue
             if not stmts_to_execute:
                 logger.info(f"Skipping execution of {sf.name}: All objects already exist ({skipped_exists_count}) or tables have no loaded data ({skipped_no_data_count}).")
                 all_script_results.append({
@@ -643,12 +669,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="07_loadObjects.py - Staged Post-Load Object Creator")
     parser.add_argument("--stage", choices=["all", "pk", "alter", "index", "fk", "validate", "views", "triggers"], default="all",
                         help="Stage: pk (PK/Unique), alter (Check & Alter constraints), index (Concurrent indexes), fk (Foreign keys), validate (FK validate), views (Views), triggers (Triggers), all (default)")
-    parser.add_argument("--schemas", help="Comma-separated schemas to process")
     parser.add_argument("--only-loaded", action="store_true", help="Only load objects for tables where data has been loaded (default: load for all tables)")
+    add_targeting_args(parser)
     args = parser.parse_args()
 
     stages = [args.stage] if args.stage != "all" else None
-    schemas = {s.strip().lower() for s in args.schemas.split(",")} if args.schemas else None
 
-    ok = apply_post_load(stages_to_run=stages, schemas_filter=schemas, only_loaded=args.only_loaded)
+    ok = apply_post_load(stages_to_run=stages, only_loaded=args.only_loaded, selector=selector_or_exit(args, logger))
     sys.exit(0 if ok else 1)

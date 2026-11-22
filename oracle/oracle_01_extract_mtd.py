@@ -17,9 +17,10 @@ Generates: reports/01_extractMetadata_report_<timestamp>.xlsx
 """
 import re
 import sys
-import csv
 import argparse
 from pathlib import Path
+from sweep_merge import merge_csv
+from sweep_targeting import Selector, add_targeting_args, selector_or_exit, validate_or_exit
 from sweep_common import (
     log_summary,
     ORACLE_INPUTS_DIR, ORACLE_DUMP_DIR, ORACLE_REPORTS_DIR,
@@ -517,8 +518,29 @@ def parse_table_ddl(text, default_owner="", source_file=""):
     }
 
 
-def extract_metadata_from_master(sql_file_path=None, owners_filter=None):
+def extract_metadata_from_master(sql_file_path=None, owners_filter=None, selector=None):
+    """
+    `selector` (sweep_targeting.Selector) narrows the run to tables / schemas; `owners_filter` is the old set-of-owners
+    argument, kept for callers that still pass it. Without any selector this is a FULL run and the metadata CSVs are
+    replaced; a targeted run merges its tables into the existing CSVs (sweep_merge) and keeps every other entry.
+    """
     ts = get_timestamp()
+    sel = selector or Selector(schemas={o.lower() for o in (owners_filter or ())})
+    all_seen = set()          # every table of the dump, whatever the selector says (validates --tables / --schemas)
+
+    def owner_ok(owner):
+        return not sel.schemas or owner.lower() in sel.schemas
+
+    def owner_objects_ok(owner):
+        """Views, PL/SQL objects and sequences belong to a schema, not to a table: --tables leaves them untouched."""
+        return owner_ok(owner) and not sel.tables
+
+    def table_selected(tbl):
+        all_seen.add((tbl["owner"], tbl["table"]))
+        return sel.matches(tbl["owner"], tbl["table"])
+
+    def index_selected(idx):
+        return sel.matches(idx.get("table_owner") or idx["owner"], idx.get("table_name", ""))
 
     # Locate master SQL file: prioritize inputs/oracle_dump/, fallback to inputs/
     master_files = []
@@ -589,17 +611,18 @@ def extract_metadata_from_master(sql_file_path=None, owners_filter=None):
                     owner = (m_obj.group(2) or cur_schema or "PUBLIC").upper()
                     name = m_obj.group(3).upper()
 
-                    if owners_filter and owner not in owners_filter and not kind.startswith("PUBLIC"):
+                    if not owner_ok(owner) and not kind.startswith("PUBLIC"):
                         continue
 
                     # Views / PLSQL objects
                     if kind in ("VIEW", "MATERIALIZED VIEW", "PUBLIC SYNONYM", "SYNONYM") or kind in PLSQL_TYPES:
-                        objects_list.append({
-                            "owner": owner,
-                            "object_type": kind,
-                            "object_name": name,
-                            "source_file": target_sql.name
-                        })
+                        if owner_objects_ok(owner) or (kind.startswith("PUBLIC") and not sel.filtered):
+                            objects_list.append({
+                                "owner": owner,
+                                "object_type": kind,
+                                "object_name": name,
+                                "source_file": target_sql.name
+                            })
                         if kind in PLSQL_TYPES:
                             if line.strip() == "/":
                                 mode = None
@@ -616,7 +639,7 @@ def extract_metadata_from_master(sql_file_path=None, owners_filter=None):
                     if kind == "SEQUENCE":
                         if is_statement_end(line):
                             seq = parse_sequence_ddl(line, default_owner=cur_schema)
-                            if seq and (not owners_filter or seq["owner"] in owners_filter):
+                            if seq and owner_objects_ok(seq["owner"]):
                                 sequences_list.append(seq)
                             mode = None
                         else:
@@ -628,7 +651,7 @@ def extract_metadata_from_master(sql_file_path=None, owners_filter=None):
                     if "INDEX" in kind:
                         if is_statement_end(line):
                             idx = parse_index_ddl(line, default_owner=cur_schema, source_file=target_sql.name)
-                            if idx and (not owners_filter or idx["owner"] in owners_filter):
+                            if idx and index_selected(idx):
                                 indexes_list.append(idx)
                             mode = None
                         else:
@@ -640,7 +663,7 @@ def extract_metadata_from_master(sql_file_path=None, owners_filter=None):
                     if "TABLE" in kind:
                         if is_statement_end(line):
                             tbl = parse_table_ddl(line, default_owner=cur_schema, source_file=target_sql.name)
-                            if tbl and (not owners_filter or tbl["owner"] in owners_filter):
+                            if tbl and table_selected(tbl):
                                 seen_tables.add((tbl["owner"], tbl["table"]))
                                 tables_list.extend(tbl["columns"])
                                 constraints_list.extend(tbl["constraints"])
@@ -667,12 +690,12 @@ def extract_metadata_from_master(sql_file_path=None, owners_filter=None):
                 elif m_alt:
                     # ALTER TABLE ... ADD CONSTRAINT
                     owner = (m_alt.group(1) or cur_schema or "").upper()
-                    if owners_filter and owner not in owners_filter:
+                    if not owner_ok(owner):
                         continue
                     if is_statement_end(line):
                         cons = parse_alter_ddl(line, default_owner=cur_schema, source_file=target_sql.name)
                         for cn in cons:
-                            if not owners_filter or cn["owner"] in owners_filter:
+                            if sel.matches(cn["owner"], cn["table_name"]):
                                 constraints_list.append(cn)
                         mode = None
                     else:
@@ -701,7 +724,7 @@ def extract_metadata_from_master(sql_file_path=None, owners_filter=None):
 
                 if mode == "TABLE":
                     tbl = parse_table_ddl(text, default_owner=cur_schema, source_file=target_sql.name)
-                    if tbl and (not owners_filter or tbl["owner"] in owners_filter):
+                    if tbl and table_selected(tbl):
                         seen_tables.add((tbl["owner"], tbl["table"]))
                         tables_list.extend(tbl["columns"])
                         constraints_list.extend(tbl["constraints"])
@@ -715,18 +738,18 @@ def extract_metadata_from_master(sql_file_path=None, owners_filter=None):
 
                 elif mode == "INDEX":
                     idx = parse_index_ddl(text, default_owner=cur_schema, source_file=target_sql.name)
-                    if idx and (not owners_filter or idx["owner"] in owners_filter):
+                    if idx and index_selected(idx):
                         indexes_list.append(idx)
 
                 elif mode == "SEQUENCE":
                     seq = parse_sequence_ddl(text, default_owner=cur_schema)
-                    if seq and (not owners_filter or seq["owner"] in owners_filter):
+                    if seq and owner_objects_ok(seq["owner"]):
                         sequences_list.append(seq)
 
                 elif mode == "ALTER":
                     cons = parse_alter_ddl(text, default_owner=cur_schema, source_file=target_sql.name)
                     for cn in cons:
-                        if not owners_filter or cn["owner"] in owners_filter:
+                        if sel.matches(cn["owner"], cn["table_name"]):
                             constraints_list.append(cn)
 
                 mode = None
@@ -735,37 +758,48 @@ def extract_metadata_from_master(sql_file_path=None, owners_filter=None):
     # -------------------------------------------------------------------------
     # Write the 7 required metadata CSV files in outputs/oracle_metadata/
     # -------------------------------------------------------------------------
-    def write_csv(filepath, data, default_header):
-        with open(filepath, "w", newline="", encoding="utf-8") as out_f:
-            if data:
-                writer = csv.DictWriter(out_f, fieldnames=list(data[0].keys()))
-                writer.writeheader()
-                writer.writerows(data)
-            else:
-                writer = csv.writer(out_f)
-                writer.writerow(default_header)
+    validate_or_exit(sel.validate_tables, sorted(all_seen), what=f"the dump {target_sql.name}", logger=logger)
+
+    if sel.dry_run:
+        logger.info(f"[dry-run] {sel.describe()}: would write metadata of {len(seen_tables)} table(s) "
+                    f"({len(tables_list)} columns, {len(constraints_list)} constraints, {len(indexes_list)} indexes, "
+                    f"{len(partitions_list)} partitions, {len(sequences_list)} sequences, {len(objects_list)} objects); nothing written")
+        return True
+
+    full = not sel.filtered
+    table_scope = sel.table_scope("owner", "table_name")
+
+    def write_csv(filepath, data, default_header, scope):
+        merge_csv(filepath, data, scope=None if full else scope, full=full, fieldnames=list(data[0].keys()) if data else default_header)
         logger.info(f"Saved: {filepath.name} ({len(data)} rows)")
 
+    # owner-level files (sequences, objects) are only touched when no --tables selector narrows the run
+    owner_scope = lambda r: (r.get("owner", "").upper() == "PUBLIC" and not sel.filtered) or owner_objects_ok(r.get("owner", ""))
+
     write_csv(META_TABLES_CSV, tables_list,
-              ["owner", "table_name", "column_id", "column_name", "data_type", "data_length", "data_precision", "data_scale", "nullable", "is_pk", "is_identity", "identity_options", "default_expr", "partitioned", "temporary"])
+              ["owner", "table_name", "column_id", "column_name", "data_type", "data_length", "data_precision", "data_scale", "nullable", "is_pk", "is_identity", "identity_options", "default_expr", "partitioned", "temporary"],
+              table_scope)
 
     write_csv(META_CONSTRAINTS_CSV, constraints_list,
-              ["owner", "table_name", "constraint_name", "ctype", "columns", "ref_owner", "ref_table", "ref_columns", "check_condition", "source_file"])
+              ["owner", "table_name", "constraint_name", "ctype", "columns", "ref_owner", "ref_table", "ref_columns", "check_condition", "source_file"],
+              table_scope)
 
     write_csv(META_INDEXES_CSV, indexes_list,
-              ["owner", "index_name", "table_owner", "table_name", "uniqueness", "columns", "has_expression", "partitioned", "source_file"])
+              ["owner", "index_name", "table_owner", "table_name", "uniqueness", "columns", "has_expression", "partitioned", "source_file"],
+              lambda r: sel.matches(r.get("table_owner") or r.get("owner", ""), r.get("table_name", "")))
 
     write_csv(META_PARTITIONS_CSV, partitions_list,
-              ["owner", "table_name", "partition_name", "partition_position", "bound", "method", "key_columns", "interval_expr", "subpartitioned"])
+              ["owner", "table_name", "partition_name", "partition_position", "bound", "method", "key_columns", "interval_expr", "subpartitioned"],
+              table_scope)
 
     write_csv(META_TABLE_STATS_CSV, table_stats_list,
-              ["owner", "table_name", "num_rows", "size_mb"])
+              ["owner", "table_name", "num_rows", "size_mb"], table_scope)
 
-    write_csv(META_SEQUENCES_CSV, sequences_list,
-              ["owner", "sequence_name", "min_value", "max_value", "increment_by", "start_with", "cache_size", "cycle"])
-
-    write_csv(META_OBJECTS_CSV, objects_list,
-              ["owner", "object_type", "object_name", "source_file"])
+    if not sel.tables:
+        write_csv(META_SEQUENCES_CSV, sequences_list,
+                  ["owner", "sequence_name", "min_value", "max_value", "increment_by", "start_with", "cache_size", "cycle"], owner_scope)
+        write_csv(META_OBJECTS_CSV, objects_list,
+                  ["owner", "object_type", "object_name", "source_file"], owner_scope)
 
     # Generate Excel Report
     report_file = ORACLE_REPORTS_DIR / f"{get_db_name()}_oracle_01_extract_mtd_report_{ts}.xlsx"
@@ -815,9 +849,8 @@ def extract_metadata_from_master(sql_file_path=None, owners_filter=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="01_extractMetadata.py - Stream Extract Metadata from Master SQL Dump")
     parser.add_argument("--file", help="Specific master SQL dump file path (defaults to inputs/*.sql)")
-    parser.add_argument("--owners", help="Comma-separated owners to filter (e.g. BSS01001,BSS01104)")
+    add_targeting_args(parser, schemas="--owners")
     args = parser.parse_args()
 
-    owners = {o.strip().upper() for o in args.owners.split(",")} if args.owners else None
-    ok = extract_metadata_from_master(sql_file_path=args.file, owners_filter=owners)
+    ok = extract_metadata_from_master(sql_file_path=args.file, selector=selector_or_exit(args, logger, use_files=False))
     sys.exit(0 if ok else 1)

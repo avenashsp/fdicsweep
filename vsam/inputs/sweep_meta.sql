@@ -8,8 +8,13 @@
 -- -----------------------------------------------------------------------------
 CREATE SCHEMA IF NOT EXISTS sweep_ctl;
 
--- Atomic file load log: tracks every S3 file loaded into PostgreSQL
-CREATE TABLE IF NOT EXISTS sweep_ctl.load_log (
+-- Control objects of the 6.0.0 schema: oracle_load_log, vsam_load_log, load_rejects, load_audit, delta_registry,
+-- promote_log, schema_version and the sweep_delta schema. Identical to migration 1 in sweep_migrate.py (which also
+-- upgrades an existing 5.x database: `python3 sweep.py migrate`); keep both in step.
+CREATE SCHEMA IF NOT EXISTS sweep_ctl;
+CREATE SCHEMA IF NOT EXISTS sweep_delta;
+
+CREATE TABLE IF NOT EXISTS sweep_ctl.oracle_load_log (
     uri             text PRIMARY KEY,
     target_schema   text NOT NULL,
     target_table    text NOT NULL,
@@ -23,24 +28,64 @@ CREATE TABLE IF NOT EXISTS sweep_ctl.load_log (
     worker_id       int DEFAULT 1,
     status          text DEFAULT 'SUCCESS',
     message         text,
-    loaded_at       timestamptz DEFAULT now()
+    loaded_at       timestamptz DEFAULT now(),
+    s3_last_modified text,
+    s3_etag          text,
+    s3_size          bigint
 );
+CREATE INDEX IF NOT EXISTS idx_sweep_oracle_load_log_target ON sweep_ctl.oracle_load_log (target_schema, target_table);
+CREATE INDEX IF NOT EXISTS idx_sweep_oracle_load_log_status ON sweep_ctl.oracle_load_log (status);
 
-CREATE INDEX IF NOT EXISTS idx_sweep_load_log_target 
-    ON sweep_ctl.load_log (target_schema, target_table);
+CREATE TABLE IF NOT EXISTS sweep_ctl.vsam_load_log (
+    uri             text NOT NULL,
+    target_schema   text NOT NULL,
+    target_table    text NOT NULL,
+    size_bytes      bigint DEFAULT 0,
+    loaded_rows     bigint DEFAULT 0,
+    seconds         numeric DEFAULT 0,
+    rows_per_sec    numeric GENERATED ALWAYS AS (
+        CASE WHEN seconds > 0 THEN ROUND(loaded_rows / seconds, 2) ELSE 0 END
+    ) STORED,
+    file_format     text DEFAULT 'gzip',
+    worker_id       int DEFAULT 1,
+    status          text DEFAULT 'SUCCESS',
+    message         text,
+    loaded_at       timestamptz DEFAULT now(),
+    s3_last_modified text,
+    s3_etag          text,
+    s3_size          bigint,
+    PRIMARY KEY (uri, target_schema)
+);
+CREATE INDEX IF NOT EXISTS idx_sweep_vsam_load_log_target ON sweep_ctl.vsam_load_log (target_schema, target_table);
+CREATE INDEX IF NOT EXISTS idx_sweep_vsam_load_log_status ON sweep_ctl.vsam_load_log (status);
+ALTER TABLE sweep_ctl.oracle_load_log ADD COLUMN IF NOT EXISTS s3_last_modified text;
+ALTER TABLE sweep_ctl.oracle_load_log ADD COLUMN IF NOT EXISTS s3_etag          text;
+ALTER TABLE sweep_ctl.oracle_load_log ADD COLUMN IF NOT EXISTS s3_size          bigint;
+ALTER TABLE sweep_ctl.vsam_load_log   ADD COLUMN IF NOT EXISTS s3_last_modified text;
+ALTER TABLE sweep_ctl.vsam_load_log   ADD COLUMN IF NOT EXISTS s3_etag          text;
+ALTER TABLE sweep_ctl.vsam_load_log   ADD COLUMN IF NOT EXISTS s3_size          bigint;
 
-CREATE INDEX IF NOT EXISTS idx_sweep_load_log_status 
-    ON sweep_ctl.load_log (status);
+-- Rows rejected during Step 06 loads (bad rows are reported, not fatal); shared by both tracks
+CREATE TABLE IF NOT EXISTS sweep_ctl.load_rejects (
+    id            bigserial PRIMARY KEY,
+    track         text,
+    uri           text NOT NULL,
+    target_schema text,
+    target_table  text,
+    row_no        bigint,
+    reason        text NOT NULL,
+    detail        text,
+    row_data      jsonb,
+    file_status   text DEFAULT 'LOADED',
+    rejected_at   timestamptz DEFAULT now()
+);
+ALTER TABLE sweep_ctl.load_rejects ADD COLUMN IF NOT EXISTS track text;
+CREATE INDEX IF NOT EXISTS idx_sweep_load_rejects_uri ON sweep_ctl.load_rejects (uri);
 
--- S3 object metadata of the file as loaded (a file counts as loaded only while all three still match S3).
--- CREATE TABLE IF NOT EXISTS does not add columns to an existing table, hence the ALTERs.
-ALTER TABLE sweep_ctl.load_log ADD COLUMN IF NOT EXISTS s3_last_modified text;
-ALTER TABLE sweep_ctl.load_log ADD COLUMN IF NOT EXISTS s3_etag          text;
-ALTER TABLE sweep_ctl.load_log ADD COLUMN IF NOT EXISTS s3_size          bigint;
-
--- Run-level execution history and audit log
+-- Run-level execution history and audit log; shared by both tracks
 CREATE TABLE IF NOT EXISTS sweep_ctl.load_audit (
     id              bigserial PRIMARY KEY,
+    track           text,
     run_id          text NOT NULL,
     step_name       text NOT NULL,
     status          text NOT NULL,
@@ -51,6 +96,57 @@ CREATE TABLE IF NOT EXISTS sweep_ctl.load_audit (
     message         text,
     started_at      timestamptz DEFAULT now(),
     completed_at    timestamptz DEFAULT now()
+);
+ALTER TABLE sweep_ctl.load_audit ADD COLUMN IF NOT EXISTS track text;
+
+-- Applied deltas of this database (one row per table and strictly increasing sequence number). The row exists in the
+-- layer that captured the delta (bronze: while loading from S3) and in every layer that received it by `promote`.
+CREATE TABLE IF NOT EXISTS sweep_ctl.delta_registry (
+    delta_id        bigserial PRIMARY KEY,
+    run_id          text NOT NULL,
+    seq             bigint NOT NULL,
+    target_schema   text NOT NULL,
+    target_table    text NOT NULL,
+    origin_layer    text,
+    source_uris     text,
+    rows_inserted   bigint DEFAULT 0,
+    rows_updated    bigint DEFAULT 0,
+    rows_total      bigint DEFAULT 0,
+    full_copy       boolean DEFAULT false,
+    delta_table     text,
+    status          text NOT NULL DEFAULT 'SUCCESS',
+    message         text,
+    created_at      timestamptz DEFAULT now(),
+    applied_at      timestamptz DEFAULT now(),
+    UNIQUE (target_schema, target_table, seq)
+);
+
+CREATE TABLE IF NOT EXISTS sweep_ctl.promote_log (
+    id              bigserial PRIMARY KEY,
+    run_id          text NOT NULL,
+    source_layer    text NOT NULL,
+    target_layer    text NOT NULL,
+    target_schema   text NOT NULL,
+    target_table    text NOT NULL,
+    track           text,
+    seq             bigint,
+    mode            text,
+    inserted        bigint DEFAULT 0,
+    updated         bigint DEFAULT 0,
+    unchanged       bigint DEFAULT 0,
+    rejected        bigint DEFAULT 0,
+    status          text NOT NULL,
+    message         text,
+    started_at      timestamptz DEFAULT now(),
+    finished_at     timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_sweep_promote_log_table ON sweep_ctl.promote_log (target_schema, target_table);
+
+CREATE TABLE IF NOT EXISTS sweep_ctl.schema_version (
+    version     int PRIMARY KEY,
+    name        text NOT NULL,
+    applied_at  timestamptz NOT NULL DEFAULT now(),
+    applied_by  text NOT NULL DEFAULT CURRENT_USER
 );
 
 -- -----------------------------------------------------------------------------
@@ -279,18 +375,3 @@ DO $$ BEGIN
         CREATE OPERATOR public.+ (FUNCTION = public.timestamp_add_int, LEFTARG = timestamp without time zone, RIGHTARG = integer);
     END IF;
 END $$;
-
--- Rows rejected during Oracle Step 06 loads (bad rows are reported, not fatal)
-CREATE TABLE IF NOT EXISTS sweep_ctl.load_rejects (
-    id            bigserial PRIMARY KEY,
-    uri           text NOT NULL,
-    target_schema text,
-    target_table  text,
-    row_no        bigint,
-    reason        text NOT NULL,
-    detail        text,
-    row_data      jsonb,
-    file_status   text DEFAULT 'LOADED',
-    rejected_at   timestamptz DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_sweep_load_rejects_uri ON sweep_ctl.load_rejects (uri);

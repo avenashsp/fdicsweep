@@ -65,6 +65,28 @@ OUTPUTS_DIR = BASE_DIR / "outputs"
 REPORTS_DIR = BASE_DIR / "reports"
 LOGS_DIR = BASE_DIR / "logs"
 
+
+
+def _peek_layer():
+    """Layer given as SWEEP_LAYER or `--layer X` on the command line (known before argparse runs, because the output
+    folders and the environment file below depend on it)."""
+    argv = sys.argv[1:]
+    for i, a in enumerate(argv):
+        if a == "--layer" and i + 1 < len(argv):
+            return argv[i + 1].strip().lower()
+        if a.startswith("--layer="):
+            return a.split("=", 1)[1].strip().lower()
+    return (os.environ.get("SWEEP_LAYER") or "").strip().lower() or None
+
+
+LAYER = _peek_layer()          # bronze | silver | gold_backup | gold | None (not layer specific)
+
+
+def layer_dir(base):
+    """Layer-dependent outputs (generated DDL, ...) live in <base>/<layer>/ so databases never overwrite each other."""
+    return Path(base) / LAYER if LAYER else Path(base)
+
+
 # Track-Specific Directories: Oracle (oracle/{inputs,outputs,reports,logs})
 ORACLE_DIR = BASE_DIR / "oracle"
 ORACLE_INPUTS_DIR = ORACLE_DIR / "inputs"
@@ -73,8 +95,8 @@ ORACLE_REPORTS_DIR = ORACLE_DIR / "reports"
 ORACLE_LOGS_DIR = ORACLE_DIR / "logs"
 
 ORACLE_META_DIR = ORACLE_OUTPUTS_DIR / "oracle_metadata"
-ORACLE_PRE_LOAD_DIR = ORACLE_OUTPUTS_DIR / "pre_load"
-ORACLE_POST_LOAD_DIR = ORACLE_OUTPUTS_DIR / "post_load"
+ORACLE_PRE_LOAD_DIR = layer_dir(ORACLE_OUTPUTS_DIR / "pre_load")
+ORACLE_POST_LOAD_DIR = layer_dir(ORACLE_OUTPUTS_DIR / "post_load")
 ORACLE_DUMP_DIR = ORACLE_INPUTS_DIR / "oracle_dump" if (ORACLE_INPUTS_DIR / "oracle_dump").exists() else ORACLE_INPUTS_DIR
 
 # Track-Specific Directories: VSAM (vsam/{inputs,outputs,reports,logs})
@@ -85,7 +107,7 @@ VSAM_REPORTS_DIR = VSAM_DIR / "reports"
 VSAM_LOGS_DIR = VSAM_DIR / "logs"
 
 VSAM_COPYBOOK_DIR = VSAM_INPUTS_DIR / "copybooks"
-VSAM_GEN_DDL_DIR = VSAM_OUTPUTS_DIR / "gen_ddl"
+VSAM_GEN_DDL_DIR = layer_dir(VSAM_OUTPUTS_DIR / "gen_ddl")
 VSAM_PRE_LOAD_DIR = VSAM_GEN_DDL_DIR
 VSAM_APPROVALS_DIR = VSAM_OUTPUTS_DIR / "approvals"
 
@@ -240,7 +262,9 @@ STREAM_SCRIPT = BASE_DIR / "sweep_stream.sh"
 
 CTL_SCHEMA = "sweep_ctl"
 META_SCHEMA = "sweep_meta"
-LOAD_LOG_TABLE = f"{CTL_SCHEMA}.load_log"
+ORACLE_LOAD_LOG_TABLE = f"{CTL_SCHEMA}.oracle_load_log"   # one row per S3 file (PK uri)
+VSAM_LOAD_LOG_TABLE = f"{CTL_SCHEMA}.vsam_load_log"       # one row per S3 file and destination schema (PK uri, target_schema)
+LEGACY_LOAD_LOG_TABLE = f"{CTL_SCHEMA}.load_log_legacy"   # the old single table, kept (renamed) by migration 1
 LOAD_AUDIT_TABLE = f"{CTL_SCHEMA}.load_audit"
 
 # -----------------------------------------------------------------------------

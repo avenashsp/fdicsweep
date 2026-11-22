@@ -9,6 +9,9 @@ Generates: reports/05_applyDDL_report_<timestamp>.xlsx
 import sys
 import argparse
 from pathlib import Path
+from sweep_common import layer_dir, ORACLE_OUTPUTS_DIR
+from sweep_ddlfrag import FragmentStore
+from sweep_targeting import Selector, add_targeting_args, selector_or_exit, validate_or_exit
 from sweep_common import (
     log_summary,
     BASE_DIR,
@@ -34,14 +37,36 @@ from sweep_common import (
 logger = get_logger("oracle_05_apply_ddl", "oracle_05_apply_ddl")
 
 
-def deploy_ddl(schemas_filter=None, skip_meta=False):
+def deploy_ddl(schemas_filter=None, skip_meta=False, selector=None):
+    """
+    Applies the generated table DDL. With --tables / --exclude-tables only the selected tables are created (from their
+    per-table fragments); --schemas applies whole schema scripts; no selector applies every script.
+    """
     ts = get_timestamp()
+    sel = selector or Selector(schemas={s.lower() for s in (schemas_filter or ())})
+    store = FragmentStore(layer_dir(ORACLE_OUTPUTS_DIR / "ddl_fragments"))
     if not has_db_auth():
         logger.error(AUTH_HELP)
         return False
     meta_sql_file = SWEEP_META_SQL if SWEEP_META_SQL.exists() else (BASE_DIR / "sweep_meta.sql")
 
     logger.info(f"Target Database: {PGUSER}@{PGHOST}:{PGPORT}/{PGDATABASE}")
+
+    known = [(sc, t) for sc in store.schemas() for t in store.tables(sc)]
+    if known:
+        validate_or_exit(sel.validate_tables, known, what="the generated DDL (run Step 04)", logger=logger)
+    elif sel.tables or sel.exclude:
+        logger.error("No per-table DDL found; run Step 04 before using --tables / --exclude-tables")
+        return False
+    per_table = bool(sel.tables or sel.exclude)
+
+    if sel.dry_run:
+        for sc in store.schemas():
+            picked = [t for t in store.tables(sc) if sel.matches(sc, t)]
+            if picked:
+                logger.info(f"[dry-run] would apply {len(picked)} table(s) of {sc}" + (f": {', '.join(picked[:10])}" if per_table else ""))
+        logger.info(f"[dry-run] {sel.describe()}; nothing applied")
+        return True
 
     # 1. Apply Migration Control Catalog
     if not skip_meta and meta_sql_file.exists():
@@ -54,15 +79,27 @@ def deploy_ddl(schemas_filter=None, skip_meta=False):
             return False
 
     # 2. Find and apply table DDL scripts
-    ddl_files = list(ORACLE_PRE_LOAD_DIR.glob("*_tables.sql"))
-    if not ddl_files:
+    deployed_files = []
+    if per_table:
+        for sc in store.schemas():
+            picked = [t for t in store.tables(sc) if sel.matches(sc, t)]
+            if not picked:
+                continue
+            logger.info(f"Applying target DDL of {len(picked)} table(s) in {sc}...")
+            try:
+                run_psql(store.script_for(sc, "tables", picked))
+                deployed_files.append({"schema": sc, "file": f"{len(picked)} table fragment(s)", "status": "SUCCESS"})
+            except RuntimeError as e:
+                logger.error(f"Failed to apply DDL of {sc}: {e}")
+                deployed_files.append({"schema": sc, "file": f"{len(picked)} table fragment(s)", "status": clip_error(f"FAILED: {e}")})
+    ddl_files = [] if per_table else list(ORACLE_PRE_LOAD_DIR.glob("*_tables.sql"))
+    if not ddl_files and not per_table:
         logger.error(f"No table DDL scripts found in {ORACLE_PRE_LOAD_DIR}. Run 04_generateDDL.py first.")
         return False
 
-    deployed_files = []
     for ddl_f in ddl_files:
         schema_name = ddl_f.stem.replace("_tables", "")
-        if schemas_filter and schema_name.lower() not in schemas_filter:
+        if not sel.matches_schema(schema_name):
             continue
 
         logger.info(f"Applying target DDL: {ddl_f.name}...")
@@ -144,10 +181,9 @@ def deploy_ddl(schemas_filter=None, skip_meta=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="05_applyDDL.py - Apply Target DDL to PostgreSQL")
-    parser.add_argument("--schemas", help="Comma-separated schemas to apply (e.g. bss01001,bss01104)")
     parser.add_argument("--skip-meta", action="store_true", help="Skip re-applying sweep_meta.sql")
+    add_targeting_args(parser)
     args = parser.parse_args()
 
-    schemas = {s.strip().lower() for s in args.schemas.split(",")} if args.schemas else None
-    ok = deploy_ddl(schemas_filter=schemas, skip_meta=args.skip_meta)
+    ok = deploy_ddl(skip_meta=args.skip_meta, selector=selector_or_exit(args, logger))
     sys.exit(0 if ok else 1)

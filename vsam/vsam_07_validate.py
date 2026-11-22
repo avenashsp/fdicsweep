@@ -10,7 +10,7 @@ Performs comprehensive post-migration validation:
      between copybook spec (Step 01) and PostgreSQL information_schema.
   4. PK Constraint Audit: verifies PK constraints are present in PostgreSQL.
   5. Audit Column Check: verifies the 4 standard audit columns are present.
-  6. S3 File Reconciliation: S3 planned files vs sweep_ctl.load_log.
+  6. S3 File Reconciliation: S3 planned files vs sweep_ctl.vsam_load_log.
 
 Generates:
   - reports/vsam/<db>_vsam_07_validate_report_<ts>.xlsx
@@ -25,9 +25,10 @@ import pandas as pd
 
 from sweep_common import (
     log_summary,
-    VSAM_REPORTS_DIR, CTL_SCHEMA,
+    VSAM_REPORTS_DIR, VSAM_LOAD_LOG_TABLE,
     get_logger, get_timestamp, get_db_name, generate_excel_report, run_psql, query_db_rows, q
 )
+from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
 from vsam.common_colmap import effective_columns_meta
 from vsam.vsam_common import OUT, load_csv_safe, read_json
 
@@ -68,10 +69,10 @@ def cb_sql_base(sql_type):
 def main():
     parser = argparse.ArgumentParser(description="Step 07: Comprehensive VSAM migration validation.")
     parser.add_argument("--exact-counts", action="store_true", help="Perform exact count(*) queries on target tables")
-    parser.add_argument("--tables", help="Comma-separated tables to validate")
-    parser.add_argument("--schema", help="Validate only this schema")
     parser.add_argument("--bg", action="store_true", help="Run in background")
+    add_targeting_args(parser, schemas="--schema", company=True)
     args = parser.parse_args()
+    sel = selector_or_exit(args, logger)
 
     logger.info("=" * 75)
     logger.info("SWEEP VSAM MIGRATION - STEP 08: VALIDATION & PARITY AUDIT")
@@ -81,11 +82,14 @@ def main():
     lm_file = OUT / "vsam_02_load_matrix.csv" if (OUT / "vsam_02_load_matrix.csv").exists() else OUT / "load_matrix.csv"
     lm = load_csv_safe(lm_file)
 
-    if args.tables:
-        tbls = [t.strip().lower() for t in args.tables.split(",")]
-        lm = lm[lm["target_table"].isin(tbls)]
-    if args.schema:
-        lm = lm[lm["target_schema"] == args.schema.strip().lower()]
+    if sel.filtered and not lm.empty:
+        validate_or_exit(sel.validate_companies, lm["source_company"].astype(str).unique(), what="the load matrix", logger=logger)
+        validate_or_exit(sel.validate_tables, list(zip(lm["target_schema"], lm["target_table"])), what="the load matrix", logger=logger)
+        lm = lm[lm.apply(lambda r: sel.matches_company(r["source_company"]) and sel.matches(r["target_schema"], r["target_table"]), axis=1)]
+    if sel.dry_run:
+        logger.info(f"[dry-run] {sel.describe()}: the validation would cover {len(lm)} load row(s) in "
+                    f"{lm['target_table'].nunique() if not lm.empty else 0} table(s); no report written")
+        return True
 
     # Load Step 03 profile for dynamic type overrides
     tg_prof = read_json(OUT / "vsam_03_type_gate.json", default={})
@@ -102,21 +106,20 @@ def main():
     # ===========================================================================
     # 1. S3 File Reconciliation
     # ===========================================================================
-    logger.info("1. Reconciling loaded files against sweep_ctl.load_log...")
+    logger.info("1. Reconciling loaded files against sweep_ctl.vsam_load_log...")
     try:
-        log_sql = f"SELECT uri || '|' || target_schema || '|' || target_table || '|' || status || '|' || COALESCE(loaded_rows::text, '0') FROM {CTL_SCHEMA}.load_log;"
+        log_sql = f"SELECT uri || '|' || target_schema || '|' || target_table || '|' || status || '|' || COALESCE(loaded_rows::text, '0') FROM {VSAM_LOAD_LOG_TABLE};"
         log_rows = query_db_rows(log_sql)
         loaded_map = {}
         for r in log_rows:
             parts = r.split("|")
             if len(parts) >= 5:
-                raw_uri = parts[0].split("#")[0]
-                loaded_map[f"{raw_uri}|{parts[1]}"] = {
+                loaded_map[f"{parts[0]}|{parts[1]}"] = {
                     "schema": parts[1], "table": parts[2],
                     "status": parts[3], "rows": parts[4]
                 }
     except RuntimeError as e:
-        logger.error(f"Cannot validate: failed to query {CTL_SCHEMA}.load_log: {e}")
+        logger.error(f"Cannot validate: failed to query {VSAM_LOAD_LOG_TABLE}: {e}")
         return False
 
     fname_col = "s3_filename" if "s3_filename" in lm.columns else "csv_filename"

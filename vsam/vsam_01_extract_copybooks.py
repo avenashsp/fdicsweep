@@ -31,6 +31,8 @@ from sweep_common import (
     norm_col,
     VSAM_REPORTS_DIR,
 )
+from sweep_merge import merge_csv
+from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
 from vsam.common_cobol import read_copybook_tree
 from vsam.common_config import COPYBOOK_DIR
 from vsam.vsam_common import field_lengths, is_key_group_or_field, norm_usage, OUT, sql_type
@@ -94,7 +96,9 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Step 01: Extract column metadata from COBOL copybooks.")
     parser.add_argument("--bg", action="store_true", help="Run in background")
-    parser.parse_args()
+    add_targeting_args(parser, tables=False, schemas=None, exclude=False, copybook=True)
+    args = parser.parse_args()
+    sel = selector_or_exit(args, logger)
 
     logger.info("=" * 75)
     logger.info("SWEEP VSAM MIGRATION - STEP 01: COPYBOOK METADATA EXTRACTION")
@@ -107,6 +111,13 @@ def main():
 
     cb_files = sorted(copybook_dir.glob("*.txt")) + sorted(copybook_dir.glob("*.cbl")) + sorted(copybook_dir.glob("*.cob"))
     logger.info(f"Found {len(cb_files)} copybook files in {copybook_dir}")
+    validate_or_exit(sel.validate_copybooks, [c.name for c in cb_files], logger=logger)
+    cb_files = [c for c in cb_files if sel.matches_copybook(c.name)]
+    if sel.dry_run:
+        for cb in cb_files:
+            logger.info(f"[dry-run] would extract {cb.name}")
+        logger.info(f"[dry-run] {sel.describe()}: {len(cb_files)} copybook(s); nothing written")
+        return True
 
     all_rows = []
     summary_rows = []
@@ -162,7 +173,9 @@ def main():
         "copybook_file", "field_name", "col_name", "pic", "usage",
         "sql_type", "len_display", "len_storage", "is_key", "is_filler"
     ])
-    df.to_csv(OUT / "vsam_01_copybook_extracts.csv", index=False)
+    full = not sel.filtered
+    merge_csv(OUT / "vsam_01_copybook_extracts.csv", all_rows, full=full,
+              scope=None if full else (lambda r: sel.matches_copybook(r.get("copybook_file", ""))), fieldnames=list(df.columns))
     logger.info(f"Saved: {OUT / 'vsam_01_copybook_extracts.csv'} ({len(df)} fields)")
 
     ts = get_timestamp()

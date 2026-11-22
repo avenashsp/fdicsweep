@@ -17,7 +17,9 @@ import argparse
 import subprocess
 from pathlib import Path
 from collections import defaultdict
+from sweep_merge import merge_csv
 from sweep_s3meta import canon_etag, canon_time
+from sweep_targeting import Selector, add_targeting_args, selector_or_exit, validate_or_exit
 from sweep_common import (
     log_summary,
     ORACLE_INPUTS_DIR,
@@ -308,8 +310,16 @@ def is_chunked_file(filename, table_name=""):
     return False
 
 
-def build_inventory(s3_uri=None, mock_files=None, owners_filter=None, tables_filter=None):
+def build_inventory(s3_uri=None, mock_files=None, owners_filter=None, tables_filter=None, selector=None):
+    """
+    `selector` (sweep_targeting.Selector) narrows the run to tables / schemas / S3 files. owners_filter / tables_filter
+    are the old set arguments. A run without selectors is FULL and replaces the file map; a targeted run replaces only
+    the rows of its tables (--file selects the tables the files belong to, so the per-table rules still see all files).
+    """
     ts = get_timestamp()
+    sel = selector or Selector(
+        schemas={o.lower() for o in (owners_filter or ())},
+        tables=[(None, t.split(".")[-1].lower()) if "." not in t else tuple(t.lower().split(".", 1)) for t in (tables_filter or ())])
     target_uri = s3_uri or S3_BUCKET
     known = get_known_tables()
 
@@ -337,6 +347,20 @@ def build_inventory(s3_uri=None, mock_files=None, owners_filter=None, tables_fil
     if not raw_objects:
         logger.error("No S3 objects found to inventory.")
         return False
+
+    # Validate the selectors against what exists BEFORE anything is written
+    validate_or_exit(sel.validate_tables, [(o, t) for o, ts_ in known.items() for t in ts_], what="the Oracle metadata", logger=logger)
+    validate_or_exit(sel.validate_files, [o["uri"] for o in raw_objects], what="S3", logger=logger)
+    file_tables = set()          # tables the selected files belong to
+    if sel.files:
+        for obj in raw_objects:
+            if sel.matches_file(obj["uri"]):
+                o_, t_ = match_table(obj["filename"], obj["key"], known)
+                if o_ and t_:
+                    file_tables.add((o_, t_))
+        if not file_tables:
+            logger.error(f"The selected file(s) {', '.join(sel.files)} do not map to any known table")
+            return False
 
     # Group objects by (owner, table) and track ignored / unmapped files
     grouped = defaultdict(list)
@@ -366,7 +390,7 @@ def build_inventory(s3_uri=None, mock_files=None, owners_filter=None, tables_fil
             })
             continue
 
-        if owners_filter and owner.upper() not in owners_filter and owner_base not in owners_filter:
+        if not sel.matches(owner, table) or (sel.files and (owner, table) not in file_tables):
             ignored_files.append({
                 "uri": obj["uri"],
                 "filename": obj["filename"],
@@ -374,19 +398,7 @@ def build_inventory(s3_uri=None, mock_files=None, owners_filter=None, tables_fil
                 "size_mb": round(obj["size_bytes"] / (1024**2), 2),
                 "detected_owner": owner,
                 "detected_table": table,
-                "reason_ignored": f"Excluded by --owners filter ({', '.join(sorted(owners_filter))})"
-            })
-            continue
-
-        if tables_filter and f"{owner}.{table}".upper() not in tables_filter and table.upper() not in tables_filter:
-            ignored_files.append({
-                "uri": obj["uri"],
-                "filename": obj["filename"],
-                "size_bytes": obj["size_bytes"],
-                "size_mb": round(obj["size_bytes"] / (1024**2), 2),
-                "detected_owner": owner,
-                "detected_table": table,
-                "reason_ignored": "Excluded by --tables filter"
+                "reason_ignored": f"Excluded by the selectors ({sel.describe()})"
             })
             continue
 
@@ -576,16 +588,28 @@ def build_inventory(s3_uri=None, mock_files=None, owners_filter=None, tables_fil
     # Write output CSV (both oracle_02_s3_file_map.csv and legacy s3_file_map.csv)
     map_csv_path = ORACLE_OUTPUTS_DIR / "oracle_02_s3_file_map.csv"
     legacy_map_path = ORACLE_OUTPUTS_DIR / "s3_file_map.csv"
+    map_header = ["load_order_rank", "owner", "table_name", "target_schema", "target_table", "file_format", "size_bytes", "size_mb",
+                  "uri", "filename", "s3_last_modified", "s3_etag", "s3_size"]
+    if sel.dry_run:
+        for r in file_map_rows:
+            logger.info(f"[dry-run] would map {r['owner']}.{r['table_name']} <- {r['filename']} ({r['size_mb']} MB)")
+        logger.info(f"[dry-run] {sel.describe()}: {len(file_map_rows)} file(s) would be written to the file map; nothing written")
+        return True
+
+    def rerank(rows):
+        """Merged rows come from different runs: number them again small to large (table volume, file size, name)."""
+        vol = defaultdict(int)
+        for r in rows:
+            vol[(r["owner"], r["table_name"])] += int(float(r.get("size_bytes") or 0))
+        rows = sorted(rows, key=lambda r: (vol[(r["owner"], r["table_name"])], int(float(r.get("size_bytes") or 0)), r.get("filename", "")))
+        for rank, r in enumerate(rows, 1):
+            r["load_order_rank"] = rank
+        return rows
+
+    full = not sel.filtered
+    scope = sel.table_scope("owner", "table_name")
     for out_path in (map_csv_path, legacy_map_path):
-        with open(out_path, "w", newline="", encoding="utf-8") as out:
-            if file_map_rows:
-                w = csv.DictWriter(out, fieldnames=list(file_map_rows[0].keys()))
-                w.writeheader()
-                w.writerows(file_map_rows)
-            else:
-                w = csv.writer(out)
-                w.writerow(["load_order_rank", "owner", "table_name", "target_schema", "target_table", "file_format", "size_bytes", "size_mb", "uri", "filename",
-                            "s3_last_modified", "s3_etag", "s3_size"])
+        merge_csv(out_path, file_map_rows, scope=None if full else scope, full=full, fieldnames=map_header, post=rerank)
 
     logger.info(f"Generated {map_csv_path} and {legacy_map_path} with {len(file_map_rows)} file(s) ordered small to large.")
 
@@ -636,13 +660,8 @@ def build_inventory(s3_uri=None, mock_files=None, owners_filter=None, tables_fil
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="02_s3Inventory.py - S3 Inventory and Small-to-Large Load Ordering")
     parser.add_argument("--s3", help="S3 URI prefix (e.g. s3://bucket/path/)")
-    parser.add_argument("--owners", help="Comma-separated owners to filter (e.g. BSS01001,BSS01104)")
-    parser.add_argument("--tables", help="Comma-separated tables to filter (e.g. BSS01001.BROKERACCOUNTDETAIL)")
+    add_targeting_args(parser, schemas="--owners", file=True)
     args = parser.parse_args()
 
-    owners = {o.strip().upper() for o in args.owners.split(",")} if args.owners else None
-    tables = {t.strip().upper() for t in args.tables.split(",")} if args.tables else None
-
-    ok = build_inventory(s3_uri=args.s3, owners_filter=owners, tables_filter=tables)
+    ok = build_inventory(s3_uri=args.s3, selector=selector_or_exit(args, logger))
     sys.exit(0 if ok else 1)
-

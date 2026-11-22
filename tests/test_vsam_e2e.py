@@ -224,7 +224,7 @@ def test_unchanged_files_are_skipped_and_changed_ones_reload(repo):
     repo_dir, data, env = repo
     write_snapshot(data, "20240101", "A", range(1, 11), "x", 5)
     run_steps(repo_dir, env, STEPS[:6])
-    first = q("SELECT string_agg(DISTINCT s3_etag, ',') FROM sweep_ctl.load_log WHERE s3_etag IS NOT NULL AND s3_last_modified IS NOT NULL AND s3_size > 0")
+    first = q("SELECT string_agg(DISTINCT s3_etag, ',') FROM sweep_ctl.vsam_load_log WHERE s3_etag IS NOT NULL AND s3_last_modified IS NOT NULL AND s3_size > 0")
     assert first
     r = run_step6(repo_dir, env)
     assert r.returncode == 0 and "Nothing to do" in r.stdout + r.stderr          # nothing changed -> skipped
@@ -254,7 +254,7 @@ def test_a_failing_keyless_load_rolls_back_and_keeps_the_old_snapshot(repo):
     r = run_step6(repo_dir, env, "--max-rejects", "1")
     assert r.returncode != 0
     assert q("SELECT count(*), min(ref_name) FROM bcs.stg_bcsxref_rec_v") == "5|x1"      # old snapshot untouched
-    assert q("SELECT count(*) FROM sweep_ctl.load_log WHERE uri LIKE '%20240301%' AND status = 'SUCCESS'") == "0"
+    assert q("SELECT count(*) FROM sweep_ctl.vsam_load_log WHERE uri LIKE '%20240301%' AND status = 'SUCCESS'") == "0"
     assert q("SELECT count(*) FROM sweep_ctl.load_rejects WHERE file_status = 'FILE_FAILED'") == "1"
     # default (no reject limit): the valid rows load, the bad one is reported
     r = run_step6(repo_dir, env)
