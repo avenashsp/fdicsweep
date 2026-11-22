@@ -12,6 +12,7 @@ Values are kept as plain text in a canonical form so they compare exactly:
   size           -> integer bytes
 """
 import json
+import re
 import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -36,7 +37,7 @@ def canon_time(value):
         text = str(value).strip().replace(" ", "T", 1) if " " in str(value).strip()[:11] else str(value).strip()
         if text.endswith("Z"):
             text = text[:-1] + "+00:00"
-        elif len(text) > 3 and text[-3] in "+-" and text[-2:].isdigit() and ":" not in text[-6:]:
+        elif re.search(r"\d:\d{2}(\.\d+)?[+-]\d{2}$", text):
             text += ":00"                       # '+00' -> '+00:00' (fromisoformat on Python 3.9)
         try:
             dt = datetime.fromisoformat(text)

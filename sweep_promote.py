@@ -32,6 +32,7 @@ from sweep_delta import REGISTRY, TOOL_AUDIT_COLS, ensure_delta_table
 from sweep_layers import (LayerError, chain, get_layer, layer_conn, read_manifest, same_credentials, use_layer, validate_manifest_rows)
 from sweep_loadpipe import (ensure_reject_table, load_table_meta, parse_output, persist_failed_file_rejects, probe_trigger_mode)
 from sweep_merge import current_run_id
+from sweep_s3meta import canon_time
 from sweep_platform import group_popen_kwargs, kill_process_group
 
 logger = get_logger("sweep_promote", "sweep_promote")
@@ -162,8 +163,7 @@ def run_with_stream(script, src_argv, options, timeout):
         src_ok = src.returncode == 0
         if src_ok:
             tgt.stdin.write(b"\\.\n" + tail.encode("utf-8"))
-        tgt.stdin.close()
-        out, err = tgt.communicate(timeout=timeout or None)
+        out, err = tgt.communicate(timeout=timeout or None)       # closes the pipe (an explicit close() breaks communicate on 3.9)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
         kill_process_group(tgt)
         kill_process_group(src)
@@ -622,7 +622,7 @@ def purge_deltas(dry_run=False, retention_days=None):
             applied = [regs[l.name].get(key) for l in later]
             if any(a is None or a["status"] != "SUCCESS" for a in applied):
                 continue
-            last = max(datetime.fromisoformat(a["applied_at"].replace(" ", "T")) if a["applied_at"] else now for a in applied)
+            last = max(datetime.strptime(canon_time(a["applied_at"]), "%Y-%m-%dT%H:%M:%SZ") if a["applied_at"] else now for a in applied)
             if last.tzinfo is None:
                 last = last.replace(tzinfo=timezone.utc)
             if (now - last).days >= days:
