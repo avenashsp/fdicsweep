@@ -34,7 +34,7 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 | :---: | :--- | :--- |
 | **01** | `vsam.vsam_01_extract_copybooks`<br>`python3 sweep.py vsam extract` | `'-h, --help'`, `'--bg'`, `'--copybook COPYBOOK'`, `'--dry-run'` |
 | **02** | `vsam.vsam_02_inventory`<br>`python3 sweep.py vsam inventory` | `'-h, --help'`, `'--s3 S3'`, `'--tables TABLES'`, `'--schemas, --owners SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--file FILE'`, `'--filename FILENAME'`, `'--company COMPANY'`, `'--dry-run'`, `'--tbl-col {headers,copybook}'`, `'--bg'` |
-| **03** | `vsam.vsam_03_type_gate`<br>`python3 sweep.py vsam type-gate` | `'-h, --help'`, `'--workers WORKERS'`, `'--bg'`, `'--tables TABLES'`, `'--schemas, --owners SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--file FILE'`, `'--filename FILENAME'`, `'--company COMPANY'`, `'--dry-run'` |
+| **03** | `vsam.vsam_03_type_gate`<br>`python3 sweep.py vsam type-gate` | `'-h, --help'`, `'--workers WORKERS'`, `'--rows N|all'`, `'--bg'`, `'--tables TABLES'`, `'--schemas, --owners SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--file FILE'`, `'--filename FILENAME'`, `'--company COMPANY'`, `'--dry-run'` |
 | **04** | `vsam.vsam_04_generate_ddl`<br>`python3 sweep.py vsam gen-ddl` | `'-h, --help'`, `'--execute'`, `'--bg'`, `'--tables TABLES'`, `'--schemas, --owners SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--company COMPANY'`, `'--dry-run'`, `'--layer LAYER'`, `'--allow-ddl'` |
 | **05** | `vsam.vsam_05_apply_ddl`<br>`python3 sweep.py vsam apply-ddl` | `'-h, --help'`, `'--skip-meta'`, `'--bg'`, `'--tables TABLES'`, `'--schemas, --owners SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--dry-run'`, `'--layer LAYER'`, `'--allow-ddl'` |
 | **06** | `vsam.vsam_06_load_data`<br>`python3 sweep.py vsam load-data` | `'-h, --help'`, `'--workers WORKERS'`, `'--tables TABLES'`, `'--schemas, --owners SCHEMAS'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--file FILE'`, `'--filename FILENAME'`, `'--company COMPANY'`, `'--dry-run'`, `'--layer LAYER'`, `'--allow-ddl'`, `'--limit-files LIMIT_FILES'`, `'--force-truncate'`, `'--reload'`, `'--full'`, `'--max-rejects MAX_REJECTS'`, `'--bg'` |
@@ -215,6 +215,7 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 | :--- | :--- | :--- | :--- | :--- |
 | `-h, --help` | flag | - | Show help message and exit | `python3 sweep.py vsam type-gate -h` |
 | `--workers WORKERS`| integer | `4` | Parallel profiling worker threads | `--workers 8` |
+| `--rows N\|all` | integer or `all` | `VSAM_ANALYZE_MAX_ROWS`, else all | Rows read per file. `all` checks every row even when the env variable is set. Only the first N rows are checked, so a key unique there may still have later duplicates | `--rows 1000` |
 | `--company COMPANY`| string | all companies | Comma-separated company tokens to filter | `--company FDIC` |
 | `--bg` | flag | false | Run in background daemon *(CLI only)* | `python3 sweep.py vsam type-gate --bg` |
 
@@ -423,7 +424,7 @@ All parameters can be pre-configured via `sweep.env` located in the root reposit
 | `VSAM_BASE` | Local directory scanned for VSAM files when not using S3 | repository root |
 | `VSAM_COPYBOOK_DIR` | Directory holding the COBOL copybooks | `vsam/inputs/copybooks` |
 | `VSAM_MASTER_MAPPING` / `VSAM_MASTER_OVERRIDES` | Paths of the mapping / override workbooks | `vsam/inputs/vsam_master_mapping.xlsx` / `vsam_master_overrides.xlsx` |
-| `VSAM_ANALYZE_MAX_ROWS` | Cap on rows read per file when profiling (`0` = all) | `0` |
+| `VSAM_ANALYZE_MAX_ROWS` | Cap on rows read per file by the VSAM type gate (`0` = all); `--rows N\|all` overrides it. `sweep.env.sample` sets `1000` | `0` |
 | `PSQL` | `psql` executable to use | `psql` |
 | `NO_COLOR` | Disable ANSI colours in the dashboard | unset |
 

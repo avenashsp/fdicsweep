@@ -327,6 +327,12 @@ DB_STEPS = {"oracle_04_generate_ddl", "oracle_05_apply_ddl", "oracle_06_load_dat
 
 def runall_targeting(args, module):
     """Targeting flags (and --layer for the steps that touch a database) for one step of run-all."""
+    if module == "vsam_03_type_gate" and getattr(args, "rows", None):
+        return ["--rows", str(args.rows)] + _runall_targeting(args, module)
+    return _runall_targeting(args, module)
+
+
+def _runall_targeting(args, module):
     allowed = RUNALL_FLAGS.get(module, _TBL)
     out = [f for f in targeting(args, skip=tuple(n for n in TARGET_FLAGS if n not in allowed)) if f != "--dry-run"]
     if getattr(args, "dry_run", False):
@@ -488,6 +494,7 @@ def handle_vsam(args):
     elif cmd in ("type-gate", "gate"):
         c = step("vsam", "vsam_03_type_gate")
         if getattr(args, "workers", None): c.extend(["--workers", str(args.workers)])
+        if getattr(args, "rows", None): c.extend(["--rows", str(args.rows)])
         c.extend(targeting(args))
         run_or_bg("vsam_03_type_gate", c, getattr(args, "bg", False))
 
@@ -532,7 +539,7 @@ def handle_vsam(args):
         extra = ["--force-truncate"] if getattr(args, "force_truncate", False) else []
         tbl = ["--tbl-col", args.tbl_col] if getattr(args, "tbl_col", None) else []
         commands = [step("vsam", m, *(["--workers", workers, *extra] if m == "vsam_06_load_data" else tbl if m == "vsam_02_inventory" else []), *runall_targeting(args, m)) for m in VSAM_STEPS]
-        bg_cmd = [sys.executable, str(BASE_DIR / "sweep.py"), "vsam", "run-all", "--workers", str(workers), *extra, *tbl, *targeting(args, skip=("file", "filename"))]
+        bg_cmd = [sys.executable, str(BASE_DIR / "sweep.py"), "vsam", "run-all", "--workers", str(workers), *extra, *tbl, *targeting(args, skip=("file", "filename")), *(["--rows", str(args.rows)] if getattr(args, "rows", None) else [])]
         pipeline_or_bg("vsam_full_pipeline", "VSAM Full", commands, bg_cmd, getattr(args, "bg", False))
 
 
@@ -652,7 +659,7 @@ def cmd_run_all(args):
         tbl = ["--tbl-col", args.tbl_col] if getattr(args, "tbl_col", None) else []
         oracle_cmds = [step("oracle", m, *(["--workers", workers] if m == "oracle_06_load_data" else [])) for m in ORACLE_STEPS]
         vsam_cmds = [step("vsam", m, *(["--workers", workers, *extra] if m == "vsam_06_load_data" else tbl if m == "vsam_02_inventory" else [])) for m in VSAM_STEPS]
-        bg_cmd = [sys.executable, str(BASE_DIR / "sweep.py"), "run-all", "--track", "all", "--workers", str(workers), *extra, *tbl]
+        bg_cmd = [sys.executable, str(BASE_DIR / "sweep.py"), "run-all", "--track", "all", "--workers", str(workers), *extra, *tbl, *(["--rows", str(args.rows)] if getattr(args, "rows", None) else [])]
         pipeline_or_bg("sweep_all_tracks", "Oracle + VSAM", oracle_cmds + vsam_cmds, bg_cmd, getattr(args, "bg", False))
 
 
@@ -678,6 +685,7 @@ def main():
     p_all.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Parallel workers (default: {DEFAULT_WORKERS})")
     p_all.add_argument("--force-truncate", action="store_true", help="Pass --force-truncate to the VSAM load step")
     p_all.add_argument("--tbl-col", choices=["headers", "copybook"], help="VSAM table column names: S3 file headers (default) or copybook column names")
+    p_all.add_argument("--rows", metavar="N|all", help="Rows per file for the VSAM type gate (Step 03): a number or 'all'")
     p_all.add_argument("--bg", action="store_true", help="Run full pipeline as detached background daemon")
     add_targeting_args(p_all, company=True)
     add_layer_arg(p_all)
@@ -848,6 +856,7 @@ def main():
     v_gate.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Parallel workers")
     v_gate.add_argument("--company", help="Comma-separated company tokens to filter")
     add_targeting_args(v_gate, company=True, file=True)
+    v_gate.add_argument("--rows", metavar="N|all", help="Rows to read per file: a number or 'all' (default: VSAM_ANALYZE_MAX_ROWS, else all)")
     v_gate.add_argument("--bg", action="store_true", help="Run in background")
 
     v_ddl = v_sub.add_parser("gen-ddl", aliases=["ddl"], help="Step 04: Generate DDL (tables + PK in gen_ddl)")
@@ -894,6 +903,7 @@ def main():
     v_runall.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Parallel workers")
     v_runall.add_argument("--force-truncate", action="store_true", help="Pass --force-truncate to the VSAM load step")
     v_runall.add_argument("--tbl-col", choices=["headers", "copybook"], help="Table column names: S3 file headers (default) or copybook column names")
+    v_runall.add_argument("--rows", metavar="N|all", help="Rows per file for the VSAM type gate (Step 03): a number or 'all'")
     v_runall.add_argument("--bg", action="store_true", help="Run full pipeline in background")
     add_targeting_args(v_runall, company=True)
     add_layer_arg(v_runall)

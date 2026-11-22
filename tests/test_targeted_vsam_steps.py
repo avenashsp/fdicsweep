@@ -228,3 +228,24 @@ def test_unchanged_vsam_files_are_reloaded_when_a_table_they_loaded_into_was_tru
     _q("TRUNCATE bcs.stg_bcsxref_rec_v")                                       # a keyless table emptied by hand
     run(d, env, "vsam_06_load_data")
     assert _q("SELECT count(*) FROM bcs.stg_bcsxref_rec_v") == "5"
+
+
+def test_step03_rows_flag_overrides_the_env_default(repo):
+    d, data, env = repo
+    for step in STEPS[:2]:
+        run(d, env, step)
+    out = d / "vsam" / "outputs"
+    import json as _j
+
+    def rows_checked(*extra, **envvars):
+        run(d, {**env, **envvars}, "vsam_03_type_gate", *extra)
+        gate = _j.loads((out / "vsam_03_type_gate.json").read_text())
+        return next(v["rows_total"] for k, v in gate.items() if "ACHFILE" in k.upper() and "|" in k)
+
+    assert rows_checked("--rows", "3") == 3
+    assert rows_checked("--rows", "all", VSAM_ANALYZE_MAX_ROWS="2") == 10          # 'all' beats the env value
+    assert rows_checked(VSAM_ANALYZE_MAX_ROWS="4") == 4                            # no flag: the env value is the default
+    assert rows_checked() == 10                                                    # neither: all rows
+    for bad in ("0", "-1", "abc"):
+        r = run(d, env, "vsam_03_type_gate", "--rows", bad, check=False)
+        assert r.returncode == 2 and "--rows must be" in (r.stdout + r.stderr)

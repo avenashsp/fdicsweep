@@ -64,7 +64,21 @@ from vsam.vsam_common import (
 
 logger = get_logger("vsam_03_type_gate", "vsam_03_type_gate")
 
-MAX_ROWS = int(os.getenv("VSAM_ANALYZE_MAX_ROWS", "0")) or None
+MAX_ROWS = int(os.getenv("VSAM_ANALYZE_MAX_ROWS", "0")) or None     # rows read per file; None = all (--rows overrides)
+
+
+def parse_rows(value):
+    """--rows value: a positive integer, or 'all' (None = every row). Raises ValueError otherwise."""
+    text = str(value).strip().lower()
+    if text == "all":
+        return None
+    try:
+        n = int(text)
+    except ValueError:
+        raise ValueError(f"--rows must be a positive integer or 'all', got {value!r}")
+    if n < 1:
+        raise ValueError(f"--rows must be a positive integer or 'all', got {value!r}")
+    return n
 
 
 def make_columns_unique(cols):
@@ -86,7 +100,7 @@ def make_columns_unique(cols):
     return out
 
 
-def read_file_data(path, has_hdr=True, columns_meta=None, nrows=MAX_ROWS, mode="quality"):
+def read_file_data(path, has_hdr=True, columns_meta=None, nrows=None, mode="quality"):
     """
     Safely reads data from an S3 URI or local file into a pandas DataFrame.
     Every file has headers: column names are taken directly from the first line (header=0).
@@ -722,10 +736,22 @@ def profile_source(source_key, rows, key_cols, target_schemas, columns_meta, mod
 def main():
     parser = argparse.ArgumentParser(description="Step 03: Type Gate, PK verification and schema column detection.")
     parser.add_argument("--workers", type=int, default=int(os.getenv("VSAM_WORKERS", str(min(4, os.cpu_count() or 1)))))
+    parser.add_argument("--rows", default=None, metavar="N|all",
+                        help="Rows to read per file: a number, or 'all'. Default: VSAM_ANALYZE_MAX_ROWS (all rows when unset or 0). "
+                             "Only the first N rows are checked, so a key that is unique there may still have duplicates later.")
     parser.add_argument("--bg", action="store_true", help="Run in background")
     add_targeting_args(parser, company=True, file=True)
     args = parser.parse_args()
     sel = selector_or_exit(args, logger)
+    global MAX_ROWS
+    if args.rows is not None:
+        try:
+            MAX_ROWS = parse_rows(args.rows)
+        except ValueError as e:
+            logger.error(f"Invalid selection: {e}")
+            sys.exit(2)
+    logger.info(f"Rows read per file: {MAX_ROWS if MAX_ROWS else 'all'}"
+                + (" (sampled: PK uniqueness is only checked within these rows)" if MAX_ROWS else ""))
 
     logger.info("=" * 75)
     logger.info("SWEEP VSAM MIGRATION - STEP 03: TYPE GATE & PK VERIFICATION")
