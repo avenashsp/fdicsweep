@@ -126,6 +126,7 @@ Generated `logs/`, `reports/` and `outputs/` folders are git-ignored.
 pip install -r requirements-dev.txt
 python3 -m pyflakes .
 python3 -m pytest                     # PG* env vars (or SWEEP_ALLOW_NO_PASSWORD=1) enable the integration tests
+python3 tools/make_package.py         # fdicsweep_package_v<version>.docx in package/ (git-tracked files, zip + base64, self-extracting commands)
 ```
 
 ## Documentation
