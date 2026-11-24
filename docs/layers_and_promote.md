@@ -31,7 +31,7 @@ A layer only ever touches the tables of **its own manifest** - tables the applic
 | Command | What it does |
 |---|---|
 | `python3 sweep.py layers init-manifests [--force]` | Drafts the manifests from the inventory: bronze = all Oracle + all VSAM, silver / gold_backup / gold = all Oracle. Existing (reviewed) manifests are kept unless `--force` (a `.bak` is kept). Keyed tables get `upsert`, keyless Oracle tables `insert_only`, keyless VSAM tables `replace`. |
-| `python3 sweep.py layers scan-models --models-dir <path>` | Scans the data-model Python scripts (SQL inside strings, `to_sql` / `read_sql_table`) and **drafts** `layers/silver_vsam_tables.draft.csv` (VSAM tables the models read) and `layers/model_output_tables.draft.csv` (tables they write), plus `layers/models_scan.json`. Drafts have `enabled=false`; **nothing is applied automatically** - a person reviews them and copies the rows they accept into the manifests. The scripts are only read, never run. |
+| `python3 sweep.py layers scan-models [--models-dir <path>]` | Reads the data models of `data_models/` (default) - the `SWEEP_MODEL` header of each script is the truth, only a script without a header falls back to scanning the SQL inside its strings - and **drafts** `layers/silver_vsam_tables.draft.csv` (VSAM tables the models read) and `layers/model_output_tables.draft.csv` (tables they write), plus `layers/models_scan.json`. Drafts have `enabled=false`; **nothing is applied automatically** - a person reviews them and copies the rows they accept into the manifests. The scripts are only read, never run. `layers init-manifests` also writes these drafts from the headers, and `models_scan.json` lists outputs that collide with a loaded table (a model output must have its own name). See [data_models.md](data_models.md). |
 
 ## 3. Capturing the delta while bronze loads
 
@@ -52,9 +52,11 @@ python3 sweep.py promote --purge [--dry-run]
 * **Same staged pipeline as Step 06:** validation (`pg_input_is_valid`), rejects in `sweep_ctl.load_rejects`, only-if-different upsert, row-count check (`read = inserted + updated + unchanged + rejected + duplicates`), **one transaction per table**, `sweep_ctl.promote_log` row (run id, source / target layer, table, mode, inserted, updated, unchanged, rejected, status, timestamps). The target records **its own delta** for the next hop.
 * **Order and gating:** deltas are applied per table in **strict sequence order** (N+1 never before N; a gap is an error that asks for `--full`). A layer takes a table only if the previous layer applied that delta successfully; a failure stops that table's chain while other tables continue. **gold_backup is the gate:** gold only reads what gold_backup applied. Re-running is idempotent and resumable.
 * **Modes:** `upsert` (changed rows only), `insert_only` (keyless: insert rows the target does not have; keyed: new keys only), `replace` (atomic `TRUNCATE` + `INSERT` in one transaction, for VSAM keyless tables in silver - **refused on gold and gold_backup**). A keyless **model output** table is skipped with a warning unless its manifest says `insert_only`.
-* **Model outputs** (`track=model_output`): after the Database team's model scripts finish in silver, `promote --from silver --to gold_backup`, then `--to gold`. Upsert on the primary key of the **changed rows only** (`IS DISTINCT FROM`); never a replace or truncate.
+* **Model outputs** (`track=model_output`): the data models of `data_models/` run in silver (`python3 sweep.py models run`, see [data_models.md](data_models.md)); then `promote --from silver --to gold_backup`, then `--to gold`. Upsert on the primary key of the **changed rows only** (`IS DISTINCT FROM`); never a replace or truncate. **`promote --from silver` refuses a model output** whose model has no SUCCESS newer than its latest silver input delta (`--ignore-model-status` overrides).
 * **`--status`** prints the delta x layer matrix (`SUCCESS` / `FAILED` / `PENDING` / `BLOCKED`). **`--purge`** removes delta tables once **every** later layer applied them plus `SWEEP_DELTA_RETENTION_DAYS` (default 14); the registry rows stay.
 * **`--full`** copies the whole source table (baseline or resynchronization) instead of the deltas.
+* **Schema first, then data:** a hop is refused while the target layer has pending FE files that the source layer has already applied (`python3 sweep.py fwd-ddl promote --from L --to L` first; `--ignore-pending-fwd` overrides). See [fwd_ddl.md](fwd_ddl.md).
+* **`sweep_ctl.load_history`:** every load attempt - an S3 file (Oracle / VSAM Step 06) or a promote hop - is one append-only row (run id, track, layer, source, uri, table, SUCCESS / FAILED, rows read / inserted / updated / unchanged / rejected / duplicates, `rows_before` on the first row of a table = its ledger baseline, S3 metadata), written **inside the load transaction**; a failed attempt gets a FAILED row of its own.
 
 ### Gold safeguards (gold is live)
 
@@ -67,10 +69,17 @@ python3 sweep.py promote --purge [--dry-run]
 ## 5. `chain`
 
 ```
-python3 sweep.py chain [--until <layer>] [--tracks oracle,vsam] [--skip-load] [--workers N] [--tables ...] [--dry-run]
+python3 sweep.py chain [--until bronze|silver|models|gold_backup|gold] [--skip-models] [--models a,b] [--force-models] [--allow-ddl] [--tracks oracle,vsam] [--skip-load] [--workers N] [--tables ...] [--dry-run]
 ```
 
-Loads bronze from S3 (Oracle and VSAM Step 06 with `--layer bronze`), then promotes silver -> gold_backup -> gold, **stopping at the first failure**. `--until gold_backup` stops early so the result can be reviewed before gold.
+The order of a Day-2 run, **stopping at the first failure**:
+
+```
+load bronze from S3 -> fwd-ddl apply (bronze) -> fwd-ddl promote + promote (silver) -> RUN THE DATA MODELS in silver
+  -> fwd-ddl promote + promote (gold_backup: deltas and model outputs together) -> fwd-ddl promote + promote (gold)
+```
+
+It never goes past silver while silver has pending FE files. `--until models` stops after the models so the result can be reviewed; `--until gold_backup` before gold. `--skip-models` promotes without running the models. A failed model stops the chain: nothing is promoted to gold_backup. FE files for gold_backup / gold are applied only with `--allow-ddl`.
 
 ## 6. `migrate`
 
@@ -87,13 +96,24 @@ python3 sweep.py layers reconcile --from <layer> --to <layer> [--tables ...] [--
 python3 sweep.py layers check [--layer X]
 ```
 
-* **reconcile:** per table row counts plus a key-hash comparison (`--exact` hashes every row; the default compares a 1 percent sample of the keys), Excel report, exit code. Bronze vs silver vs gold_backup must match for the Oracle tables (and model outputs); for **gold** - and for VSAM tables - the report is informational only. Tool-set audit columns (`createddate_m`, `createdby_m`) are not compared. **Run and review it before the first chained delta.**
-* **check:** database reachable, PostgreSQL >= 16, privilege to set `session_replication_role`, `sweep_ctl` migrated, schema drift summary against the upstream layer, sequences behind `max(column)`.
+* **reconcile:** per table row counts plus a key-hash comparison (`--exact` hashes every row; the default compares a 1 percent sample of the keys), Excel report, exit code. Only columns of the **same type** are compared; type differences are reported separately (`type_differences`, status `TYPE_DIFFERENCE`). Bronze vs silver vs gold_backup must match for the Oracle tables and model outputs, and **VSAM tables are enforced in silver** (informational in gold_backup). **gold uses a superset check:** every key of gold_backup must still exist in gold and `count(gold) >= count(gold_backup)` (the keys are streamed from gold_backup into gold through the same cross-database pipe `promote` uses; a 1 percent sample by default, all keys with `--exact`) - the application may add and change rows in gold, never remove them. Differences an applied FE file explains are `FE_ADDED` / `FE_CHANGED` / `FE_DROPPED`, count as PASS and appear in the `FE_Changes` sheet. Tool-set audit columns (`createddate_m`, `createdby_m`) are not compared. **Run and review it before the first chained delta.**
+* **check:** database reachable, PostgreSQL >= 16, privilege to set `session_replication_role`, `sweep_ctl` migrated, schema drift summary against the upstream layer (columns / tables an applied FE file dropped are not drift), sequences behind `max(column)`.
+
+### Validate one layer and monitor
+
+```
+python3 sweep.py validate --layer L [--tables a,b] [--exact] [--tracks oracle,vsam]
+python3 sweep.py monitor [--layer L] [-w]
+```
+
+* **validate** writes one Excel report with a verdict per component and for the layer (exit code 0 = PASS). **bronze** = Oracle Step 08 + VSAM Step 07 (their own reports) + the ledger; **every other layer** = reconcile with its upstream (gold: superset check) + a column-by-column schema comparison with FE-explained differences + the ledger. Sheets: `Summary`, `Reconcile`, `Schema`, `Ledger`, `FE_Changes`.
+* **ledger check** (Oracle Step 08, VSAM Step 07, `validate`): `count(table) == rows_before + sum(rows_inserted)` from `sweep_ctl.load_history` (exact counts), status `LEDGER_MATCH` / `LEDGER_MISMATCH` (columns in `Row_Count_Audit` / `RowCounts`, sheet `Ledger`): a row deleted or added outside the loaders shows up. A keyless VSAM table is replaced by every run, so its ledger is the rows of the latest snapshot.
+* **monitor --layer** adds the layer and database name, a compact last-promote line and the number of pending FE files to the dashboard header.
 
 ## 8. Recommended first run
 
 1. `python3 sweep.py migrate --all-layers`
-2. `python3 sweep.py layers init-manifests`, review the manifests; `layers scan-models --models-dir ...`, review the drafts, copy accepted rows.
+2. `python3 sweep.py layers init-manifests`, review the manifests; review the drafts written from the `data_models/` headers (`layers scan-models`), copy accepted rows.
 3. `python3 sweep.py layers check`
 4. `python3 sweep.py layers reconcile --from bronze --to silver`, `--from silver --to gold_backup`, `--from gold_backup --to gold` (informational), review the reports.
-5. Day-2: `python3 sweep.py chain --until gold_backup`, review, then `python3 sweep.py promote --from gold_backup --to gold`.
+5. Day-2: `python3 sweep.py chain --until gold_backup` (FE files, promote to silver, the data models, promote to gold_backup), review (`python3 sweep.py validate --layer gold_backup`), then `python3 sweep.py chain --until gold --skip-load` or `python3 sweep.py promote --from gold_backup --to gold`.

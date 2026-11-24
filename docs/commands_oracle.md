@@ -1,6 +1,8 @@
 # SWEEP CLI Command Reference - Oracle Migration Track (v6.0.0)
 
 > **6.0.0:** Steps 05-08 need `--layer` (Step 06 only `--layer bronze`); Steps 04, 05 and 07 refuse gold / gold_backup without `--allow-ddl`; Oracle 05 and 07 accept `--tables`; every step accepts `--tables`, `--schemas` / `--owners`, `--exclude-tables`, `--dry-run` (Oracle 02, 03, 06 also `--file` / `--filename`); targeted runs merge their outputs. Step 06 writes `sweep_ctl.oracle_load_log`, captures the applied delta for `promote` and loads again when the target table is empty. See [layers_and_promote.md](layers_and_promote.md) and [targeting_and_outputs.md](targeting_and_outputs.md).
+>
+> **FE files and validation (6.0.0):** Step 06 reads the loader rules of the FE files (`ignore-column`, `rename-column`, `default-column`, `skip-table`; an unknown column still fails and the message names the pragmas) and `--dry-run` now reads each file header and runs the plan check; every load attempt is a row of `sweep_ctl.load_history`. Steps 05 / 07 report `FE_CHANGED` for objects an applied FE file dropped or changed (Step 04 never touches the database, so the report is made by 05 and 07). Step 08 adds the ledger check (`ledger_status` / `ledger_rows` in `Row_Count_Audit`, `LEDGER_MATCH` / `LEDGER_MISMATCH`) and the `FE_Changes` sheet; differences an applied FE file explains are `FE_ADDED` / `FE_CHANGED` / `FE_DROPPED` and count as PASS. See [fwd_ddl.md](fwd_ddl.md) and [layers_and_promote.md](layers_and_promote.md).
 
 Complete command reference for the **Oracle Migration Track** of the SWEEP Unified Data Migration Framework.
 

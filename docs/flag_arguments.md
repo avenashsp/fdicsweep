@@ -370,11 +370,18 @@ Invalid selectors (unknown table / schema / file / company / copybook, unparseab
 
 | Command | Flags |
 | :--- | :--- |
-| `promote` | `--from L`, `--to L`, `--tables`, `--full`, `--dry-run`, `--workers N`, `--transport {auto,program,stream}`, `--status`, `--purge`, `--limit N` |
-| `chain` | `--until L`, `--tracks oracle,vsam`, `--skip-load`, `--workers N`, `--transport`, `--tables`, `--dry-run` |
+| `promote` | `--from L`, `--to L`, `--tables`, `--full`, `--dry-run`, `--workers N`, `--transport {auto,program,stream}`, `--status`, `--purge`, `--limit N`, `--ignore-pending-fwd`, `--ignore-model-status` |
+| `chain` | `--until {bronze,silver,models,gold_backup,gold}`, `--skip-models`, `--models a,b`, `--force-models`, `--allow-ddl`, `--tracks oracle,vsam`, `--skip-load`, `--workers N`, `--transport`, `--tables`, `--dry-run` |
+| `fwd-ddl status` / `check` | `--layer L` (optional: all layers), `--allow-ddl` (check on gold / gold_backup) |
+| `fwd-ddl apply` | `--layer L` (required), `--file F`, `--dry-run`, `--allow-data`, `--force`, `--allow-ddl` (required on gold / gold_backup) |
+| `fwd-ddl promote` | `--from L`, `--to L` (required), `--dry-run`, `--allow-data`, `--force`, `--allow-ddl` |
+| `validate` | `--layer L` (required), `--tables a,b`, `--exact`, `--tracks oracle,vsam` (bronze only) |
+| `models list` / `status` | - |
+| `models run` | `--models a,b`, `--with-deps`, `--full`, `--force`, `--workers N`, `--dry-run`, `--skip-promote-check` |
+| `monitor` | `-w`, `--interval S`, `--no-color`, `--track {all,oracle,vsam}`, `--layer L` |
 | `migrate` | `--layer L` or `--all-layers`, `--dry-run` |
 | `layers init-manifests` | `--force` |
-| `layers scan-models` | `--models-dir PATH` (required) |
+| `layers scan-models` | `--models-dir PATH` (default `data_models/`) |
 | `layers reconcile` | `--from L`, `--to L` (required), `--tables`, `--exact` |
 | `layers check` | `--layer L` (default: all layers) |
 
@@ -390,6 +397,10 @@ Details: [layers_and_promote.md](layers_and_promote.md).
 | `SWEEP_PROMOTE_TRANSPORT` | `program`, `stream` or `auto` | `auto` |
 | `SWEEP_PROMOTE_DEBUG_DIR` | Keep the generated apply script and its output of every promote step in this folder | unset |
 | `SWEEP_MERGE_LOCK_TIMEOUT` | Seconds a merge waits for the lock of an output file | `60` |
+| `SWEEP_FWD_DDL_DIR` | Folder of the FE files | `fwd_ddl/` |
+| `SWEEP_MODELS_DIR` | Folder of the data models (`config/`, `work/`, `logs/` live below it) | `data_models/` |
+| `SWEEP_MODEL_TIMEOUT` | Seconds a data model may run (a header `timeout` wins); the process group is killed on expiry | `21600` |
+| `SWEEP_MODEL_PGUSER` / `SWEEP_MODEL_PGPASSWORD` | Optional account of the silver database used by the models instead of the layer's (set in `sweep.silver.env`) | unset |
 
 ---
 

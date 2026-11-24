@@ -64,14 +64,18 @@ Every step exits `0` on success and non-zero on failure (`2` for an invalid sele
 ```bash
 python3 sweep.py migrate --all-layers                          # versioned sweep_ctl migrations (first thing on every database)
 python3 sweep.py layers init-manifests                         # draft layers/<layer>_tables.csv for review
-python3 sweep.py layers scan-models --models-dir <path>        # draft the silver VSAM list and the model output tables
+python3 sweep.py layers scan-models                             # draft the silver VSAM list and the model outputs from the data_models/ headers
 python3 sweep.py layers check                                  # reachable, PostgreSQL >= 16, migrated, drift, sequences
 python3 sweep.py layers reconcile --from bronze --to silver    # counts + key hash; run it BEFORE the first chained delta
 
 python3 sweep.py oracle load-data --layer bronze               # S3 is read into bronze only (also: vsam load-data)
 python3 sweep.py promote --from bronze --to silver             # one hop, applying the captured deltas in sequence order
 python3 sweep.py promote --from silver --to gold_backup --dry-run
-python3 sweep.py chain --until gold_backup                     # load bronze, promote to gold_backup, review ...
+python3 sweep.py fwd-ddl status                                 # FE SQL files (fwd_ddl/) applied / pending per layer
+python3 sweep.py fwd-ddl apply --layer bronze                   # then: fwd-ddl promote --from bronze --to silver ...
+python3 sweep.py models run                                     # the data models (data_models/) in silver, when an input changed
+python3 sweep.py validate --layer silver                        # one report and a verdict per layer
+python3 sweep.py chain --until gold_backup                     # load bronze, FE files, silver, models, gold_backup, review ...
 python3 sweep.py promote --from gold_backup --to gold          # ... then gold (explicit; gold is the live database)
 python3 sweep.py promote --status                              # delta x layer status matrix
 ```
@@ -109,7 +113,9 @@ sweep_streaming.py          safe S3 -> stdout helpers (no shell interpolation)
 sweep_stream.sh             S3 -> stdout streaming pipe
 sweep_layers.py / .json     layer profiles, --layer guard, manifests;  sweep_layer_cmds.py  init-manifests / scan-models
 sweep_promote.py            promote / chain / status / purge;  sweep_delta.py  delta capture + registry
-sweep_migrate.py            versioned sweep_ctl migrations;  sweep_reconcile.py  layers reconcile / check
+sweep_migrate.py            versioned sweep_ctl migrations;  sweep_reconcile.py  layers reconcile / check / validate
+sweep_fwd_ddl.py / _rules   FE SQL files (fwd_ddl/) and the loader rules;  sweep_validate.py  ledger + FE overlay
+sweep_models.py             the data-model runner;  data_models/  the models (Python scripts, config/, work/, logs/)
 sweep_targeting.py          uniform --tables/--schemas/... selectors;  sweep_merge.py / sweep_ddlfrag.py  merge-safe outputs
 sweep_bg.py + sweep_jobs.py, sweep_metrics.py, sweep_dashboard.py, sweep_format.py   background jobs and monitor
 oracle/                     Oracle track (steps 01-08) + inputs/
@@ -135,6 +141,8 @@ python3 tools/make_package.py         # fdicsweep_package_v<version>.docx in pac
 - [Oracle commands](docs/commands_oracle.md)
 - [VSAM commands](docs/commands_vsam.md)
 - [Layers, promote, migrate](docs/layers_and_promote.md)
+- [FE SQL files (fwd-ddl)](docs/fwd_ddl.md)
+- [Data models](docs/data_models.md)
 - [Targeted runs, merge-safe outputs, log tables](docs/targeting_and_outputs.md)
 - [Flag and environment reference](docs/flag_arguments.md)
 - [Sample outputs](docs/sweep_outputs.md)
