@@ -567,13 +567,31 @@ def cmd_promote(args):
         if not args.from_layer or not args.to_layer:
             return _layer_error(LayerError("--from and --to are required (promote moves data one hop, e.g. --from bronze --to silver)"))
         results, code = sp.promote(args.from_layer, args.to_layer, tables=tables or None, full=args.full, dry_run=args.dry_run,
-                                   workers=args.workers, transport=args.transport)
+                                   workers=args.workers, transport=args.transport, ignore_pending_fwd=getattr(args, "ignore_pending_fwd", False))
         for r in results:
             print(f"{r['status']:<10} {r['table']:<50} inserted {r['inserted']:>9} updated {r['updated']:>9} unchanged {r['unchanged']:>9}"
                   + (f"  {r['message']}" if r["message"] else ""))
         if results:
             sp.write_promote_report(results, get_layer(args.from_layer), get_layer(args.to_layer), args.dry_run)
         return code
+    except LayerError as e:
+        return _layer_error(e)
+
+
+def cmd_fwd_ddl(args):
+    import sweep_fwd_ddl as fd
+    from sweep_layers import LayerError
+    try:
+        if args.fwd_cmd == "status":
+            return fd.cmd_status(args)
+        if args.fwd_cmd == "check":
+            return fd.cmd_check(args)
+        if args.fwd_cmd == "apply":
+            return fd.cmd_apply(args)
+        if args.fwd_cmd == "promote":
+            return fd.cmd_promote(args)
+        print("Usage: python3 sweep.py fwd-ddl {status,apply,promote,check} ...")
+        return 0
     except LayerError as e:
         return _layer_error(e)
 
@@ -589,7 +607,8 @@ def cmd_chain(args):
             load.append([sys.executable, str(BASE_DIR / "sweep.py"), track, "load-data", "--layer", "bronze", "--workers", str(args.workers)])
     try:
         return sp.run_chain(until=args.until, load_cmds=load, workers=args.workers, transport=args.transport,
-                            tables=[t for t in (args.tables or "").split(",") if t.strip()] or None, dry_run=args.dry_run)
+                            tables=[t for t in (args.tables or "").split(",") if t.strip()] or None, dry_run=args.dry_run,
+                            skip_models=args.skip_models, allow_ddl=args.allow_ddl)
     except LayerError as e:
         return _layer_error(e)
 
@@ -722,10 +741,13 @@ def main():
                         help="Cross-database transport: psql copy FROM PROGRAM (program), a pipe made by Python (stream), or auto (default)")
     p_prom.add_argument("--status", action="store_true", help="Print the delta x layer status matrix and exit")
     p_prom.add_argument("--purge", action="store_true", help="Remove delta tables every layer applied (plus SWEEP_DELTA_RETENTION_DAYS) and exit")
+    p_prom.add_argument("--ignore-pending-fwd", action="store_true", help="Promote data even when the target layer has pending FE (fwd-ddl) files")
     p_prom.add_argument("--limit", type=int, default=10, help="Deltas per table shown by --status (default 10)")
 
     p_chain = subparsers.add_parser("chain", help="Load bronze from S3, then promote silver -> gold_backup -> gold (stops at the first failure)")
-    p_chain.add_argument("--until", help="Stop after this layer (e.g. gold_backup, to review before gold)")
+    p_chain.add_argument("--until", help="Stop after this stage: bronze, silver, models, gold_backup or gold (e.g. gold_backup, to review before gold)")
+    p_chain.add_argument("--skip-models", action="store_true", help="Promote without running the data models")
+    p_chain.add_argument("--allow-ddl", action="store_true", help="Also apply pending FE (fwd-ddl) files to gold_backup / gold")
     p_chain.add_argument("--tracks", default="oracle,vsam", help="Tracks to load into bronze: oracle, vsam or both (default both)")
     p_chain.add_argument("--skip-load", action="store_true", help="Do not load bronze (promote what bronze already holds)")
     p_chain.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Parallel workers")
@@ -737,6 +759,24 @@ def main():
     p_mig.add_argument("--layer", help="Layer to migrate")
     p_mig.add_argument("--all-layers", action="store_true", help="Migrate every layer, in chain order")
     p_mig.add_argument("--dry-run", action="store_true", help="Show the pending migrations; change nothing")
+
+    p_fwd = subparsers.add_parser("fwd-ddl", help="Forward-engineering (FE) SQL files: status / apply / promote / check across the layers")
+    f_sub = p_fwd.add_subparsers(dest="fwd_cmd", help="fwd-ddl subcommands")
+    def _fwd_common(sp, layer_required=False):
+        add_targeting_args(sp, file=True)
+        add_layer_arg(sp)
+        sp.add_argument("--allow-data", action="store_true", help="Allow statements that insert or change data (FE files are structure only)")
+        sp.add_argument("--force", action="store_true", help="Apply even when the compatibility check reports a BLOCK")
+    f_st = f_sub.add_parser("status", help="Pending / applied / failed FE files per layer (read-only; all layers without --layer)")
+    _fwd_common(f_st)
+    f_ap = f_sub.add_parser("apply", help="Apply the pending FE files of a layer in order (one transaction per file)")
+    _fwd_common(f_ap)
+    f_pr = f_sub.add_parser("promote", help="Apply to the next layer the files the previous layer applied")
+    _fwd_common(f_pr)
+    f_pr.add_argument("--from", dest="from_layer", required=True)
+    f_pr.add_argument("--to", dest="to_layer", required=True)
+    f_ck = f_sub.add_parser("check", help="Dry-run every pending file with the compatibility check; nothing is written (read-only)")
+    _fwd_common(f_ck)
 
     p_lay = subparsers.add_parser("layers", help="Layer manifests, model scan, reconcile and checks")
     l_sub = p_lay.add_subparsers(dest="layers_cmd", help="layers subcommands")
@@ -916,6 +956,8 @@ def main():
 
     if args.command == "check":
         sys.exit(0 if cmd_check(args) else 1)
+    elif args.command == "fwd-ddl":
+        sys.exit(cmd_fwd_ddl(args))
     elif args.command == "promote":
         sys.exit(cmd_promote(args))
     elif args.command == "chain":

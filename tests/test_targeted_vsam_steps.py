@@ -249,3 +249,80 @@ def test_step03_rows_flag_overrides_the_env_default(repo):
     for bad in ("0", "-1", "abc"):
         r = run(d, env, "vsam_03_type_gate", "--rows", bad, check=False)
         assert r.returncode == 2 and "--rows must be" in (r.stdout + r.stderr)
+
+
+def _fe_sql(sql):
+    """FE-style change applied to the table in EVERY schema that has it (the loaders provision the table in all active schemas)."""
+    _q("DO $$ DECLARE r record; BEGIN FOR r IN SELECT table_schema AS s FROM information_schema.tables WHERE table_name = 'stg_achfile_v' LOOP "
+       "EXECUTE replace($sql$" + sql + "$sql$, '@S@', quote_ident(r.s)); END LOOP; END $$")
+
+
+def _rule(rule, col=None, new=None, expr=None, table="stg_achfile_v"):
+    f = lambda v: "NULL" if v is None else "'" + v.replace("'", "''") + "'"
+    _q(f"INSERT INTO sweep_ctl.fwd_ddl_rules (file_name, rule, schema_name, table_name, column_name, new_name, expression) VALUES "
+       f"('V1__t.sql', '{rule}', '*', '{table}', {f(col)}, {f(new)}, {f(expr)})")
+
+
+def _newer_snapshot(d, data, status="Z"):
+    for f in data.glob("*ACHFILE*.csv"):
+        f.unlink()
+    hdr = ["status_code", "b_korg", "amount", "account_number", "effective_date"]
+    _write_csv(data / "FDICSWP_FDIC_ACHFILE_FLAT_20240301.csv", hdr,
+               [[status if i == 1 else "A", "104" if i % 2 else "112", i * 1.5, 1000 + i, "2024-01-01"] for i in range(1, 11)])
+    for step in ("vsam_02_inventory", "vsam_03_type_gate"):
+        run(d, env_of(d), step)
+
+
+def env_of(d):
+    return _ENV[str(d)]
+
+
+_ENV = {}
+
+
+def test_vsam_loader_rules_ignore_rename_default_skip_and_unknown_column(repo):
+    d, data, env = repo
+    _ENV[str(d)] = env
+    for step in STEPS[:6]:
+        run(d, env, step)
+    # FE dropped the column the source file still carries -> without a rule the file FAILS (it used to be dropped silently)
+    _fe_sql("ALTER TABLE @S@.stg_achfile_v DROP COLUMN effective_date")
+    _newer_snapshot(d, data)
+    r = run(d, env, "vsam_06_load_data", check=False)
+    assert "not found in table: effective_date" in (r.stdout + r.stderr) and "docs/fwd_ddl.md" in (r.stdout + r.stderr)
+    assert _q("SELECT status_code FROM bss01104.stg_achfile_v WHERE account_number = 1001") == "A"           # nothing changed
+    # dry-run reports the same problem before the real run
+    r = run(d, env, "vsam_06_load_data", "--dry-run", check=False)
+    assert r.returncode != 0 and "PROBLEM" in r.stdout and "effective_date" in r.stdout
+    _rule("ignore-column", "effective_date")
+    assert "OK" in run(d, env, "vsam_06_load_data", "--dry-run").stdout
+    run(d, env, "vsam_06_load_data")
+    assert _q("SELECT status_code FROM bss01104.stg_achfile_v WHERE account_number = 1001") == "Z"           # loaded, column ignored
+
+    # rename: the table column is called status now
+    _fe_sql("ALTER TABLE @S@.stg_achfile_v RENAME COLUMN status_code TO status")
+    _newer_snapshot(d, data, status="Y")
+    assert run(d, env, "vsam_06_load_data", check=False).returncode != 0
+    _rule("rename-column", "status_code", "status")
+    run(d, env, "vsam_06_load_data")
+    assert _q("SELECT status FROM bss01104.stg_achfile_v WHERE account_number = 1001") == "Y"
+
+    # default: a new NOT NULL column the file does not have
+    _fe_sql("ALTER TABLE @S@.stg_achfile_v ADD COLUMN region text NOT NULL DEFAULT 'x'; ALTER TABLE @S@.stg_achfile_v ALTER COLUMN region DROP DEFAULT")
+    _q("UPDATE bss01104.stg_achfile_v SET region = 'old'")
+    _newer_snapshot(d, data, status="X")
+    assert run(d, env, "vsam_06_load_data", check=False).returncode != 0
+    _rule("default-column", "region", expr="'new'")
+    run(d, env, "vsam_06_load_data")
+    assert _q("SELECT status || ':' || region FROM bss01104.stg_achfile_v WHERE account_number = 1001") == "X:old"      # existing rows keep their value
+    _fe_sql("ALTER TABLE @S@.stg_achfile_v ADD COLUMN extra_new int")                                   # nullable: adding columns needs no rule
+    _newer_snapshot(d, data, status="W")
+    run(d, env, "vsam_06_load_data")
+    assert _q("SELECT status FROM bss01104.stg_achfile_v WHERE account_number = 1001") == "W"
+
+    # skip-table: the table was dropped by FE
+    _fe_sql("DROP TABLE @S@.stg_achfile_v")
+    _rule("skip-table")
+    _newer_snapshot(d, data, status="V")
+    r = run(d, env, "vsam_06_load_data")
+    assert "SKIPPED" in r.stdout and "skip-table rule" in r.stdout

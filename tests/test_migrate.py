@@ -8,7 +8,8 @@ pytestmark = pytest.mark.integration
 
 LEGACY_DDL = """
 DROP TABLE IF EXISTS sweep_ctl.oracle_load_log, sweep_ctl.vsam_load_log, sweep_ctl.delta_registry, sweep_ctl.promote_log,
-  sweep_ctl.schema_version CASCADE;
+  sweep_ctl.schema_version, sweep_ctl.fwd_ddl_log, sweep_ctl.fwd_ddl_changes, sweep_ctl.fwd_ddl_rules, sweep_ctl.load_history,
+  sweep_ctl.model_run_log CASCADE;
 ALTER TABLE sweep_ctl.load_rejects DROP COLUMN IF EXISTS track;
 ALTER TABLE sweep_ctl.load_audit DROP COLUMN IF EXISTS track;
 CREATE TABLE sweep_ctl.load_log (
@@ -30,23 +31,23 @@ def _cols(table):
 
 def test_migration_copies_legacy_rows_and_renames(pg_db):
     c.run_psql(LEGACY_DDL)
-    assert m.migrate_current_database() == [1]
+    assert m.migrate_current_database() == [1, 2]
     assert c.run_psql("SELECT uri || '|' || loaded_rows FROM sweep_ctl.oracle_load_log", tuples_only=True) == "s3://b/oracle/a.csv.gz|10"
     vs = c.query_db_rows("SELECT uri || '|' || target_schema || '|' || loaded_rows FROM sweep_ctl.vsam_load_log ORDER BY 1")
     assert vs == ["s3://b/vsam/x#y.csv|bcs|3", "s3://b/vsam/x#y.csv|bss01104|4"]      # split at the LAST '#'
     assert c.run_psql("SELECT count(*) FROM sweep_ctl.load_log_legacy", tuples_only=True) == "3"   # kept, not dropped
     assert c.run_psql("SELECT to_regclass('sweep_ctl.load_log') IS NULL", tuples_only=True) == "t"
-    assert c.run_psql("SELECT count(*) FROM sweep_ctl.schema_version", tuples_only=True) == "1"
+    assert c.run_psql("SELECT count(*) FROM sweep_ctl.schema_version", tuples_only=True) == "2"
     for t in ("load_rejects", "load_audit"):
         assert any(x.startswith("track:") for x in _cols(t))
 
 
 def test_migration_is_idempotent(pg_db):
     c.run_psql(LEGACY_DDL)
-    assert m.migrate_current_database() == [1]
+    assert m.migrate_current_database() == [1, 2]
     assert m.migrate_current_database() == []
     assert c.run_psql("SELECT count(*) FROM sweep_ctl.oracle_load_log", tuples_only=True) == "1"
-    assert c.run_psql("SELECT count(*) FROM sweep_ctl.schema_version", tuples_only=True) == "1"
+    assert c.run_psql("SELECT count(*) FROM sweep_ctl.schema_version", tuples_only=True) == "2"
 
 
 def test_dry_run_changes_nothing(pg_db):
@@ -67,7 +68,8 @@ def test_failed_migration_rolls_back(pg_db, monkeypatch):
 
 def test_fresh_install_and_migrated_database_have_the_same_columns(pg_db):
     fresh = {t: _cols(t) for t in ("oracle_load_log", "vsam_load_log", "load_rejects", "load_audit",
-                                    "delta_registry", "promote_log", "schema_version")}
+                                    "delta_registry", "promote_log", "schema_version", "fwd_ddl_log", "fwd_ddl_changes",
+                                    "fwd_ddl_rules", "load_history", "model_run_log")}
     c.run_psql(LEGACY_DDL)
     m.migrate_current_database()
     assert fresh == {t: _cols(t) for t in fresh}
@@ -76,3 +78,18 @@ def test_fresh_install_and_migrated_database_have_the_same_columns(pg_db):
 
 def test_meta_sql_files_are_identical():
     assert (c.ORACLE_INPUTS_DIR / "sweep_meta.sql").read_text() == (c.VSAM_INPUTS_DIR / "sweep_meta.sql").read_text()
+
+
+def test_migration_2_adds_the_fe_and_history_tables_to_a_version_1_database(pg_db):
+    c.run_psql(LEGACY_DDL)
+    monkey_all = list(m.MIGRATIONS)
+    m.MIGRATIONS[:] = monkey_all[:1]
+    try:
+        assert m.migrate_current_database() == [1]
+    finally:
+        m.MIGRATIONS[:] = monkey_all
+    c.run_psql("DROP TABLE IF EXISTS sweep_ctl.fwd_ddl_log, sweep_ctl.fwd_ddl_changes, sweep_ctl.fwd_ddl_rules, sweep_ctl.load_history, sweep_ctl.model_run_log")
+    assert m.migrate_current_database() == [2]                       # only the new migration runs
+    assert m.migrate_current_database() == []
+    assert c.run_psql("SELECT string_agg(version::text, ',' ORDER BY version) FROM sweep_ctl.schema_version", tuples_only=True) == "1,2"
+    assert c.run_psql("SELECT count(*) FROM sweep_ctl.oracle_load_log", tuples_only=True) == "1"     # data of migration 1 untouched

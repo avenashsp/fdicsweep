@@ -6,6 +6,8 @@ sweep_migrate.py - versioned, idempotent, transactional migrations of the sweep_
 does not list yet. Each migration runs in ONE transaction together with its schema_version row, so a failure leaves
 the database exactly as it was. Re-running is a no-op.
 
+Migration 2 (v6.0.0): sweep_ctl.fwd_ddl_log / fwd_ddl_changes / fwd_ddl_rules (FE SQL), load_history, model_run_log.
+
 Migration 1 (v6.0.0)
   * sweep_ctl.oracle_load_log (PK uri) and sweep_ctl.vsam_load_log (PK uri, target_schema) with the s3_* columns
   * rows of the old sweep_ctl.load_log are copied (uri LIKE '%#%' = VSAM, split at the LAST '#'; others = Oracle) and
@@ -152,6 +154,88 @@ CREATE TABLE IF NOT EXISTS sweep_ctl.schema_version (
 );
 """
 
+# Migration 2 (FE SQL, load history, model runs)
+CTL_OBJECTS_V2_SQL = """
+-- Forward-engineering (FE) SQL files applied to this database (`sweep.py fwd-ddl`)
+CREATE TABLE IF NOT EXISTS sweep_ctl.fwd_ddl_log (
+    file_name     text PRIMARY KEY,
+    order_no      bigint NOT NULL,
+    checksum      text NOT NULL,
+    status        text NOT NULL,                 -- APPLIED / FAILED
+    applied_by    text NOT NULL DEFAULT CURRENT_USER,
+    applied_at    timestamptz NOT NULL DEFAULT now(),
+    duration_sec  numeric,
+    message       text
+);
+-- Structured before / after catalog diff of every applied file
+CREATE TABLE IF NOT EXISTS sweep_ctl.fwd_ddl_changes (
+    id            bigserial PRIMARY KEY,
+    file_name     text NOT NULL,
+    kind          text NOT NULL,                 -- table / column / constraint / index / view / trigger / sequence / rule
+    action        text NOT NULL,                 -- added / dropped / changed
+    schema_name   text,
+    object_name   text,
+    detail        jsonb,
+    recorded_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sweep_fwd_ddl_changes_file ON sweep_ctl.fwd_ddl_changes (file_name);
+-- Loader rules registered from the pragmas of FE files
+CREATE TABLE IF NOT EXISTS sweep_ctl.fwd_ddl_rules (
+    id            bigserial PRIMARY KEY,
+    file_name     text NOT NULL,
+    rule          text NOT NULL,                 -- ignore-column / rename-column / default-column / skip-table
+    schema_name   text NOT NULL,                 -- '*' = every schema
+    table_name    text NOT NULL,
+    column_name   text,
+    new_name      text,
+    expression    text,
+    created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sweep_fwd_ddl_rules_table ON sweep_ctl.fwd_ddl_rules (table_name);
+-- Append-only load history: one row per load attempt (the load log keeps ONE row per file and is overwritten on a reload)
+CREATE TABLE IF NOT EXISTS sweep_ctl.load_history (
+    id               bigserial PRIMARY KEY,
+    run_id           text,
+    track            text NOT NULL,              -- oracle / vsam
+    layer            text,
+    source           text NOT NULL DEFAULT 's3', -- s3 / promote
+    uri              text,
+    target_schema    text NOT NULL,
+    target_table     text NOT NULL,
+    status           text NOT NULL,              -- SUCCESS / FAILED
+    rows_read        bigint DEFAULT 0,
+    rows_inserted    bigint DEFAULT 0,
+    rows_updated     bigint DEFAULT 0,
+    rows_unchanged   bigint DEFAULT 0,
+    rows_rejected    bigint DEFAULT 0,
+    rows_duplicates  bigint DEFAULT 0,
+    rows_before      bigint,                     -- rows in the table before the first recorded load (ledger baseline)
+    s3_last_modified text,
+    s3_etag          text,
+    s3_size          bigint,
+    message          text,
+    started_at       timestamptz,
+    finished_at      timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sweep_load_history_table ON sweep_ctl.load_history (target_schema, target_table);
+-- One row per data-model run (used in silver)
+CREATE TABLE IF NOT EXISTS sweep_ctl.model_run_log (
+    id            bigserial PRIMARY KEY,
+    run_id        text NOT NULL,
+    model         text NOT NULL,
+    status        text NOT NULL,                 -- SUCCESS / FAILED / SKIPPED
+    mode          text,                          -- full / delta
+    started_at    timestamptz,
+    ended_at      timestamptz DEFAULT now(),
+    exit_code     int,
+    log_file      text,
+    input_seqs    jsonb,                         -- delta sequences processed per input table
+    result        jsonb,                         -- the SWEEP_MODEL_RESULT line
+    message       text
+);
+CREATE INDEX IF NOT EXISTS idx_sweep_model_run_log_model ON sweep_ctl.model_run_log (model, id);
+"""
+
 # Copies the rows of the old single load_log into the two new tables and renames it. Runs only while the old table
 # exists and has not been renamed yet, so a second run (or a fresh install) does nothing.
 LEGACY_COPY_SQL = """
@@ -187,7 +271,9 @@ $mig$;
 # (version, name, sql) - append new migrations here; never edit one that has been released.
 MIGRATIONS = [
     (1, "log_tables_delta_registry_promote_log", CTL_OBJECTS_SQL + LEGACY_COPY_SQL),
+    (2, "fwd_ddl_load_history_model_runs", CTL_OBJECTS_V2_SQL),
 ]
+CTL_ALL_SQL = CTL_OBJECTS_SQL + CTL_OBJECTS_V2_SQL      # the state a fresh install (sweep_meta.sql) creates
 LATEST_VERSION = MIGRATIONS[-1][0]
 
 _VERSION_TABLE_SQL = """

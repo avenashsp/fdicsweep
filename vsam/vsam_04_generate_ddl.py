@@ -47,7 +47,7 @@ from vsam.common_colmap import effective_columns_meta
 from sweep_common import layer_dir
 from sweep_ddlfrag import FragmentStore
 from sweep_merge import write_text_file
-from sweep_migrate import CTL_OBJECTS_SQL
+from sweep_migrate import CTL_ALL_SQL
 from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
 from sweep_layers import add_layer_arg, ensure_layer
 from vsam.vsam_common import get_all_active_schemas, get_korg_override_pkey, load_csv_safe, OUT
@@ -63,7 +63,7 @@ AUDIT_COLS = [
     '  "createdby_m" character varying(40) NOT NULL DEFAULT CURRENT_USER',
 ]
 
-CTL_DDL = CTL_OBJECTS_SQL      # control schema objects (oracle_load_log / vsam_load_log, rejects, delta registry ...)
+CTL_DDL = CTL_ALL_SQL      # control schema objects (oracle_load_log / vsam_load_log, rejects, delta registry ...)
 
 
 AUDIT_COL_NAMES = {

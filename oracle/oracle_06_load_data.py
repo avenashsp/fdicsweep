@@ -61,6 +61,7 @@ from sweep_platform import atomic_write_json
 from sweep_targeting import Selector, add_targeting_args, selector_or_exit, validate_or_exit
 from sweep_layers import add_layer_arg, ensure_layer, require_bronze, restrict_to_manifest
 from sweep_delta import ensure_delta_table, fast_registry_sql
+from sweep_fwd_rules import load_rules, resolve_columns, rules_for
 from sweep_loadpipe import tables_with_rows
 from sweep_migrate import require_migrated
 from sweep_merge import current_run_id
@@ -239,6 +240,39 @@ def _failed(error, sec=0.0, **extra):
     return LoadOutcome("FAILED", 0, sec, error, **extra)
 
 
+FWD_RULES = None
+
+
+def fwd_rules():
+    """FE loader rules of the database being loaded (read once per run)."""
+    global FWD_RULES
+    with LOCK:
+        if FWD_RULES is None:
+            FWD_RULES = load_rules()
+        return FWD_RULES
+
+
+def plan_file(job, region):
+    """
+    Reads the header of the file and checks it against the target table and the FE loader rules WITHOUT loading.
+    Returns (skip_reason, file_cols, meta, resolution, plan, problem): skip_reason is set for a skip-table rule, problem for anything
+    that would make the real load fail (unknown column, missing required column, missing table).
+    """
+    schema, table = job["target_schema"].lower(), job["target_table"].lower()
+    rules = rules_for(fwd_rules(), schema, table)
+    if rules.skip:
+        return f"table {schema}.{table} was dropped by an FE file (skip-table rule)", [], None, None, None, ""
+    file_cols = extract_file_header(job["uri"], region)
+    meta = get_table_meta(schema, table)
+    if not meta["columns"]:
+        return "", file_cols, meta, None, None, f"Target table {schema}.{table} does not exist in PostgreSQL."
+    res = resolve_columns(file_cols, meta["columns"], rules)
+    if res.problem:
+        return "", file_cols, meta, res, None, res.problem
+    plan, problem = plan_load(meta, res.table_cols)
+    return "", file_cols, meta, res, plan, problem
+
+
 def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False, max_rejects=DEFAULT_MAX_REJECTS,
                      fast_bulk=False, trigger_mode="replica"):
     """
@@ -252,20 +286,33 @@ def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False, max_rejec
     size_bytes = int(job.get("size_bytes") or 0)
     file_format = job.get("file_format", "gzip")
 
-    if dry_run:
-        return LoadOutcome("DRY_RUN", 0, 0.0, "")
+    if dry_run:      # reads the file header and runs the same plan check as the real load, without loading
+        try:
+            skip, _fc, _m, res, _plan, problem = plan_file(job, region)
+        except (RuntimeError, OSError, ValueError) as e:
+            return _failed(f"dry-run check: {clip_error(e)}")
+        if skip:
+            return LoadOutcome("SKIPPED", 0, 0.0, skip)
+        if problem:
+            return _failed(f"dry-run check: {problem}")
+        note = f"; FE rules: {len(res.ignored)} ignored, {sum(1 for t, f in res.col_map.items() if t != f)} renamed, {len(res.defaults)} default" \
+            if (res.ignored or res.defaults or any(t != f for t, f in res.col_map.items())) else ""
+        return LoadOutcome("DRY_RUN", 0, 0.0, note)
 
     t0 = time.time()
     size_mb_val = float(job.get("size_mb") or (size_bytes / (1024**2)))
     record_stream_start(worker_id, job, size_mb_val)
     try:
-        header_cols = extract_file_header(uri, region)
-        meta = get_table_meta(schema, table)
-        if not meta["columns"]:
-            return _failed(f"Target table {schema}.{table} does not exist in PostgreSQL.")
-        plan, problem = plan_load(meta, header_cols)
+        skip, file_cols, meta, resolution, plan, problem = plan_file(job, region)
+        if skip:
+            logger.info(f"[Worker {worker_id}] SKIPPED {job.get('filename', uri)}: {skip}")
+            return LoadOutcome("SKIPPED", 0, round(time.time() - t0, 2), skip)
         if problem:
             return _failed(problem)
+        header_cols = resolution.table_cols
+        for ign in resolution.ignored:
+            logger.info(f"[Worker {worker_id}] INFO column {ign} of {job.get('filename', uri)} is ignored (FE ignore-column rule)")
+        has_rules = bool(resolution.ignored or resolution.defaults or any(t != f for t, f in resolution.col_map.items()))
 
         # Re-check the object right before loading: the load_log row stores exactly what was loaded, so a stale
         # file map cannot cause a skipped or mis-recorded reload.
@@ -274,7 +321,7 @@ def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False, max_rejec
         log_sql = load_log_insert(uri, schema, table, size_bytes, file_format, worker_id, s3_meta)
         name = job.get("filename", Path(uri).name)
 
-        use_fast = fast_bulk and not has_constraints(meta) and is_table_empty(schema, table)
+        use_fast = fast_bulk and not has_rules and not has_constraints(meta) and is_table_empty(schema, table)
         if use_fast:
             logger.info(f"[Worker {worker_id}] Started stream: {name} ({format_size_actual(size_mb_val)}) -> {schema}.{table} (fast bulk - empty table without constraints)")
             script = build_fast_script(schema, table, header_cols, stream_cmd, meta, trigger_mode,
@@ -287,7 +334,7 @@ def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False, max_rejec
             ensure_delta_table(schema, table)        # applied rows are captured for `promote` (unless the table is empty / --full)
             capture = {"run_id": current_run_id(), "layer": "bronze", "full": FULL_LOAD, "uris": uri, "downstream": True}
             script = build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trigger_mode, max_rejects, uri, log_sql,
-                                         capture=capture)
+                                         capture=capture, raw_cols=file_cols, col_map=resolution.col_map, defaults=resolution.defaults)
 
         # High-performance bulk load options. psql runs in its own process group, with a hard
         # timeout (SWEEP_LOAD_TIMEOUT) that also kills the S3/gzip pipeline it spawned.
@@ -348,6 +395,10 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
     ts = get_timestamp()
     sel = selector or _legacy_selector(tables_filter, exclude_tables, file_uri, filename, dry_run)
     dry_run = dry_run or sel.dry_run
+    global FWD_RULES
+    FWD_RULES = None                       # the FE loader rules and the table layouts are read again for every run
+    META_CACHE.clear()
+    COL_CACHE.clear()
     if not has_db_auth():
         logger.error(AUTH_HELP)
         return False
@@ -556,8 +607,10 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
                                 f"{job['target_schema']}.{job['target_table']} ({rows:,} rows in {sec}s ~ {rate:,} r/s; "
                                 f"inserted {out.inserted:,}, updated {out.updated:,}, rejected {out.rejected:,}, duplicates dropped {out.duplicates:,})")
                 elif status == "DRY_RUN":
-                    logger.info(f"[{completed_files}/{len(pending_jobs)}] DRY-RUN: {job['filename']} -> "
-                                f"{job['target_schema']}.{job['target_table']} ({job['size_mb']} MB)")
+                    logger.info(f"[{completed_files}/{len(pending_jobs)}] DRY-RUN OK: {job['filename']} -> "
+                                f"{job['target_schema']}.{job['target_table']} ({job['size_mb']} MB){msg}")
+                elif status == "SKIPPED":
+                    logger.warning(f"[{completed_files}/{len(pending_jobs)}] SKIPPED: {job['filename']} -> {msg}")
                 else:
                     logger.error(f"[{completed_files}/{len(pending_jobs)}] FAILED: {job['filename']} -> {msg}")
 

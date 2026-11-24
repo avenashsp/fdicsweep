@@ -472,7 +472,18 @@ def select_rows(src, tgt, tables, logger_=logger):
     return rows
 
 
-def promote(from_layer, to_layer, tables=None, full=False, dry_run=False, workers=4, transport=None, force_full_without_delta=False):
+def fwd_pending_between(src, tgt):
+    """Names of the FE files the source layer applied that the target layer has not applied yet (None when a log cannot be read)."""
+    from sweep_fwd_ddl import layer_log
+    a, b = layer_log(src), layer_log(tgt)
+    if a is None or b is None:
+        return None
+    done = lambda log: {n for n, r in log.items() if r["status"] == "APPLIED"}
+    return sorted(done(a) - done(b))
+
+
+def promote(from_layer, to_layer, tables=None, full=False, dry_run=False, workers=4, transport=None, force_full_without_delta=False,
+            ignore_pending_fwd=False):
     """
     Moves data one hop. Returns (results, exit_code). Tables are processed parent-first, level by level (all tables of a level
     finish before the next level starts, workers in parallel inside a level); every table is its own transaction.
@@ -481,6 +492,12 @@ def promote(from_layer, to_layer, tables=None, full=False, dry_run=False, worker
     from sweep_migrate import LATEST_VERSION
     src, tgt = check_hop(from_layer, to_layer)
     rows = select_rows(src, tgt, tables)
+    if not ignore_pending_fwd:       # schema first, then data: the FE files of the source layer must be in the target layer
+        pending = fwd_pending_between(src, tgt)
+        if pending:
+            raise LayerError(f"{tgt.name} has {len(pending)} pending FE file(s) that {src.name} already applied: {', '.join(pending[:5])}"
+                             f"{' ...' if len(pending) > 5 else ''}. Run `python3 sweep.py fwd-ddl promote --from {src.name} --to {tgt.name}"
+                             f"{' --allow-ddl' if not tgt.allow_ddl else ''}` first (--ignore-pending-fwd overrides).")
     sconn, tconn = layer_conn(src), layer_conn(tgt)
     if not same_credentials(sconn, tconn):
         raise LayerError("source and target layer must use the same host, port, user and password for the cross-database transfer "
@@ -640,29 +657,99 @@ def purge_deltas(dry_run=False, retention_days=None):
     return purged
 
 
-def run_chain(until=None, load_cmds=None, workers=4, transport=None, tables=None, dry_run=False):
+CHAIN_STAGES = ("bronze", "silver", "models", "gold_backup", "gold")
+
+
+def _fwd_args(layer=None, **kw):
+    import argparse
+    ns = dict(layer=layer, dry_run=False, allow_ddl=False, allow_data=False, force=False, file=None, filename=None, tables=None, schemas=None,
+              exclude_tables=None, from_layer=None, to_layer=None)
+    ns.update(kw)
+    return argparse.Namespace(**ns)
+
+
+def run_chain(until=None, load_cmds=None, workers=4, transport=None, tables=None, dry_run=False, skip_models=False, allow_ddl=False,
+              models_args=None):
     """
-    chain = load bronze from S3, then promote silver -> gold_backup -> gold, stopping at the first failure; `until` stops early
-    (e.g. to review at gold_backup). `load_cmds` are the commands that load bronze (list of argv lists).
+    The order of a Day-2 run (schema first, then data, per layer):
+      load bronze from S3 -> fwd-ddl apply (bronze) -> fwd-ddl promote + data promote (silver) -> RUN THE DATA MODELS in silver ->
+      fwd-ddl promote + data promote (gold_backup: Oracle deltas AND model outputs) -> fwd-ddl promote + data promote (gold)
+    It stops at the first failure. `until` is one of bronze, silver, models, gold_backup, gold. It never continues past silver while silver
+    has pending FE files (the models read the FE-changed tables). `skip_models` promotes without running the models.
+    FE files for gold_backup / gold are applied only with `allow_ddl` (they are DDL on live layers).
     Returns the exit code.
     """
+    import sweep_fwd_ddl as fd
     layers = chain()
     names = [l.name for l in layers]
-    if until and until not in names:
-        raise LayerError(f"unknown layer {until!r}: choose one of {', '.join(names)}")
+    if until and until not in CHAIN_STAGES:
+        raise LayerError(f"unknown --until {until!r}: choose one of {', '.join(CHAIN_STAGES)}")
+    stop_after = CHAIN_STAGES.index(until) if until else len(CHAIN_STAGES)
+
+    def reached(stage):
+        return CHAIN_STAGES.index(stage) <= stop_after
+
     for cmd in (load_cmds or []):
-        logger.info(f"chain: loading {layers[0].name}: {' '.join(cmd)}")
+        logger.info(f"chain: loading {names[0]}: {' '.join(cmd)}")
         if subprocess.run(cmd, cwd=str(c.BASE_DIR), env=os.environ.copy()).returncode != 0:
-            logger.error(f"chain stopped: the {layers[0].name} load failed")
+            logger.error(f"chain stopped: the {names[0]} load failed")
             return EXIT_FAILED
-    if until == layers[0].name:
+    logger.info("chain: FE (fwd-ddl) files of bronze")
+    if fd.cmd_apply(_fwd_args("bronze", dry_run=dry_run)) != 0:
+        logger.error("chain stopped: fwd-ddl apply on bronze failed (nothing was promoted)")
+        return EXIT_FAILED
+    if not reached("silver"):
         return 0
-    for src, tgt in zip(layers, layers[1:]):
-        results, code = promote(src.name, tgt.name, tables=tables, dry_run=dry_run, workers=workers, transport=transport)
+    hops = list(zip(layers, layers[1:]))                      # bronze->silver, silver->gold_backup, gold_backup->gold
+    for src, tgt in hops:
+        if tgt.name == "gold_backup":
+            if not skip_models and reached("models"):
+                code = _models_stage(models_args, dry_run)
+                if code != 0:
+                    logger.error("chain stopped: a data model failed (nothing was promoted to gold_backup)")
+                    return code
+            if not reached("gold_backup"):
+                return 0
+            if not skip_models:
+                pend = fd.pending_count("silver")
+                if pend:
+                    logger.error(f"chain stopped: silver has {pend} pending FE file(s); apply them before the models run")
+                    return EXIT_FAILED
+        pending = fwd_pending_between(src, tgt)
+        if pending:
+            if not tgt.allow_ddl and not allow_ddl:
+                logger.error(f"chain stopped: {len(pending)} FE file(s) must be applied to {tgt.name} ({', '.join(pending[:3])}); "
+                             f"run the chain with --allow-ddl in the quiet window")
+                return EXIT_FAILED
+            logger.info(f"chain: FE (fwd-ddl) files {src.name} -> {tgt.name}")
+            if fd.cmd_promote(_fwd_args(tgt.name, from_layer=src.name, to_layer=tgt.name, allow_ddl=allow_ddl or tgt.allow_ddl, dry_run=dry_run)) != 0:
+                logger.error(f"chain stopped: fwd-ddl promote {src.name} -> {tgt.name} failed")
+                return EXIT_FAILED
+        results, code = promote(src.name, tgt.name, tables=tables, dry_run=dry_run, workers=workers, transport=transport,
+                                ignore_pending_fwd=dry_run)
         if code != 0:
             logger.error(f"chain stopped at {tgt.name}: {src.name} -> {tgt.name} had failures (later layers are not touched)")
             return code
-        if until == tgt.name:
+        if tgt.name == "silver":
+            pend = fd.pending_count("silver")
+            summary = "none" if not pend else f"{pend} pending - apply them before data modelling"
+            logger.info(f"chain: silver is ready for the data models; pending FE files in silver: {summary}")
+            if pend:
+                logger.error("chain stopped: silver has pending FE files; data modelling must not start")
+                return EXIT_FAILED
+            if until == "silver":
+                logger.info("chain stopped after silver (--until)")
+                return 0
+        elif until == tgt.name:
             logger.info(f"chain stopped after {tgt.name} (--until)")
-            break
+            return 0
     return 0
+
+
+def _models_stage(models_args, dry_run):
+    """Runs the data models in silver (K); 0 when there is nothing to run."""
+    try:
+        import sweep_models
+    except ImportError:
+        return 0
+    return sweep_models.run_models_cmd(**(models_args or {}), dry_run=dry_run)

@@ -75,7 +75,8 @@ def _reject_inserts(i, f, meta_cols, arbiter, keyed):
             f"WHEN {nines_any} THEN array_to_string(ARRAY[{nines_detail}], '; ') END AS _detail "
             f"FROM {raw} r) x WHERE x._reason IS NOT NULL;\n")
 
-    typed = [c for c in f["present"] if not _is_text(meta_cols[c]["type"])]
+    defaults = f.get("defaults") or {}
+    typed = [c for c in f["present"] if not _is_text(meta_cols[c]["type"]) and c not in defaults]
     if typed:
         tests = ", ".join(
             f"CASE WHEN NOT pg_input_is_valid(NULLIF(btrim(r.{q(c)}, {WS}), ''), {lit(meta_cols[c]['type'])}) "
@@ -86,7 +87,8 @@ def _reject_inserts(i, f, meta_cols, arbiter, keyed):
             f"SELECT r.*, {dest} AS _dest, array_remove(ARRAY[{tests}], NULL) AS bad FROM {raw} r "
             f"WHERE NOT EXISTS (SELECT 1 FROM _rej b WHERE b.f = {i} AND b.row_no = r._row_no)) x WHERE cardinality(x.bad) > 0;\n")
 
-    sel = ", ".join(f"NULLIF(btrim(r.{q(c)}, {WS}), '')::{meta_cols[c]['type']} AS {q(c)}" for c in f["present"])
+    sel = ", ".join((f"({defaults[c]})::{meta_cols[c]['type']} AS {q(c)}" if c in defaults else
+                     f"NULLIF(btrim(r.{q(c)}, {WS}), '')::{meta_cols[c]['type']} AS {q(c)}") for c in f["present"])
     stage = (f"CREATE TEMP TABLE _s{i} ON COMMIT DROP AS SELECT r._row_no, {dest} AS _dest, {sel} FROM {raw} r "
              f"WHERE NOT EXISTS (SELECT 1 FROM _rej b WHERE b.f = {i} AND b.row_no = r._row_no);\nDROP TABLE {raw};\n")
     return out, stage
@@ -180,7 +182,8 @@ def build_unit_script(unit):
                 spec = capture_spec(d, table, name=f"_cap{di}") if delta_ok else None
                 for stmt in upsert_statements(f"{q(d)}.{q(table)}", f["present"], cols, a, set(f["present"]), False,
                                               stg=f"_s{f['i']}", where=f"WHERE s._dest = {lit(d)}",
-                                              sfx=f"|{f['i']}|{d}", existing=f"_ex{f['i']}", capture=spec):
+                                              sfx=f"|{f['i']}|{d}", existing=f"_ex{f['i']}", capture=spec,
+                                              no_update=set(f.get("defaults") or ())):
                     add(stmt)
     else:
         for d in dests:       # snapshot replace: a destination that receives rows is emptied first

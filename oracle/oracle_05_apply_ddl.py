@@ -12,6 +12,7 @@ from pathlib import Path
 from sweep_common import layer_dir, ORACLE_OUTPUTS_DIR
 from sweep_ddlfrag import FragmentStore
 from sweep_targeting import Selector, add_targeting_args, selector_or_exit, validate_or_exit
+from sweep_fwd_ddl import load_fe_changes
 from sweep_layers import add_layer_arg, ensure_layer, restrict_to_manifest
 from sweep_common import (
     log_summary,
@@ -80,12 +81,19 @@ def deploy_ddl(schemas_filter=None, skip_meta=False, selector=None, layer=None):
             logger.error(f"Failed to apply sweep_meta.sql: {e}")
             return False
 
-    # 2. Find and apply table DDL scripts
+    # 2. Find and apply table DDL scripts. A table an applied FE file dropped (or renamed away) is NOT recreated: FE_CHANGED.
     deployed_files = []
+    fe = load_fe_changes()
+    if fe.dropped_tables:
+        per_table = True
     if per_table:
         for sc in store.schemas():
             picked = [t for t in store.tables(sc) if sel.matches(sc, t)]
             picked = [t for s_, t in restrict_to_manifest(layer, [(sc, t) for t in picked], logger, "table DDL") if s_ == sc]
+            for t in [t for t in picked if fe.table_dropped(sc, t)]:
+                logger.info(f"FE_CHANGED: {sc}.{t} was dropped by {fe.dropped_tables[(sc, t)]}; it is not recreated")
+                deployed_files.append({"schema": sc, "file": f"{sc}.{t}", "status": "FE_CHANGED"})
+            picked = [t for t in picked if not fe.table_dropped(sc, t)]
             if not picked:
                 continue
             logger.info(f"Applying target DDL of {len(picked)} table(s) in {sc}...")
@@ -176,7 +184,7 @@ def deploy_ddl(schemas_filter=None, skip_meta=False, selector=None, layer=None):
         ('target database', PGDATABASE),
     ])
         
-    failed = [d for d in deployed_files if d["status"] != "SUCCESS"]
+    failed = [d for d in deployed_files if d["status"] not in ("SUCCESS", "FE_CHANGED")]
     if failed:
         logger.error(f"{len(failed)} DDL script(s) failed: {', '.join(d['file'] for d in failed)}")
     return not failed

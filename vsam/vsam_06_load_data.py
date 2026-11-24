@@ -59,6 +59,8 @@ from sweep_common import (
 from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
 from sweep_layers import add_layer_arg, ensure_layer, require_bronze, restrict_to_manifest
 from sweep_delta import ensure_delta_table
+from sweep_fwd_ddl import load_fe_changes
+from sweep_fwd_rules import load_rules, resolve_columns, rules_for
 from sweep_merge import current_run_id
 from sweep_migrate import require_migrated
 from sweep_loadpipe import REJECT_TABLE, ensure_reject_table, load_table_meta, parse_output, probe_trigger_mode, tables_with_rows
@@ -204,6 +206,28 @@ def expected_key(task, tg):
             task.get("source_company", ""), task.get("source_filename", task.get("source_file", "")),
             task.get("s3_filename", "")) if c]
     return key
+
+
+def apply_fwd_rules(spec, table_cols, tr, worker_id=0):
+    """
+    FE loader rules for one file (sweep_fwd_rules): ignored columns stay in the raw table but leave the typed one (`_skip<n>`), renamed
+    columns load into the table column, default columns get their expression, and a column that is neither in the table nor covered by a
+    rule FAILS the file (it used to be dropped silently). Sets spec["present"] and spec["defaults"]; raises RuntimeError on a problem.
+    """
+    file_cols = [c for c in spec["raw_cols"] if not c.startswith("_skip")]
+    res = resolve_columns(file_cols, table_cols, tr)
+    if res.problem:
+        raise RuntimeError(res.problem)
+    raw = []
+    for pos, name in enumerate(spec["raw_cols"]):
+        if name in tr.ignore and not name.startswith("_skip"):
+            logger.info(f"[Worker {worker_id}] INFO column {name} of {spec['name']} is ignored (FE ignore-column rule)")
+            raw.append(f"_skip_fe{pos}")
+        else:
+            raw.append(tr.rename.get(name, name) if not name.startswith("_skip") else name)
+    spec["raw_cols"] = raw
+    spec["defaults"] = dict(res.defaults)
+    spec["present"] = [c for c in raw if not c.startswith("_skip")] + list(res.defaults)
 
 
 def prepare_file(task, tg_prof, cb_meta, index, worker_id, snapshot_msg=""):
@@ -450,14 +474,26 @@ def run_unit(table, specs, worker_id, run, tg_prof):
         bad = [s for s in specs if s["pk_error"]]
         if bad:
             raise RuntimeError(bad[0]["pk_error"])
+        dests0 = destinations(specs)
+        tr = rules_for(run.get("fwd_rules") or [], dests0, table)
+        if tr.skip:        # the table was dropped by an FE file: the files are skipped, not failed - and the table is NOT recreated
+            reason = f"table {table} was dropped by an FE file (skip-table rule)"
+            logger.info(f"[Worker {worker_id}] SKIPPED {names}: {reason}")
+            return [_file_result(s, "SKIPPED", 0, reason, None, {}, [], [], worker_id, _mapped_set(s)) for s in specs]
+        fe = run.get("fe")
+        dropped = [d for d in dests0 if fe and fe.table_dropped(d, table)]
+        if dropped:
+            raise RuntimeError(f"table {dropped[0]}.{table} was dropped by FE file {fe.dropped_tables[(dropped[0], table)]}; it is not recreated "
+                               f"- add a `-- sweep:skip-table {dropped[0]}.{table}` pragma to an FE file (docs/fwd_ddl.md)")
         info = resolve_table(table, specs)
         if not info["arbiter"] and info["has_data"] and PARTIAL_RUN and not FORCE_TRUNCATE:
             raise RuntimeError(
                 f"{table} already contains rows and has no primary key; this partial run (--company/--tables/--limit-files) "
                 f"cannot replace it safely because other source files of the table may be missing. "
                 f"Run without filters, or pass --force-truncate.")
+        tr = rules_for(run.get("fwd_rules") or [], info["dests"], table)
         for s in specs:
-            s["present"] = [c for c in s["raw_cols"] if not c.startswith("_skip") and c in info["cols"]]
+            apply_fwd_rules(s, info["cols"], tr, worker_id)
             if not s["present"]:
                 raise RuntimeError(f"No column of {s['name']} matches the columns of {table}")
             missing_key = [k for k in info["arbiter"] if k not in s["present"]]
@@ -752,11 +788,33 @@ def main():
     total_tasks = len(tasks)
 
     if sel.dry_run:
-        for t in tasks:
-            logger.info(f"[DRY-RUN] {t.get('s3_filename') or Path(t['full_path']).name} -> "
-                        f"{','.join(t.get('target_schemas') or [])}.{t['target_table']} ({t.get('size_mb', 0)} MB)")
-        logger.info(f"[DRY-RUN] {len(tasks)} file(s) would be considered. No database changes made.")
-        return True
+        # reads each file header and runs the same plan check as the real load (table, columns, required columns, FE rules) WITHOUT loading
+        problems = 0
+        rules_all = load_rules()
+        for n, t in enumerate(tasks):
+            label = f"{t.get('s3_filename') or Path(t['full_path']).name} -> {','.join(t.get('target_schemas') or [])}.{t['target_table']}"
+            try:
+                spec = prepare_file(t, tg_prof, cb_meta, n, 0)
+                dests = destinations([spec])
+                tr = rules_for(rules_all, dests, t["target_table"])
+                if tr.skip:
+                    logger.warning(f"[DRY-RUN] SKIPPED {label}: table was dropped by an FE file (skip-table rule)")
+                    continue
+                meta = load_table_meta(dests[0], t["target_table"])
+                if not meta["columns"]:
+                    logger.info(f"[DRY-RUN] {label}: table {dests[0]}.{t['target_table']} does not exist yet (Step 06 creates it on the fly)")
+                    continue
+                apply_fwd_rules(spec, meta["columns"], tr)
+                required = [n_ for n_, c_ in meta["columns"].items() if c_["notnull"] and not c_["hasdef"] and not c_["identity"]
+                            and not c_["generated"] and n_ not in spec["present"]]
+                if required:
+                    raise RuntimeError("NOT NULL column(s) without a default are absent from the file: " + ", ".join(required[:5]))
+                logger.info(f"[DRY-RUN] OK {label} ({t.get('size_mb', 0)} MB)")
+            except (RuntimeError, OSError, ValueError) as e:
+                problems += 1
+                logger.error(f"[DRY-RUN] PROBLEM {label}: {clip_error(e)}")
+        logger.info(f"[DRY-RUN] {len(tasks)} file(s) checked, {problems} problem(s). No database changes made.")
+        return problems == 0
 
     try:
         check_postgres_version()
@@ -789,7 +847,7 @@ def main():
 
     # HEAD right before loading: the load_log rows store exactly what was loaded
     heads = head_many([t["full_path"] for t in tasks])
-    run = {"max_rejects": args.max_rejects, "heads": heads, "replica": probe_trigger_mode() == "replica",
+    run = {"fwd_rules": load_rules(), "fe": load_fe_changes(), "max_rejects": args.max_rejects, "heads": heads, "replica": probe_trigger_mode() == "replica",
            "capture": {"run_id": current_run_id(), "layer": "bronze", "full": args.full}}
 
     results = [{"s3_filename": t.get("s3_filename"), "filename": t.get("s3_filename"), "table": t["target_table"], "uri": t["full_path"],

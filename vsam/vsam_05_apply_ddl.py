@@ -25,6 +25,7 @@ from sweep_common import (
 from sweep_common import layer_dir
 from sweep_ddlfrag import FragmentStore
 from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
+from sweep_fwd_ddl import load_fe_changes
 from sweep_layers import add_layer_arg, ensure_layer, restrict_to_manifest
 
 logger = get_logger("vsam_05_apply_ddl", "vsam_05_apply_ddl")
@@ -68,8 +69,16 @@ def main():
             run_psql(SWEEP_META_SQL, is_file=True)
             logger.info("[+] sweep_ctl & sweep_meta deployed.")
 
-    # 2. Apply Pre-Load DDL (tables without PK). A targeted run applies only the selected tables' fragments.
-    if sel.filtered or manifest_driven:
+    # 2. Apply Pre-Load DDL (tables without PK). A targeted run applies only the selected tables' fragments. A table an applied
+    #    FE file dropped (or renamed away) is NOT recreated: it is reported as FE_CHANGED.
+    fe = load_fe_changes()
+    use_fragments = sel.filtered or manifest_driven or bool(fe.dropped_tables)
+    if use_fragments:
+        if not (sel.filtered or manifest_driven):
+            picked = list(known)
+        for sc, t in [(sc, t) for sc, t in picked if fe.table_dropped(sc, t)]:
+            logger.info(f"FE_CHANGED: {sc}.{t} was dropped by {fe.dropped_tables[(sc, t)]}; it is not recreated")
+        picked = [(sc, t) for sc, t in picked if not fe.table_dropped(sc, t)]
         for sc in sorted({sc for sc, _ in picked}):
             run_psql(store.script_for(sc, "pre", [t for s_, t in picked if s_ == sc]))
         logger.info(f"[+] {len(picked)} target table(s) provisioned.")

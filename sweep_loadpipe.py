@@ -119,7 +119,7 @@ def _cmp(expr, type_name):
 
 
 def upsert_statements(tgt, header_cols, cols, arbiter, present, identity, stg="_stg", where="", sfx="", existing="_existing",
-                      keep_target=False, capture=None):
+                      keep_target=False, capture=None, no_update=()):
     """
     SQL statements that apply the staged rows `stg` to `tgt`:
       INSERT ... ON CONFLICT (key) DO UPDATE ... WHERE (target columns) IS DISTINCT FROM (file columns)
@@ -130,6 +130,7 @@ def upsert_statements(tgt, header_cols, cols, arbiter, present, identity, stg="_
     work on partitioned tables).
 
     keep_target=True (conflict policy keep_target): rows whose key already exists are left alone (ON CONFLICT DO NOTHING).
+    no_update: columns that are inserted but never overwritten on a conflict (FE default-column values).
     capture = {"delta": '"sweep_delta"."s__t"', "seq": "<sql>", "skip": "<sql boolean>"}: the rows that were really applied
     (inserted or changed, after the only-if-different filter) are also written to the delta table with _op 'I' / 'U',
     unless `skip` is true (empty target / full copy: the next hop copies the whole table instead).
@@ -142,7 +143,7 @@ def upsert_statements(tgt, header_cols, cols, arbiter, present, identity, stg="_
     cap_cols = ", ".join(q(c) for c in header_cols)
     if arbiter:
         a_set = set(arbiter["cols"])
-        upd = [c for c in header_cols if c not in a_set and cols[c]["identity"] != "a"]
+        upd = [c for c in header_cols if c not in a_set and cols[c]["identity"] != "a" and c not in no_update]
         sets = [f"{q(c)} = EXCLUDED.{q(c)}" for c in upd]
         # triggers are off, so set the audit columns the audit trigger would have set on an update
         if "modifiedby" in cols and "modifiedby" not in present:

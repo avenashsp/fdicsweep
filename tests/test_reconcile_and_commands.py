@@ -102,7 +102,7 @@ def test_chain_stops_at_the_first_failure_and_until_stops_early(chain_env):
     assert rows(env, "gold_backup") == "1:a:10,2:b2:20,3:c:30" and rows(env, "gold") == "1:a:10,2:b:20,3:c:30"     # reviewed at gold_backup
     psql(env.dbs["gold"], "ALTER TABLE app.customer DROP COLUMN qty")
     assert sp.run_chain(transport="program") == 1                                                    # gold drift: the chain reports the failure
-    with pytest.raises(sl.LayerError, match="unknown layer"):
+    with pytest.raises(sl.LayerError, match="unknown --until"):
         sp.run_chain(until="platinum")
 
 

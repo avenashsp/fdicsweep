@@ -44,6 +44,7 @@ from sweep_common import (
 
 from sweep_targeting import Selector, add_targeting_args, selector_or_exit, validate_or_exit
 from sweep_layers import add_layer_arg, ensure_layer, manifest_tables
+from sweep_fwd_ddl import fe_reason, load_fe_changes
 from oracle.oracle_07_parser import parse_sql_file_blocks, simplify_case_to_coalesce
 
 logger = get_logger("oracle_07_load_objects", "oracle_07_load_objects")
@@ -264,6 +265,7 @@ def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False, 
         validate_or_exit(sel.validate_tables, [(r["s"], r["t"]) for r in cat], what="the database", logger=logger)
     all_script_results = []
     all_object_actions = []
+    fe = load_fe_changes()          # what applied FE files changed in this database
     listed = manifest_tables(layer) if (layer is not None and layer.manifest_path.exists()) else None   # None = no restriction
 
     logger.info("Connecting to target database to evaluate tables and existing objects...")
@@ -352,6 +354,14 @@ def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False, 
                         "reason": "Check constraint validation is skipped by policy.",
                         "duration_sec": 0.0
                     })
+                    continue
+
+                # FE changed or dropped the table / column / object: the generated statement is obsolete - skip it, never fail on it
+                fe_why = fe_reason(fe, b)
+                if fe_why:
+                    all_object_actions.append({"stage": stage_code, "schema": s_name, "table": t_name, "object_type": obj_type,
+                                               "object_name": o_name, "status": "FE_CHANGED", "reason": fe_why, "duration_sec": 0.0})
+                    logger.info(f"  [~] FE_CHANGED: {b['raw']} ({fe_why})")
                     continue
 
                 # -------------------------------------------------------------
@@ -574,6 +584,13 @@ def apply_post_load(stages_to_run=None, schemas_filter=None, only_loaded=False, 
                         elif pass_idx < max_passes and ("does not exist" in err_lower or "undefined" in err_lower):
                             deferred_queue.append(b)
                             logger.info(f"  [~] DEFERRED (pass {pass_idx}): {b['raw']} (waiting for dependent relation, will retry in pass {pass_idx + 1})...")
+                        elif b["table"] and fe.table_touched(b["schema"], b["table"]) and \
+                                ("does not exist" in err_lower or "undefined" in err_lower or "cannot" in err_lower):
+                            why = f"FE changed table {b['schema']}.{b['table']} ({fe.changed_tables[(b['schema'].lower(), b['table'].lower())]}): {clip_error(err_msg)}"
+                            all_object_actions.append({"stage": stage_code, "schema": b["schema"], "table": b["table"],
+                                                       "object_type": b["object_type"], "object_name": b["object_name"],
+                                                       "status": "FE_CHANGED", "reason": why, "duration_sec": obj_sec})
+                            logger.info(f"  [~] FE_CHANGED: {b['raw']} ({why})")
                         else:
                             failed_count += 1
                             all_object_actions.append({
