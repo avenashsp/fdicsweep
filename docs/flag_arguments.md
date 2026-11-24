@@ -1,4 +1,4 @@
-# SWEEP Migration Framework - Complete CLI Flags Reference (v5.4.0)
+# SWEEP Migration Framework - Complete CLI Flags Reference (v5.4.1)
 
 Complete flags reference for all CLI commands and python scripts in the **SWEEP Unified Data Migration Framework** across both **Oracle** and **VSAM** tracks.
 
@@ -21,7 +21,7 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 | **03** | `oracle.oracle_03_type_gate`<br>`python3 sweep.py oracle gate` | `'--rows ROWS'`, `'--tables TABLES'`, `'--max-tables MAX_TABLES'`, `'--bg'`, `'-h, --help'` |
 | **04** | `oracle.oracle_04_generate_ddl`<br>`python3 sweep.py oracle gen-ddl` | `'--owners OWNERS'`, `'--tables TABLES'`, `'--bg'`, `'-h, --help'` |
 | **05** | `oracle.oracle_05_apply_ddl`<br>`python3 sweep.py oracle apply-ddl` | `'--schemas SCHEMAS'`, `'--skip-meta'`, `'--bg'`, `'-h, --help'` |
-| **06** | `oracle.oracle_06_load_data`<br>`python3 sweep.py oracle load-data` | `'--workers WORKERS'`, `'--tables TABLES'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--file FILE'`, `'--filename FILENAME'`, `'--gate-pass'`, `'--limit-files LIMIT_FILES'`, `'--max-size-mb MAX_SIZE_MB'`, `'--min-size-mb MIN_SIZE_MB'`, `'--dry-run'`, `'--reload'`, `'--max-rejects MAX_REJECTS'`, `'--fast-bulk'`, `'--trigger-mode TRIGGER_MODE'`, `'--bg'`, `'-h, --help'` |
+| **06** | `oracle.oracle_06_load_data`<br>`python3 sweep.py oracle load-data` | `'--workers WORKERS'`, `'--tables TABLES'`, `'--exclude-tables EXCLUDE_TABLES'`, `'--file FILE'`, `'--filename FILENAME'`, `'--gate-pass'`, `'--limit-files LIMIT_FILES'`, `'--max-size-mb MAX_SIZE_MB'`, `'--min-size-mb MIN_SIZE_MB'`, `'--dry-run'`, `'--reload'`, `'--max-rejects MAX_REJECTS'`, `'--fast-bulk'`, `'--chunk-rows CHUNK_ROWS'`, `'--chunk-min-mb CHUNK_MIN_MB'`, `'--trigger-mode TRIGGER_MODE'`, `'--bg'`, `'-h, --help'` |
 | **07** | `oracle.oracle_07_load_objects`<br>`python3 sweep.py oracle load-obj` | `'--stage {all,pk,alter,index,fk,validate,views,triggers}'`, `'--schemas SCHEMAS'`, `'--only-loaded'`, `'--bg'`, `'-h, --help'` |
 | **08** | `oracle.oracle_08_validate`<br>`python3 sweep.py oracle validate` | `'--exact-counts'`, `'--tables TABLES'`, `'--schemas SCHEMAS'`, `'--file FILE'`, `'--bg'`, `'-h, --help'` |
 | **All** | `python3 sweep.py oracle run-all` | `'--workers WORKERS'`, `'--bg'`, `'-h, --help'` |
@@ -145,7 +145,9 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 | `--dry-run` | flag | false | List the files that would load without inserting to DB | `--dry-run` |
 | `--reload` | flag | false | Load files again even when their S3 LastModified / ETag / size are unchanged since the last load (upsert on the key, append when there is none) | `--reload` |
 | `--max-rejects` | int | 0 | Oracle Step 06: fail and roll back a file when this many rows are rejected (NOT NULL / CHECK / bad value / FK / alternate-key conflict). `0` (default) = rejected rows never fail a file | `--max-rejects 50` |
-| `--fast-bulk` | flag | false | Oracle Step 06: direct COPY into an empty table without constraints (no bad-row isolation); also loads smallest to largest instead of parent tables first | `--fast-bulk` |
+| `--fast-bulk` | flag | false | Oracle Step 06: direct COPY (no temp staging, no bad-row isolation: one bad row fails the file) into an empty table without keys / CHECK / foreign keys; NOT NULL and identity columns are allowed. Otherwise the staged path is used and the log says why. Also loads smallest to largest instead of parent tables first |
+| `--chunk-rows` | int | 2000000 | Oracle Step 06: rows per chunk when a big file is staged (one transaction, temp tables emptied after each chunk); `0` = never chunk | `--chunk-rows 1000000` |
+| `--chunk-min-mb` | float | 256 | Oracle Step 06: only files at least this big (compressed size) are loaded in chunks | `--chunk-min-mb 100` | `--fast-bulk` |
 | `--trigger-mode` | choice | auto | Oracle Step 06: how triggers are switched off while loading: `replica` (session_replication_role, no lock), `disable` (ALTER TABLE DISABLE TRIGGER), `auto` | `--trigger-mode disable` |
 | `--bg` | flag | false | Run as detached background daemon *(CLI only)* | `python3 sweep.py oracle load-data --bg` |
 

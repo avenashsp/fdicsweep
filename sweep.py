@@ -379,6 +379,8 @@ def handle_oracle(args):
         if getattr(args, "reload", False): c.append("--reload")
         if getattr(args, "max_rejects", None) is not None: c.extend(["--max-rejects", str(args.max_rejects)])
         if getattr(args, "fast_bulk", False): c.append("--fast-bulk")
+        if getattr(args, "chunk_rows", None) is not None: c.extend(["--chunk-rows", str(args.chunk_rows)])
+        if getattr(args, "chunk_min_mb", None) is not None: c.extend(["--chunk-min-mb", str(args.chunk_min_mb)])
         if getattr(args, "trigger_mode", None): c.extend(["--trigger-mode", args.trigger_mode])
         run_or_bg("oracle_06_load_data", c, getattr(args, "bg", False))
 
@@ -586,6 +588,8 @@ def main():
     o_load.add_argument("--reload", action="store_true", help="Force reloading/upserting files even if previously loaded")
     o_load.add_argument("--max-rejects", type=int, default=None, help="Fail a file when this many rows are rejected (default 0 = never fail; N = fail the file at N rejects)")
     o_load.add_argument("--fast-bulk", action="store_true", help="Direct COPY into empty constraint-free tables (no bad-row isolation)")
+    o_load.add_argument("--chunk-rows", type=int, default=None, help="Rows per chunk for staged loads of big files (default 2,000,000; 0 = never chunk)")
+    o_load.add_argument("--chunk-min-mb", type=float, default=None, help="Only files at least this big (compressed MB) are chunked (default 256)")
     o_load.add_argument("--trigger-mode", choices=["auto", "replica", "disable"], default=None, help="How triggers are switched off while loading")
     o_load.add_argument("--bg", action="store_true", help="Run in background daemon")
 

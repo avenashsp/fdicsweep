@@ -19,7 +19,7 @@ from pathlib import Path
 
 from sweep_platform import make_symlink, group_popen_kwargs, kill_process_group
 
-__version__ = "5.4.0"
+__version__ = "5.4.1"
 
 def get_next_version(current_ver: str) -> str:
     """
@@ -590,6 +590,70 @@ def run_psql_script(script_text, *, options=None, timeout=None, retries=CONNECT_
             attempt += 1
             continue
         return subprocess.CompletedProcess(args, proc.returncode, out, err)
+
+
+def run_psql_script_stream(segments, *, options=None, timeout=None, dbname=None):
+    """
+    Like run_psql_script, but the script is produced piece by piece by the iterator `segments` (str / bytes) while
+    psql is already running - used for chunked loads that feed the data rows through the script itself
+    (`\\copy ... FROM STDIN`). Pipe back-pressure keeps memory at one piece; psql processes a chunk before the
+    next one is read. If psql stops (error) or the iterator raises, the other side is stopped too and the
+    transaction rolls back. Not retried (part of the stream is consumed).
+
+    Returns subprocess.CompletedProcess (stdout/stderr text); `stderr` also carries a feeder error when there was one.
+    Raises RuntimeError only on timeout.
+    """
+    import threading
+    if not has_db_auth():
+        raise RuntimeError(AUTH_HELP)
+    timeout = LOAD_TIMEOUT if timeout is None else timeout
+    args = psql_base_args(dbname) + ["-v", "ON_ERROR_STOP=1", "-f", "-"]
+    proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            env=psql_env(options=options), **group_popen_kwargs())
+    out_buf, err_buf, feeder_error = [], [], []
+
+    def drain(stream, sink):
+        for chunk in iter(lambda: stream.read(65536), b""):
+            sink.append(chunk)
+
+    def feed():
+        try:
+            for seg in segments:
+                proc.stdin.write(seg.encode("utf-8") if isinstance(seg, str) else seg)
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass                                    # psql stopped; its own error is in stderr
+        except Exception as e:  # noqa: BLE001 - feeder failure (e.g. broken S3 stream): abort the transaction
+            feeder_error.append(str(e))
+            kill_process_group(proc)
+        finally:
+            close = getattr(segments, "close", None)
+            if close:
+                close()
+            try:
+                proc.stdin.close()
+            except (OSError, ValueError):
+                pass
+
+    threads = [threading.Thread(target=drain, args=(proc.stdout, out_buf), daemon=True),
+               threading.Thread(target=drain, args=(proc.stderr, err_buf), daemon=True),
+               threading.Thread(target=feed, daemon=True)]
+    for t in threads:
+        t.start()
+    try:
+        proc.wait(timeout=timeout or None)
+    except subprocess.TimeoutExpired:
+        kill_process_group(proc)
+        proc.wait()
+        raise RuntimeError(f"psql load timed out after {timeout}s")
+    for t in threads:
+        t.join(timeout=30)
+    out = b"".join(out_buf).decode("utf-8", "replace")
+    err = b"".join(err_buf).decode("utf-8", "replace")
+    if feeder_error:
+        err = (err + "\n" if err else "") + f"data feed failed: {feeder_error[0]}"
+    rc = proc.returncode if not feeder_error else (proc.returncode or 1)
+    return subprocess.CompletedProcess(args, rc, out, err)
 
 
 def run_psql(cmd_or_sql, is_file=False, capture=True, extra_env=None, tuples_only=False, unaligned=False,

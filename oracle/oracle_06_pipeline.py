@@ -34,7 +34,8 @@ from sweep_s3meta import meta_sql_values
 __all__ = [
     "MAX_DUP_ROWS_PRINTED", "MAX_REJECT_ROWS_PRINTED", "REJECT_TABLE", "REJECT_TABLE_DDL", "TEXT_TYPES", "_cmp",
     "ensure_reject_table", "load_table_meta", "parse_output", "persist_failed_file_rejects", "probe_trigger_mode", "upsert_statements",
-    "build_fast_script", "build_staged_script", "has_constraints", "load_log_insert", "load_table_meta", "plan_load",
+    "build_fast_script", "build_staged_script", "fast_bulk_blockers", "has_constraints", "staged_prologue", "staged_chunk",
+    "staged_epilogue", "copy_from_stdin", "load_log_insert", "load_table_meta", "plan_load",
 ]
 
 # -----------------------------------------------------------------------------
@@ -101,21 +102,40 @@ def build_fast_script(schema, table, header_cols, stream_cmd, meta, trigger_mode
         + on + log_sql + "\nCOMMIT;\n")
 
 
-def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trigger_mode, max_rejects, uri, log_sql):
+def staged_prologue(schema, table, header_cols, meta, trigger_mode):
+    """BEGIN, triggers off, temp tables (raw rows, counters, rejects)."""
+    off, _ = _trigger_off_on(schema, table, meta, trigger_mode)
+    raw_defs = ", ".join(f"{q(c)} text" for c in header_cols)
+    return ("\\set ON_ERROR_STOP on\n\\pset tuples_only on\n\\pset format unaligned\nBEGIN;\n" + off +
+            f"CREATE TEMP TABLE _raw (_row_no bigint GENERATED ALWAYS AS IDENTITY, {raw_defs}) ON COMMIT DROP;\n"
+            "CREATE TEMP TABLE _c (k text PRIMARY KEY, n bigint NOT NULL DEFAULT 0) ON COMMIT DROP;\n"
+            "CREATE TEMP TABLE _rej (row_no bigint, reason text, detail text, row_data jsonb) ON COMMIT DROP;\n")
+
+
+def copy_from_program(header_cols, stream_cmd):
+    col_list = ", ".join(q(c) for c in header_cols)
+    return f"\\copy _raw ({col_list}) FROM PROGRAM '{stream_cmd}' WITH (FORMAT csv, HEADER true, ENCODING 'UTF8');\n"
+
+
+def copy_from_stdin(header_cols):
+    """Chunked loads feed the rows through the script itself (the header line is skipped by the feeder)."""
+    col_list = ", ".join(q(c) for c in header_cols)
+    return f"\\copy _raw ({col_list}) FROM STDIN WITH (FORMAT csv, HEADER false, ENCODING 'UTF8');\n"
+
+
+def staged_chunk(schema, table, header_cols, meta, plan, max_rejects, ci=1):
+    """
+    Everything that happens to the rows currently in _raw (the whole file, or one chunk of it): validation, typed
+    staging, key / FK / alternate-key handling, upsert. Counters are written with the chunk number as suffix
+    (`raw|3`, `inserted|3`, ...) and summed at the end; _raw and _stg are emptied so the next chunk starts clean.
+    """
     tgt = f"{q(schema)}.{q(table)}"
     cols = meta["columns"]
-    off, on = _trigger_off_on(schema, table, meta, trigger_mode)
-    col_list = ", ".join(q(c) for c in header_cols)
-    raw_defs = ", ".join(f"{q(c)} text" for c in header_cols)
+    sfx = f"|{ci}"
     s = []
     add = s.append
-    add("\\set ON_ERROR_STOP on\n\\pset tuples_only on\n\\pset format unaligned\nBEGIN;\n")
-    add(off)
-    add(f"CREATE TEMP TABLE _raw (_row_no bigint GENERATED ALWAYS AS IDENTITY, {raw_defs}) ON COMMIT DROP;\n")
-    add(f"\\copy _raw ({col_list}) FROM PROGRAM '{stream_cmd}' WITH (FORMAT csv, HEADER true, ENCODING 'UTF8');\n")
-    add("CREATE TEMP TABLE _c (k text PRIMARY KEY, n bigint NOT NULL DEFAULT 0) ON COMMIT DROP;\n"
-        "CREATE TEMP TABLE _rej (row_no bigint, reason text, detail text, row_data jsonb) ON COMMIT DROP;\n"
-        "INSERT INTO _c SELECT 'raw', count(*) FROM _raw;\n")
+    add(f"INSERT INTO _c SELECT 'raw{sfx}', count(*) FROM _raw;\n"
+        f"INSERT INTO _c SELECT 'lo{sfx}', coalesce(min(_row_no), 0) FROM _raw;\n")
 
     # 1. malformed values (type / length) - one pass over the raw rows
     typed = [c for c in header_cols if not _is_text(cols[c]["type"])]
@@ -133,8 +153,7 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
                    else f"{q(c)}::{t} AS {q(c)}" if _is_text(t)
                    else f"NULLIF({q(c)}, '')::{t} AS {q(c)}")
     add(f"CREATE TEMP TABLE _stg ON COMMIT DROP AS SELECT _row_no, {', '.join(sel)} FROM _raw r "
-        "WHERE NOT EXISTS (SELECT 1 FROM _rej b WHERE b.row_no = r._row_no);\nDROP TABLE _raw;\n")
-
+        "WHERE NOT EXISTS (SELECT 1 FROM _rej b WHERE b.row_no = r._row_no);\nTRUNCATE _raw;\n")
     # 3. NOT NULL + CHECK in one pass
     tests = [f"CASE WHEN {q(c)} IS NULL THEN {lit('NOT_NULL:' + c)} END" for c in plan["not_null"]]
     tests += [f"CASE WHEN (({ck['expr']})) IS FALSE THEN {lit('CHECK:' + ck['name'])} END" for ck in plan["checks"]]
@@ -179,11 +198,14 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
                 f"FROM _stg s JOIN {tgt} t ON {join} WHERE {diff};\n")
         add("DELETE FROM _stg s WHERE EXISTS (SELECT 1 FROM _rej r WHERE r.row_no = s._row_no);\n")
 
-    # 7. report what was found (echoed to the client even if the file then fails), then the threshold
-    add("INSERT INTO _c SELECT 'rejected', count(*) FROM _rej WHERE reason <> 'DUP_IN_FILE';\n"
-        "INSERT INTO _c SELECT 'dup', count(*) FROM _rej WHERE reason = 'DUP_IN_FILE';\n"
-        "INSERT INTO _c SELECT 'staged', count(*) FROM _stg;\n"
-        "SELECT '@@COUNTS@@' || json_object_agg(k, n) FROM _c;\n"
+    # 7. report what was found (echoed to the client even if the file then fails), then the reject limit
+    add(f"INSERT INTO _c SELECT 'rejected{sfx}', count(*) FROM _rej WHERE reason <> 'DUP_IN_FILE' "
+        f"AND row_no >= (SELECT n FROM _c WHERE k = 'lo{sfx}');\n"
+        f"INSERT INTO _c SELECT 'dup{sfx}', count(*) FROM _rej WHERE reason = 'DUP_IN_FILE' "
+        f"AND row_no >= (SELECT n FROM _c WHERE k = 'lo{sfx}');\n"
+        f"INSERT INTO _c SELECT 'staged{sfx}', count(*) FROM _stg;\n")
+    add(COUNTS_ECHO +
+        "SELECT '@@REJ_BEGIN@@';\n"
         "SELECT '@@REJ_SUMMARY@@' || json_build_object('reason', reason, 'detail', detail, 'n', n) "
         "FROM (SELECT reason, detail, count(*) AS n FROM _rej GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 200) g;\n"
         "SELECT '@@REJ_ROW@@' || json_build_object('row_no', row_no, 'reason', reason, 'detail', detail, 'row', row_data) "
@@ -192,24 +214,35 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
         f"FROM (SELECT * FROM _rej WHERE reason = 'DUP_IN_FILE' ORDER BY row_no LIMIT {MAX_DUP_ROWS_PRINTED}) a;\n")
     if max_rejects and max_rejects > 0:
         add("DO $$ DECLARE n bigint; msg text; BEGIN "
-            "SELECT c.n INTO n FROM _c c WHERE c.k = 'rejected'; "
+            "SELECT coalesce(sum(c.n), 0) INTO n FROM _c c WHERE split_part(c.k, '|', 1) = 'rejected'; "
             f"IF n >= {int(max_rejects)} THEN "
             "SELECT string_agg('record ' || row_no || ' ' || reason || ' ' || coalesce(detail, ''), '; ') INTO msg "
             "FROM (SELECT * FROM _rej WHERE reason <> 'DUP_IN_FILE' ORDER BY row_no LIMIT 5) f; "
             f"RAISE EXCEPTION 'Too many rejected rows: % (limit {int(max_rejects)}). First: %', n, msg; END IF; END $$;\n")
 
     # 8. apply: INSERT ... ON CONFLICT on the arbiter key, updating only rows that differ
-    for stmt in upsert_statements(tgt, header_cols, cols, plan["arbiter"], plan["present"], plan["identity"]):
+    for stmt in upsert_statements(tgt, header_cols, cols, plan["arbiter"], plan["present"], plan["identity"], sfx=sfx):
         add(stmt)
+    add("DROP TABLE _stg;\n")
+    return "".join(s)
 
+
+COUNTS_ECHO = ("SELECT '@@COUNTS@@' || json_object_agg(kk, nn) FROM (SELECT split_part(k, '|', 1) AS kk, sum(n) AS nn "
+               "FROM _c WHERE split_part(k, '|', 1) <> 'lo' GROUP BY 1) x;\n")
+
+
+def staged_epilogue(schema, table, meta, trigger_mode, uri, log_sql):
+    """Row-count check over all chunks, rejects + load_log rows, triggers back on, COMMIT."""
+    _, on = _trigger_off_on(schema, table, meta, trigger_mode)
+    s = []
+    add = s.append
     # 9. nothing may disappear silently
     add("DO $$ DECLARE raw_n bigint; acc bigint; BEGIN "
-        "SELECT n INTO raw_n FROM _c WHERE k = 'raw'; "
-        "SELECT sum(n) INTO acc FROM _c WHERE k IN ('inserted', 'updated', 'unchanged', 'rejected', 'dup'); "
+        "SELECT sum(n) INTO raw_n FROM _c WHERE split_part(k, '|', 1) = 'raw'; "
+        "SELECT sum(n) INTO acc FROM _c WHERE split_part(k, '|', 1) IN ('inserted', 'updated', 'unchanged', 'rejected', 'dup'); "
         "IF raw_n IS DISTINCT FROM acc THEN RAISE EXCEPTION 'Row count check failed: % rows read but % accounted for "
-        "(inserted + updated + unchanged + rejected + duplicates)', raw_n, acc; END IF; END $$;\n"
-        "SELECT '@@COUNTS@@' || json_object_agg(k, n) FROM _c;\n")
-
+        "(inserted + updated + unchanged + rejected + duplicates)', raw_n, acc; END IF; END $$;\n")
+    add(COUNTS_ECHO)
     # 10. persist rejects + log, restore triggers, commit
     add(f"DELETE FROM {REJECT_TABLE} WHERE uri = {lit(uri)} AND target_schema = {lit(schema)} AND target_table = {lit(table)};\n"
         f"INSERT INTO {REJECT_TABLE} (uri, target_schema, target_table, row_no, reason, detail, row_data, file_status) "
@@ -219,6 +252,35 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
     add(on)
     add(log_sql + "\nCOMMIT;\n")
     return "".join(s)
+
+
+def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trigger_mode, max_rejects, uri, log_sql):
+    """Whole file in one pass (\\copy FROM PROGRAM) - one chunk."""
+    return (staged_prologue(schema, table, header_cols, meta, trigger_mode)
+            + copy_from_program(header_cols, stream_cmd)
+            + staged_chunk(schema, table, header_cols, meta, plan, max_rejects, 1)
+            + staged_epilogue(schema, table, meta, trigger_mode, uri, log_sql))
+
+
+def fast_bulk_blockers(meta, header_cols, table_is_empty):
+    """
+    Reasons why a table cannot take the direct-COPY path (empty list = it can). NOT NULL columns and identity
+    columns do NOT block it: COPY enforces NOT NULL itself (a violation fails the file) and identity columns are
+    GENERATED BY DEFAULT. Keys, CHECK and foreign keys need the staged path (duplicate handling, bad-row isolation).
+    """
+    why = []
+    if not table_is_empty:
+        why.append("table is not empty")
+    if meta["keys"]:
+        why.append("table has a primary / unique key (" + ", ".join(k["name"] for k in meta["keys"][:3]) + ")")
+    if meta["checks"]:
+        why.append("table has CHECK constraint(s) (" + ", ".join(c["name"] for c in meta["checks"][:3]) + ")")
+    if meta["fks"]:
+        why.append("table has foreign key(s) (" + ", ".join(f["name"] for f in meta["fks"][:3]) + ")")
+    always = [c for c in header_cols if meta["columns"][c]["identity"] == "a"]
+    if always:
+        why.append("file carries GENERATED ALWAYS identity column(s) (" + ", ".join(always) + ")")
+    return why
 
 
 def load_log_insert(uri, schema, table, size_bytes, file_format, worker_id, s3_meta=None):

@@ -7,8 +7,11 @@ report bad rows in sweep_ctl.load_rejects and reconcile the row counts. This mod
 identical: the reject table, trigger handling probe, output markers, and the "update only rows that differ" upsert.
 """
 import json
+import subprocess
+import tempfile
 
 from sweep_common import CTL_SCHEMA, lit, q, query_db_dicts, run_psql
+from sweep_platform import group_popen_kwargs, kill_process_group
 
 REJECT_TABLE = f"{CTL_SCHEMA}.load_rejects"
 MAX_REJECT_ROWS_PRINTED = 1000       # rejected rows echoed back per file (and stored when the file fails)
@@ -143,15 +146,24 @@ def upsert_statements(tgt, header_cols, cols, arbiter, present, identity, stg="_
 
 
 def parse_output(stdout):
-    """Counts (last @@COUNTS@@ wins), reject summary and sample rows echoed by the staged script."""
-    counts, summary, rows = {}, [], []
+    """
+    Counts (last @@COUNTS@@ wins), reject summary and sample rows echoed by the staged script. A chunked load echoes
+    after every chunk: @@REJ_BEGIN@@ starts a fresh (cumulative) summary and repeated sample rows are kept once.
+    """
+    counts, summary, rows, seen = {}, [], [], set()
     for line in (stdout or "").splitlines():
         if line.startswith("@@COUNTS@@"):
             counts = {k: int(v) for k, v in json.loads(line[10:]).items()}
+        elif line.startswith("@@REJ_BEGIN@@"):
+            summary = []
         elif line.startswith("@@REJ_SUMMARY@@"):
             summary.append(json.loads(line[15:]))
         elif line.startswith("@@REJ_ROW@@"):
-            rows.append(json.loads(line[11:]))
+            r = json.loads(line[11:])
+            key = (r.get("f"), r.get("row_no"), r.get("reason"), r.get("detail"))
+            if key not in seen:
+                seen.add(key)
+                rows.append(r)
     return counts, summary, rows
 
 
@@ -165,3 +177,82 @@ def persist_failed_file_rejects(uri, schema, table, rows):
     run_psql(f"DELETE FROM {REJECT_TABLE} WHERE uri = {lit(uri)} AND target_schema = {lit(schema)} AND target_table = {lit(table)};\n"
              f"INSERT INTO {REJECT_TABLE} (uri, target_schema, target_table, row_no, reason, detail, row_data, file_status) "
              f"VALUES {values};")
+
+
+# -----------------------------------------------------------------------------
+# Chunked loads: feed the file through the psql script in blocks of N records
+# -----------------------------------------------------------------------------
+def csv_chunks(stream, chunk_rows, flush_bytes=4 << 20):
+    """
+    Splits a CSV byte stream (header first) into chunks of `chunk_rows` records. Yields ("data", bytes) pieces and
+    ("end", records) when a chunk is complete. A record may span lines (quoted newlines): a line ends a record
+    only when the number of double quotes seen since the record started is even.
+    """
+    buf, size, rows, quotes, header_done = [], 0, 0, 0, False
+
+    def take():
+        nonlocal buf, size
+        data = b"".join(buf)
+        buf, size = [], 0
+        return data
+
+    for line in iter(stream.readline, b""):
+        quotes += line.count(b'"')
+        if header_done:
+            buf.append(line)
+            size += len(line)
+        if quotes & 1:                                     # inside a quoted field: the record continues
+            if size >= flush_bytes:
+                yield "data", take()
+            continue
+        quotes = 0
+        if not header_done:                                # the header record is not data
+            header_done = True
+            continue
+        rows += 1
+        if rows >= chunk_rows:
+            yield "data", take()
+            yield "end", rows
+            rows = 0
+        elif size >= flush_bytes:
+            yield "data", take()
+    if buf:
+        data = take()
+        yield "data", data if data.endswith(b"\n") else data + b"\n"
+    if rows or buf:
+        yield "end", rows
+
+
+def chunked_script(prologue, copy_stdin_sql, chunk_sql, epilogue, argv, chunk_rows, on_chunk=None):
+    """
+    Generator of script pieces for run_psql_script_stream: prologue, then for every chunk the \\copy command, its
+    rows, the end marker and the chunk's SQL, finally the epilogue. If the source stream fails, it raises (the
+    transaction rolls back and nothing is committed).
+    """
+    yield prologue
+    with tempfile.TemporaryFile() as errf:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=errf, **group_popen_kwargs())
+        try:
+            chunk, open_copy = 0, False
+            for kind, payload in csv_chunks(proc.stdout, chunk_rows):
+                if kind == "data":
+                    if not open_copy:
+                        yield copy_stdin_sql
+                        open_copy = True
+                    yield payload
+                else:
+                    chunk += 1
+                    yield "\\.\n"
+                    open_copy = False
+                    yield chunk_sql(chunk)
+                    if on_chunk:
+                        on_chunk(chunk, payload)
+            rc = proc.wait()
+            if rc != 0:
+                errf.seek(0)
+                raise RuntimeError(f"source stream failed (exit {rc}): {errf.read().decode('utf-8', 'replace').strip()[:500]}")
+        finally:
+            if proc.poll() is None:
+                kill_process_group(proc)
+                proc.wait()
+    yield epilogue

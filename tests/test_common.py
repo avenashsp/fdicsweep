@@ -6,7 +6,7 @@ import sweep_common as c
 
 
 def test_version_is_5_2_1():
-    assert c.__version__ == "5.4.0"
+    assert c.__version__ == "5.4.1"
 
 
 @pytest.mark.parametrize("line,expected", [
