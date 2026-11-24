@@ -299,3 +299,17 @@ def test_vsam_loads_write_history_and_step_7_checks_the_ledger(repo):
     q("DELETE FROM bss01104.stg_achfile_v WHERE account_number = 1001")
     r = subprocess.run([sys.executable, "-m", "vsam.vsam_07_validate"], cwd=repo_dir, env=env, capture_output=True, text=True, timeout=300)
     assert r.returncode != 0 and "LEDGER_MISMATCH bss01104.stg_achfile_v" in r.stdout + r.stderr
+
+
+def test_step_5_does_not_recreate_a_table_an_fe_file_dropped_and_reports_fe_changed(repo):
+    repo_dir, data, env = repo
+    write_snapshot(data, "20240101", "A", range(1, 4), "x", 2)
+    run_steps(repo_dir, env, STEPS[:5])
+    assert q("SELECT to_regclass('bcs.stg_bcsxref_rec_v') IS NOT NULL") == "t"
+    q("DROP TABLE bcs.stg_bcsxref_rec_v")
+    q("INSERT INTO sweep_ctl.fwd_ddl_changes (file_name, kind, action, schema_name, object_name) VALUES ('V9__drop.sql', 'table', 'dropped', 'bcs', 'stg_bcsxref_rec_v')")
+    r = subprocess.run([sys.executable, "-m", "vsam.vsam_05_apply_ddl"], cwd=repo_dir, env=env, capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0, r.stdout[-1500:] + r.stderr[-1500:]
+    assert "FE_CHANGED: bcs.stg_bcsxref_rec_v was dropped by V9__drop.sql; it is not recreated" in r.stdout + r.stderr
+    assert q("SELECT to_regclass('bcs.stg_bcsxref_rec_v') IS NULL") == "t"                         # not recreated
+    assert q("SELECT to_regclass('bss01104.stg_achfile_v') IS NOT NULL") == "t"                     # the others are untouched

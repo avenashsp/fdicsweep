@@ -59,3 +59,5 @@ package/
 # Per-layer environment files hold passwords (commit only the *.sample files)
 sweep.*.env
 !sweep.*.env.sample
+data_models/work/
+data_models/logs/

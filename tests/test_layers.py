@@ -184,6 +184,35 @@ def test_scan_models_drafts_vsam_reads_and_outputs_for_review(layers_file, tmp_p
     assert not (layers_dir / "silver_tables.csv").exists()                                         # nothing was applied to a manifest
 
 
+def test_scan_models_prefers_the_header_and_defaults_to_the_data_models_folder(layers_file, tmp_path, monkeypatch):
+    sl.write_manifest("bronze", [
+        {"track": "oracle", "schema": "bss01001", "table": "customer", "promote_mode": "upsert", "conflict_policy": "source_wins", "enabled": True},
+        {"track": "vsam", "schema": "bss01104", "table": "stg_ach_v", "promote_mode": "upsert", "conflict_policy": "source_wins", "enabled": True}])
+    models = tmp_path / "data_models"
+    models.mkdir()
+    # the SQL in the string says it reads customer and writes junk; the header is the truth
+    (models / "10_h.py").write_text('SWEEP_MODEL = {"name": "h", "inputs": ["bss01104.stg_ach_v"], "outputs": ["models.res"]}\n'
+                                    'SQL = "INSERT INTO junk.table_x SELECT * FROM bss01001.customer"\n')
+    (models / "20_old.py").write_text('SQL = "INSERT INTO models.res2 SELECT * FROM bss01104.stg_ach_v"\n')
+    monkeypatch.setenv("SWEEP_MODELS_DIR", str(models))
+    report, vsam_rows, out_rows = lc.scan_models()                                                  # no folder given: data_models/
+    assert report["scripts"]["10_h.py"] == {"source": "header", "reads": ["bss01104.stg_ach_v"], "writes": ["models.res"]}
+    assert report["scripts"]["20_old.py"]["source"] == "scan"
+    assert any(u["script"] == "20_old.py" and "no SWEEP_MODEL header" in u["problem"] for u in report["unparsed"])
+    assert {(r["schema"], r["table"]) for r in out_rows} == {("models", "res"), ("models", "res2")} and "junk" not in str(out_rows)
+    assert [(r["schema"], r["table"]) for r in vsam_rows] == [("bss01104", "stg_ach_v")]
+
+
+def test_a_model_output_that_is_also_a_loaded_table_is_reported_by_the_scan(layers_file, tmp_path):
+    sl.write_manifest("bronze", [{"track": "oracle", "schema": "bss01001", "table": "customer", "promote_mode": "upsert", "conflict_policy": "source_wins", "enabled": True}])
+    models = tmp_path / "m"
+    models.mkdir()
+    (models / "10_h.py").write_text('SWEEP_MODEL = {"name": "h", "inputs": [], "outputs": ["bss01001.customer", "models.ok"]}\n')
+    report, _, out_rows = lc.scan_models(models)
+    assert report["outputs_colliding_with_loaded_tables"] == ["bss01001.customer"]
+    assert {(r["schema"], r["table"]) for r in out_rows} == {("models", "ok")}
+
+
 def test_gold_must_be_selected_explicitly_never_by_default(layers_file, monkeypatch, grab):
     msgs = grab(sl.logger)
     monkeypatch.setenv("SWEEP_LAYER", "gold")

@@ -567,7 +567,8 @@ def cmd_promote(args):
         if not args.from_layer or not args.to_layer:
             return _layer_error(LayerError("--from and --to are required (promote moves data one hop, e.g. --from bronze --to silver)"))
         results, code = sp.promote(args.from_layer, args.to_layer, tables=tables or None, full=args.full, dry_run=args.dry_run,
-                                   workers=args.workers, transport=args.transport, ignore_pending_fwd=getattr(args, "ignore_pending_fwd", False))
+                                   workers=args.workers, transport=args.transport, ignore_pending_fwd=getattr(args, "ignore_pending_fwd", False),
+                                   ignore_model_status=getattr(args, "ignore_model_status", False))
         for r in results:
             print(f"{r['status']:<10} {r['table']:<50} inserted {r['inserted']:>9} updated {r['updated']:>9} unchanged {r['unchanged']:>9}"
                   + (f"  {r['message']}" if r["message"] else ""))
@@ -608,7 +609,9 @@ def cmd_chain(args):
     try:
         return sp.run_chain(until=args.until, load_cmds=load, workers=args.workers, transport=args.transport,
                             tables=[t for t in (args.tables or "").split(",") if t.strip()] or None, dry_run=args.dry_run,
-                            skip_models=args.skip_models, allow_ddl=args.allow_ddl)
+                            skip_models=args.skip_models, allow_ddl=args.allow_ddl,
+                            models_args={"models": [m for m in (args.models or "").split(",") if m.strip()] or None, "force": args.force_models,
+                                         "workers": 1})
     except LayerError as e:
         return _layer_error(e)
 
@@ -632,6 +635,19 @@ def cmd_migrate(args):
         return 0
     except (LayerError, RuntimeError) as e:
         return _layer_error(e)
+
+
+def cmd_models(args):
+    import sweep_models as sm
+    if args.models_cmd == "list":
+        return sm.models_list()
+    if args.models_cmd == "status":
+        return sm.models_status()
+    if args.models_cmd == "run":
+        return sm.run_models_cmd(models=args.models, with_deps=args.with_deps, full=args.full, force=args.force, workers=args.workers,
+                                 dry_run=args.dry_run, skip_promote_check=args.skip_promote_check)
+    print("Usage: python3 sweep.py models {list,run,status} ...")
+    return 2
 
 
 def cmd_validate(args):
@@ -753,6 +769,7 @@ def main():
     p_prom.add_argument("--status", action="store_true", help="Print the delta x layer status matrix and exit")
     p_prom.add_argument("--purge", action="store_true", help="Remove delta tables every layer applied (plus SWEEP_DELTA_RETENTION_DAYS) and exit")
     p_prom.add_argument("--ignore-pending-fwd", action="store_true", help="Promote data even when the target layer has pending FE (fwd-ddl) files")
+    p_prom.add_argument("--ignore-model-status", action="store_true", help="Promote model output tables even when their model has no SUCCESS on the current inputs")
     p_prom.add_argument("--limit", type=int, default=10, help="Deltas per table shown by --status (default 10)")
 
     p_chain = subparsers.add_parser("chain", help="Load bronze from S3, then promote silver -> gold_backup -> gold (stops at the first failure)")
@@ -764,6 +781,8 @@ def main():
     p_chain.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Parallel workers")
     p_chain.add_argument("--transport", choices=["auto", "program", "stream"], default=None)
     p_chain.add_argument("--tables", help="Comma-separated tables to promote")
+    p_chain.add_argument("--models", help="Comma-separated data models to run in the models stage (default all)")
+    p_chain.add_argument("--force-models", action="store_true", help="Run the selected models even when their inputs did not change")
     p_chain.add_argument("--dry-run", action="store_true", help="Dry-run the promote hops (the bronze load is skipped)")
 
     p_mig = subparsers.add_parser("migrate", help="Apply the versioned sweep_ctl migrations (idempotent, transactional)")
@@ -795,12 +814,25 @@ def main():
     p_val.add_argument("--exact", action="store_true", help="Exact counts / hash every row (default: a 1 percent sample of the keys)")
     p_val.add_argument("--tracks", default="oracle,vsam", help="Bronze only: tracks to validate (default: oracle,vsam)")
 
+    p_mod = subparsers.add_parser("models", help="Data models (data_models/*.py): list, run in silver, status")
+    m_sub = p_mod.add_subparsers(dest="models_cmd", help="models subcommands")
+    m_sub.add_parser("list", help="Models in run order with their inputs, outputs and dependencies")
+    m_run = m_sub.add_parser("run", help="Run the models that are due (never succeeded, or an input received a delta / FE change) in silver")
+    m_run.add_argument("--models", help="Comma-separated models to run (default all)")
+    m_run.add_argument("--with-deps", action="store_true", help="Also run the models the selected ones depend on")
+    m_run.add_argument("--full", action="store_true", help="Run in full mode (every input is read in full)")
+    m_run.add_argument("--force", action="store_true", help="Run even when nothing changed")
+    m_run.add_argument("--workers", type=int, default=1, help="Independent models run in parallel (default 1)")
+    m_run.add_argument("--dry-run", action="store_true", help="Check the preconditions and show what would run; start nothing")
+    m_run.add_argument("--skip-promote-check", action="store_true", help="Do not refuse because a bronze -> silver delta of an input is pending / failed")
+    m_sub.add_parser("status", help="Last run of every model and whether it is due (read-only)")
+
     p_lay = subparsers.add_parser("layers", help="Layer manifests, model scan, reconcile and checks")
     l_sub = p_lay.add_subparsers(dest="layers_cmd", help="layers subcommands")
     l_init = l_sub.add_parser("init-manifests", help="Draft layers/<layer>_tables.csv from the inventory (existing manifests are kept)")
     l_init.add_argument("--force", action="store_true", help="Replace existing manifests (a .bak is kept)")
-    l_scan = l_sub.add_parser("scan-models", help="Scan the data-model scripts and DRAFT the silver VSAM list and the output tables for review")
-    l_scan.add_argument("--models-dir", required=True, help="Folder with the data-model Python scripts (they are only read)")
+    l_scan = l_sub.add_parser("scan-models", help="Read the data models (SWEEP_MODEL headers) and DRAFT the silver VSAM list and the output tables for review")
+    l_scan.add_argument("--models-dir", default=None, help="Folder with the data-model Python scripts (default data_models/; they are only read)")
     l_rec = l_sub.add_parser("reconcile", help="Row counts + key hash of the tables of two layers (Excel report, exit code)")
     l_rec.add_argument("--from", dest="from_layer", required=True)
     l_rec.add_argument("--to", dest="to_layer", required=True)
@@ -985,6 +1017,8 @@ def main():
         sys.exit(cmd_layers(args))
     elif args.command == "validate":
         sys.exit(cmd_validate(args))
+    elif args.command == "models":
+        sys.exit(cmd_models(args))
     elif args.command == "oracle":
         handle_oracle(args)
     elif args.command == "vsam":

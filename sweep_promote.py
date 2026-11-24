@@ -492,7 +492,7 @@ def fwd_pending_between(src, tgt):
 
 
 def promote(from_layer, to_layer, tables=None, full=False, dry_run=False, workers=4, transport=None, force_full_without_delta=False,
-            ignore_pending_fwd=False):
+            ignore_pending_fwd=False, ignore_model_status=False):
     """
     Moves data one hop. Returns (results, exit_code). Tables are processed parent-first, level by level (all tables of a level
     finish before the next level starts, workers in parallel inside a level); every table is its own transaction.
@@ -507,6 +507,14 @@ def promote(from_layer, to_layer, tables=None, full=False, dry_run=False, worker
             raise LayerError(f"{tgt.name} has {len(pending)} pending FE file(s) that {src.name} already applied: {', '.join(pending[:5])}"
                              f"{' ...' if len(pending) > 5 else ''}. Run `python3 sweep.py fwd-ddl promote --from {src.name} --to {tgt.name}"
                              f"{' --allow-ddl' if not tgt.allow_ddl else ''}` first (--ignore-pending-fwd overrides).")
+    if not ignore_model_status and src.name == "silver" and any(r["track"] == "model_output" for r in rows):   # K10: a model output is promoted only after its model succeeded on the current inputs
+        import sweep_models
+        stale = sweep_models.stale_outputs(src)
+        blocked = [f"{r['schema']}.{r['table']}: {stale[r['schema'] + '.' + r['table']]}" for r in rows
+                   if r["track"] == "model_output" and f"{r['schema']}.{r['table']}" in stale]
+        if blocked:
+            raise LayerError("model output table(s) are not ready to promote: " + "; ".join(blocked)
+                             + ". Run `python3 sweep.py models run` (or pass --ignore-model-status).")
     sconn, tconn = layer_conn(src), layer_conn(tgt)
     if not same_credentials(sconn, tconn):
         raise LayerError("source and target layer must use the same host, port, user and password for the cross-database transfer "
@@ -735,7 +743,7 @@ def run_chain(until=None, load_cmds=None, workers=4, transport=None, tables=None
                 logger.error(f"chain stopped: fwd-ddl promote {src.name} -> {tgt.name} failed")
                 return EXIT_FAILED
         results, code = promote(src.name, tgt.name, tables=tables, dry_run=dry_run, workers=workers, transport=transport,
-                                ignore_pending_fwd=dry_run)
+                                ignore_pending_fwd=dry_run, ignore_model_status=skip_models or dry_run)
         if code != 0:
             logger.error(f"chain stopped at {tgt.name}: {src.name} -> {tgt.name} had failures (later layers are not touched)")
             return code
@@ -757,8 +765,5 @@ def run_chain(until=None, load_cmds=None, workers=4, transport=None, tables=None
 
 def _models_stage(models_args, dry_run):
     """Runs the data models in silver (K); 0 when there is nothing to run."""
-    try:
-        import sweep_models
-    except ImportError:
-        return 0
-    return sweep_models.run_models_cmd(**(models_args or {}), dry_run=dry_run)
+    import sweep_models
+    return sweep_models.run_models_cmd(**{**(models_args or {}), "dry_run": dry_run})

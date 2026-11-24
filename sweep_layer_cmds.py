@@ -90,8 +90,15 @@ def init_manifests(force=False):
         path = write_manifest(layer, rows, force=True)
         logger.info(f"Drafted {path}: {len(rows)} table(s)")
         result[name] = (path, rows)
+    try:                                           # the SWEEP_MODEL headers of data_models/ draft the silver VSAM tables and the model_output rows
+        from sweep_models import models_dir
+        if models_dir().is_dir() and any(models_dir().glob("*.py")):
+            scan_models(models_dir())
+    except LayerError as e:
+        logger.warning(f"data models not scanned: {e}")
     logger.info("Review the drafts: silver also needs the VSAM tables the data models read and the model output tables "
-                "(python3 sweep.py layers scan-models --models-dir <path>); gold_backup / gold need the model output tables.")
+                "(layers/silver_vsam_tables.draft.csv, layers/model_output_tables.draft.csv from the data_models/ headers); "
+                "gold_backup / gold need the model output tables.")
     return result
 
 
@@ -159,37 +166,49 @@ def scan_text(text):
     return {(s, t) for s, t in reads if ok(s, t)}, {(s, t) for s, t in writes if ok(s, t)}
 
 
-def scan_models(models_dir, write=True):
+def scan_models(models_dir=None, write=True):
     """
-    Reads the data-model Python scripts under `models_dir` (SQL inside strings) and drafts, for HUMAN review:
+    Reads the data-model Python scripts (default: data_models/) and drafts, for HUMAN review. A script with a SWEEP_MODEL header is
+    described by its header (inputs / outputs); only a script without one falls back to scanning the SQL inside its strings:
       layers/models_scan.json                  what every script reads and writes
       layers/silver_vsam_tables.draft.csv      VSAM tables the models read (candidates for the silver manifest)
       layers/model_output_tables.draft.csv     tables the models write (candidates for the model_output rows)
     Nothing is applied to a manifest. The scripts are never run or changed.
     """
-    models_dir = Path(models_dir)
+    from sweep_models import ModelError, models_dir as default_models_dir, parse_header
+    models_dir = Path(models_dir) if models_dir else default_models_dir()
     if not models_dir.is_dir():
         raise LayerError(f"models directory {models_dir} not found")
-    scripts = sorted(p for p in models_dir.rglob("*.py") if p.is_file())
+    scripts = sorted(p for p in models_dir.rglob("*.py") if p.is_file() and "work" not in p.relative_to(models_dir).parts)
     if not scripts:
         raise LayerError(f"no Python scripts under {models_dir}")
     detail, reads_by, writes_by, unparsed = {}, defaultdict(set), defaultdict(set), []
     for path in scripts:
         rel = str(path.relative_to(models_dir))
         try:
-            strings, calls = sql_strings(path.read_text(encoding="utf-8", errors="replace"))
-        except SyntaxError as e:
-            unparsed.append({"script": rel, "problem": f"syntax error: {e}"})
+            header = parse_header(path)
+        except ModelError as e:
+            unparsed.append({"script": rel, "problem": str(e)})
             continue
-        reads, writes = set(), set()
-        for _, text in strings:
-            r, w = scan_text(text)
-            reads |= r
-            writes |= w
-        for _, fn, schema, name in calls:
-            (writes if fn == "to_sql" else reads).add((schema.lower(), name.lower()))
-        reads -= writes                           # a table a script writes and then reads is its own working table
-        detail[rel] = {"reads": sorted(f"{s}.{t}" if s else t for s, t in reads), "writes": sorted(f"{s}.{t}" if s else t for s, t in writes)}
+        if header is not None:                    # the header is the truth: no guessing from SQL strings
+            split = lambda names: {tuple(n.strip().lower().split(".", 1)) for n in (names or []) if "." in n}
+            reads, writes, how = split(header.get("inputs")), split(header.get("outputs")), "header"
+        else:
+            try:
+                strings, calls = sql_strings(path.read_text(encoding="utf-8", errors="replace"))
+            except SyntaxError as e:
+                unparsed.append({"script": rel, "problem": f"syntax error: {e}"})
+                continue
+            reads, writes, how = set(), set(), "scan"
+            for _, text in strings:
+                r, w = scan_text(text)
+                reads |= r
+                writes |= w
+            for _, fn, schema, name in calls:
+                (writes if fn == "to_sql" else reads).add((schema.lower(), name.lower()))
+            reads -= writes                       # a table a script writes and then reads is its own working table
+            unparsed.append({"script": rel, "problem": "no SWEEP_MODEL header: inputs / outputs guessed from the SQL strings (add a header)"})
+        detail[rel] = {"source": how, "reads": sorted(f"{s}.{t}" if s else t for s, t in reads), "writes": sorted(f"{s}.{t}" if s else t for s, t in writes)}
         for k in reads:
             reads_by[k].add(rel)
         for k in writes:
@@ -204,6 +223,7 @@ def scan_models(models_dir, write=True):
     oracle_known = {(r["schema"], r["table"]) for r in bronze_rows if r["track"] == "oracle"}
     oracle_names = {t for _, t in oracle_known}
     outputs = {k for k in writes_by if not (k in oracle_known or (not k[0] and k[1] in oracle_names))}
+    colliding = sorted(f"{s}.{t}" if s else t for (s, t) in writes_by if (s, t) in oracle_known or (s, t) in vsam_known)
 
     vsam_hits, ambiguous = {}, []
     for (s, t), scripts_ in reads_by.items():
@@ -218,7 +238,7 @@ def scan_models(models_dir, write=True):
                 ambiguous.append(f"{t}: read without a schema, exists in {', '.join(sorted(vsam_by_name[t]))} (all drafted)")
 
     root = _root() / "layers"
-    report = {"models_dir": str(models_dir), "scripts": detail, "unparsed": unparsed, "ambiguous": ambiguous,
+    report = {"models_dir": str(models_dir), "scripts": detail, "unparsed": unparsed, "ambiguous": ambiguous, "outputs_colliding_with_loaded_tables": colliding,
               "vsam_read": {f"{s}.{t}": sorted(v) for (s, t), v in sorted(vsam_hits.items())},
               "outputs_written": {f"{s}.{t}" if s else t: sorted(v) for (s, t), v in sorted(writes_by.items()) if (s, t) in outputs},
               "note": "DRAFTS for human review - nothing here is applied to a manifest"}
