@@ -30,7 +30,8 @@ import sweep_common as c
 from sweep_common import CTL_SCHEMA, clip_error, get_logger, lit, psql_base_args, psql_env, q, query_db_dicts, run_psql, run_psql_script
 from sweep_delta import REGISTRY, TOOL_AUDIT_COLS, ensure_delta_table
 from sweep_layers import (LayerError, chain, get_layer, layer_conn, read_manifest, same_credentials, use_layer, validate_manifest_rows)
-from sweep_loadpipe import (ensure_reject_table, load_table_meta, parse_output, persist_failed_file_rejects, probe_trigger_mode)
+from sweep_loadpipe import (ensure_reject_table, history_insert_sql, load_table_meta, parse_output, persist_failed_file_rejects,
+                            probe_trigger_mode, record_history_failure)
 from sweep_merge import current_run_id
 from sweep_s3meta import canon_time
 from sweep_platform import group_popen_kwargs, kill_process_group
@@ -313,6 +314,10 @@ def apply_one(src, tgt, mrow, delta, opts, meta_cache):
                f"{lit(schema)}, {lit(table)}, {lit(track)}, {'NULL' if seq is None else int(seq)}, {lit(mode)}, "
                f"(SELECT n FROM _c WHERE k = 'inserted'), (SELECT n FROM _c WHERE k = 'updated'), (SELECT n FROM _c WHERE k = 'unchanged'), "
                f"(SELECT n FROM _c WHERE k = 'rejected'), 'SUCCESS', now());")
+    _c = lambda k: f"(SELECT n FROM _c WHERE k = '{k}')"
+    log_sql += "\n" + history_insert_sql(track, tgt.name, "promote", opts["run_id"], uri, schema, table,
+                                         read=_c("raw"), inserted=_c("inserted"), updated=_c("updated"), unchanged=_c("unchanged"),
+                                         rejected=_c("rejected"), dup=_c("dup"), reset=replace)
     argv = source_argv(layer_conn(src), source_copy_sql(header_cols, schema, table, seq, delta["delta_table"]))
     transport = opts["transport"]
     if transport == "stream":
@@ -395,6 +400,10 @@ def record_failure(src, tgt, mrow, delta, message, opts):
                  f"{lit(mrow['promote_mode'])}, 'FAILED', {lit(message)}, now());")
     except RuntimeError as e:
         logger.error(f"could not record the failure of {mrow['schema']}.{mrow['table']}: {e}")
+    seq = delta.get("seq")
+    record_history_failure(mrow["track"], tgt.name, "promote", opts["run_id"],
+                           f"promote://{src.name}/{mrow['schema']}.{mrow['table']}#{seq if seq is not None else 'full'}",
+                           mrow["schema"], mrow["table"], message)
 
 
 def promote_table(src, tgt, mrow, opts, meta_cache):

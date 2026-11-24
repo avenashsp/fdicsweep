@@ -38,6 +38,7 @@ import pandas as pd
 
 from sweep_common import (
     VSAM_LOAD_LOG_TABLE,
+    LAYER,
     DEFAULT_WORKERS,
     check_postgres_version,
     VSAM_LOGS_DIR,
@@ -63,7 +64,8 @@ from sweep_fwd_ddl import load_fe_changes
 from sweep_fwd_rules import load_rules, resolve_columns, rules_for
 from sweep_merge import current_run_id
 from sweep_migrate import require_migrated
-from sweep_loadpipe import REJECT_TABLE, ensure_reject_table, load_table_meta, parse_output, probe_trigger_mode, tables_with_rows
+from sweep_loadpipe import (REJECT_TABLE, ensure_reject_table, load_table_meta, parse_output, probe_trigger_mode,
+                            record_history_failure, tables_with_rows)
 from sweep_platform import atomic_write_json
 from sweep_s3meta import classify_loaded, head_many, make_meta, meta_from_row
 from sweep_streaming import stream_program_literal
@@ -504,7 +506,7 @@ def run_unit(table, specs, worker_id, run, tg_prof):
         route = [(k, v) for k, v in get_active_schemas_map().items()]
         unit = {"table": table, "files": specs, "dests": info["dests"], "cols": info["cols"], "arbiter": info["arbiter"],
                 "route": route, "max_rejects": run["max_rejects"], "replica": run["replica"], "encoding": PG_ENCODING,
-                "capture": run.get("capture")}
+                "capture": run.get("capture"), "layer": LAYER or "bronze", "run_id": current_run_id()}
         if run.get("capture") and info["arbiter"] and len(specs) == 1:      # applied rows are captured for `promote`
             for d in info["dests"]:
                 ensure_delta_table(d, table)
@@ -548,6 +550,8 @@ def run_unit(table, specs, worker_id, run, tg_prof):
                     f"ON CONFLICT (uri, target_schema) DO UPDATE SET status='FAILED', message={lit(err)}, loaded_at=now();")
             except RuntimeError as log_err:
                 logger.error(f"[Worker {worker_id}] Could not record FAILED status for {s['name']}: {log_err}")
+            record_history_failure("vsam", LAYER or "bronze", "s3", current_run_id(), s["uri"],
+                                   (info["dests"][0] if info and info.get("dests") else "bcs"), table, err)
         return _failed_results(specs, err, sec, worker_id, info)
     finally:
         record_stream_end(worker_id)

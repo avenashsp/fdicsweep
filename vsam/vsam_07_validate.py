@@ -30,6 +30,8 @@ from sweep_common import (
 )
 from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
 from sweep_layers import add_layer_arg, ensure_layer
+from sweep_fwd_ddl import load_fe_changes
+from sweep_validate import FE_STATUSES, LEDGER_MISMATCH, FeLog, ledger_check
 from vsam.common_colmap import effective_columns_meta
 from vsam.vsam_common import OUT, load_csv_safe, read_json
 
@@ -327,6 +329,46 @@ def main():
         })
 
     # ===========================================================================
+    # FE overlay (I3) and ledger (I2)
+    # ===========================================================================
+    fe = load_fe_changes()
+    felog = FeLog(fe)
+    for r in row_count_rows:
+        if r["status"] == "TABLE_MISSING" and felog.table(r["schema"], r["table"], "MISSING_IN_PG"):
+            r["status"] = "FE_DROPPED"
+    for r in col_audit_rows:
+        if r["status"] == "MISSING":
+            st = felog.column(r["schema"], r["table"], r["copybook_col"], "MISSING_IN_PG")
+            if st:
+                r["status"] = st
+    for r in type_audit_rows:
+        if r["match"] == "FAIL" and r.get("actual_type") == "COLUMN_MISSING":
+            st = felog.column(r["schema"], r["table"], r["column"], "MISSING_IN_PG")
+        elif r["match"] == "MISMATCH":
+            st = felog.column(r["schema"], r["table"], r["column"], "TYPE_MISMATCH")
+        else:
+            st = ""
+        if st:
+            r["match"] = st
+    for r in pk_audit_rows:
+        if r["match"] not in ("OK", "ACTIVE_PK") and fe.table_touched(r["schema"], r["table"]):
+            felog.add("FE_CHANGED", r["schema"], r["table"], file=fe.changed_tables[(r["schema"], r["table"])], was=r["match"],
+                      detail="keys changed by an applied FE file")
+            r["match"] = "FE_CHANGED"
+    for r in recon:
+        if r["load_status"] == "NOT_LOADED" and fe.table_dropped(r["schema"], r["table"]):
+            r["load_status"] = "FE_DROPPED"
+    ledger = ledger_check(None, sel if sel.table_selectors else None, fe)
+    by_table = {(r["schema"], r["table"]): r for r in row_count_rows}
+    for lr in ledger:
+        row = by_table.get((lr["target_schema"], lr["target_table"]))
+        if row is not None:
+            row.update(ledger_rows=lr["ledger_rows"], ledger_actual=lr["actual_rows"], ledger_status=lr["ledger_status"], ledger_note=lr["note"])
+    ledger_bad = [lr for lr in ledger if lr["ledger_status"] == LEDGER_MISMATCH]
+    for lr in ledger_bad:
+        logger.warning(f"LEDGER_MISMATCH {lr['target_schema']}.{lr['target_table']}: ledger {lr['ledger_rows']} rows, table {lr['actual_rows']} ({lr['note']})")
+
+    # ===========================================================================
     # Excel Report
     # ===========================================================================
     ts = get_timestamp()
@@ -337,15 +379,17 @@ def main():
         "RowCounts": row_count_rows,
         "ColumnAudit": col_audit_rows,
         "TypeAudit": type_audit_rows,
-        "PKAudit": pk_audit_rows
+        "PKAudit": pk_audit_rows,
+        "Ledger": ledger or [{"ledger_status": "no load_history rows"}],
+        "FE_Changes": felog.sheet(),
     })
 
     logger.info("Validation Complete.")
     logger.info(f"Excel Report: {report_file}")
 
-    missing_cols = sum(1 for r in col_audit_rows if r["status"] != "OK")
-    type_mismatches = sum(1 for r in type_audit_rows if r["match"] != "OK")
-    pk_issues = sum(1 for r in pk_audit_rows if r["match"] != "OK")
+    missing_cols = sum(1 for r in col_audit_rows if r["status"] not in ("OK",) + FE_STATUSES)
+    type_mismatches = sum(1 for r in type_audit_rows if r["match"] not in ("OK",) + FE_STATUSES)
+    pk_issues = sum(1 for r in pk_audit_rows if r["match"] not in ("OK", "ACTIVE_PK") + FE_STATUSES)
     not_loaded = sum(1 for r in recon if r["load_status"] == "NOT_LOADED")
 
     log_summary(logger, Path(__file__).name, [
@@ -356,10 +400,12 @@ def main():
         ('missing columns', missing_cols),
         ('type mismatches', type_mismatches),
         ('PK issues', pk_issues),
+        ('ledger mismatches', len(ledger_bad)),
+        ('differences explained by FE files', len(felog.rows)),
     ])
 
     # Parity verdict: every mapped file loaded, no missing columns, no type mismatches.
-    return not_loaded == 0 and missing_cols == 0 and type_mismatches == 0
+    return not_loaded == 0 and missing_cols == 0 and type_mismatches == 0 and not ledger_bad
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ import sweep
 import sweep_common as c
 import sweep_layers as sl
 import sweep_reconcile as rc
-from chain_support import LAYERS, day1, psql, rows
+from chain_support import DELTA1, LAYERS, day1, psql, rows
 
 pytestmark = pytest.mark.integration
 
@@ -29,16 +29,66 @@ def test_reconcile_matches_when_layers_agree_and_flags_a_difference(chain_env, c
         rc.reconcile_cmd("bronze", "silver", tables=["app.nosuch"])
 
 
-def test_reconcile_on_gold_is_informational_and_audit_columns_are_ignored(chain_env, capsys, monkeypatch):
+def test_gold_is_a_superset_check_application_changes_pass_and_a_removed_key_fails(chain_env, capsys, monkeypatch):
     env = chain_env
     monkeypatch.setattr(rc, "ORACLE_REPORTS_DIR", env.tmp / "reports")
     day1(env)
-    psql(env.dbs["gold"], "UPDATE app.customer SET name = 'application change' WHERE id = 1")     # the application works in gold
-    assert rc.reconcile_cmd("gold_backup", "gold", exact=True) == 0                              # informational: exit code stays 0
-    assert "informational" in capsys.readouterr().out
+    psql(env.dbs["gold"], "UPDATE app.customer SET name = 'application change' WHERE id = 1; INSERT INTO app.customer VALUES (9, 'app', 1)")
+    assert rc.reconcile_cmd("gold_backup", "gold", exact=True) == 0                 # changed values and extra rows are fine
+    capsys.readouterr()
+    psql(env.dbs["gold"], "DELETE FROM app.customer WHERE id = 2")
+    assert rc.reconcile_cmd("gold_backup", "gold", exact=True) == 1                 # a key of gold_backup is gone (and one row fewer is masked by the extra row)
+    out = capsys.readouterr().out
+    assert "MISMATCH" in out and "key(s) of gold_backup missing in gold" in out
     psql(env.dbs["silver"], "ALTER TABLE app.customer ADD COLUMN createddate_m timestamp DEFAULT now()")
-    assert rc.reconcile_cmd("bronze", "silver", exact=True) == 0                                   # tool audit columns are not compared
-    assert len(list((env.tmp / "reports").glob("*layers_reconcile*.xlsx"))) >= 2                    # an Excel report per run
+    assert rc.reconcile_cmd("bronze", "silver", exact=True) == 0                    # tool audit columns are not compared
+    assert len(list((env.tmp / "reports").glob("*layers_reconcile*.xlsx"))) >= 2     # an Excel report per run
+
+
+def test_reconcile_compares_only_same_type_columns_and_reports_type_differences(chain_env, capsys, monkeypatch):
+    env = chain_env
+    monkeypatch.setattr(rc, "ORACLE_REPORTS_DIR", env.tmp / "reports")
+    day1(env)
+    psql(env.dbs["silver"], "ALTER TABLE app.customer ALTER COLUMN qty TYPE bigint")
+    assert rc.reconcile_cmd("bronze", "silver", exact=True) == 1                    # not hidden: unexplained type difference
+    out = capsys.readouterr().out
+    assert "TYPE_DIFFERENCE" in out and "qty" in out
+    # an applied FE file that changed the column explains it: FE_CHANGED counts as PASS and is listed in FE_Changes
+    psql(env.dbs["silver"], "INSERT INTO sweep_ctl.fwd_ddl_changes (file_name, kind, action, schema_name, object_name) "
+                            "VALUES ('V5__qty.sql', 'column', 'changed', 'app', 'customer.qty')")
+    assert rc.reconcile_cmd("bronze", "silver", exact=True) == 0
+    assert "FE_CHANGED" in capsys.readouterr().out
+    import openpyxl
+    wb = openpyxl.load_workbook(sorted((env.tmp / "reports").glob("*layers_reconcile_bronze_to_silver*.xlsx"))[-1])
+    assert "FE_Changes" in wb.sheetnames
+    sheet = [[c.value for c in r] for r in wb["FE_Changes"].iter_rows()]
+    assert any("V5__qty.sql" in r for r in sheet)
+
+
+def test_reconcile_a_table_dropped_by_an_fe_file_is_fe_dropped_not_an_error(chain_env, capsys, monkeypatch):
+    env = chain_env
+    monkeypatch.setattr(rc, "ORACLE_REPORTS_DIR", env.tmp / "reports")
+    day1(env)
+    psql(env.dbs["silver"], "DROP TABLE app.customer")
+    assert rc.reconcile_cmd("bronze", "silver") == 1
+    assert "ERROR" in capsys.readouterr().out
+    psql(env.dbs["silver"], "INSERT INTO sweep_ctl.fwd_ddl_changes (file_name, kind, action, schema_name, object_name) "
+                            "VALUES ('V6__drop.sql', 'table', 'dropped', 'app', 'customer')")
+    assert rc.reconcile_cmd("bronze", "silver") == 0
+    assert "FE_DROPPED" in capsys.readouterr().out
+
+
+def test_vsam_tables_are_enforced_in_silver_and_informational_in_gold_backup(chain_env, capsys, monkeypatch):
+    env = chain_env
+    monkeypatch.setattr(rc, "ORACLE_REPORTS_DIR", env.tmp / "reports")
+    env.everywhere("CREATE SCHEMA bcs; CREATE TABLE bcs.v (a int PRIMARY KEY);")
+    for l in ("bronze", "silver", "gold_backup"):
+        env.manifest(l, [{"schema": "bcs", "table": "v", "track": "vsam"}])
+    psql(env.dbs["bronze"], "INSERT INTO bcs.v VALUES (1), (2)")
+    assert rc.reconcile_cmd("bronze", "silver", exact=True) == 1                    # silver must equal bronze
+    psql(env.dbs["silver"], "INSERT INTO bcs.v VALUES (1)")
+    assert rc.reconcile_cmd("silver", "gold_backup", exact=True) == 0               # informational there
+    assert "informational" in capsys.readouterr().out
 
 
 def test_layers_check_reports_every_layer_and_fails_when_a_layer_is_not_migrated(chain_env, capsys):
@@ -121,3 +171,51 @@ def test_gold_refuses_ddl_steps_without_allow_ddl_and_stays_inside_its_manifest(
     assert r.returncode != 3                                                                       # the guard accepts the right database
     r = subprocess.run([sys.executable, "-m", "oracle.oracle_08_validate", "--dry-run"], cwd=c.BASE_DIR, env=envvars, capture_output=True, text=True)
     assert r.returncode == 2 and "--layer is required" in (r.stdout + r.stderr)
+
+
+def test_validate_gives_one_report_and_a_verdict_per_layer_with_fe_differences_explained(chain_env, capsys, monkeypatch):
+    env = chain_env
+    monkeypatch.setattr(rc, "ORACLE_REPORTS_DIR", env.tmp / "reports")
+    day1(env)
+    assert rc.validate_layer_cmd("silver") == 0
+    out = capsys.readouterr().out
+    assert "VERDICT silver" in out and "PASS" in out and "schema comparison with bronze" in out
+    psql(env.dbs["silver"], "ALTER TABLE app.customer DROP COLUMN qty")
+    assert rc.validate_layer_cmd("silver") == 1                                    # column missing: not explained
+    assert "FAIL" in capsys.readouterr().out
+    psql(env.dbs["silver"], "INSERT INTO sweep_ctl.fwd_ddl_changes (file_name, kind, action, schema_name, object_name) "
+                            "VALUES ('V7__qty.sql', 'column', 'dropped', 'app', 'customer.qty')")
+    assert rc.validate_layer_cmd("silver") == 0                                    # explained by an applied FE file
+    reports = sorted((env.tmp / "reports").glob("*_validate_silver_*.xlsx"))
+    import openpyxl
+    wb = openpyxl.load_workbook(reports[-1])
+    assert {"Summary", "Reconcile", "Schema", "Ledger", "FE_Changes"} <= set(wb.sheetnames)
+    assert any("V7__qty.sql" in [c.value for c in r] for r in wb["FE_Changes"].iter_rows())
+    assert rc.validate_layer_cmd("gold") == 0                                      # superset check for gold
+
+
+def test_monitor_header_has_the_layer_database_last_promote_and_pending_fe_files(chain_env):
+    from sweep_dashboard import render_dashboard
+    env = chain_env
+    day1(env)
+    assert "last promote: none" in render_dashboard(use_color=False, layer=sl.get_layer("silver"))
+    env.bronze_load(DELTA1)
+    assert env.promote("bronze", "silver")[1] == 0
+    text = render_dashboard(use_color=False, layer=sl.get_layer("silver"))
+    assert f"LAYER: silver    DATABASE: {env.dbs['silver']}" in text
+    assert "last promote: bronze>silver" in text and "1 table(s)  +1 inserted  ~1 updated  0 failed" in text
+    assert "pending FE files: 0" in text
+    assert "LAYER:" not in render_dashboard(use_color=False)                       # without --layer the dashboard is unchanged
+
+
+def test_layers_check_does_not_call_an_fe_dropped_column_drift(chain_env, capsys):
+    env = chain_env
+    day1(env)
+    psql(env.dbs["silver"], "ALTER TABLE app.customer DROP COLUMN qty")
+    rc.check_cmd("silver")
+    assert "lack source columns" in capsys.readouterr().out
+    psql(env.dbs["silver"], "INSERT INTO sweep_ctl.fwd_ddl_changes (file_name, kind, action, schema_name, object_name) "
+                            "VALUES ('V7__qty.sql', 'column', 'dropped', 'app', 'customer.qty')")
+    rc.check_cmd("silver")
+    out = capsys.readouterr().out
+    assert "schema drift vs bronze: none" in out

@@ -210,3 +210,43 @@ def persist_failed_file_rejects(uri, schema, table, rows, track="oracle"):
     run_psql(f"DELETE FROM {REJECT_TABLE} WHERE uri = {lit(uri)} AND target_schema = {lit(schema)} AND target_table = {lit(table)};\n"
              f"INSERT INTO {REJECT_TABLE} (track, uri, target_schema, target_table, row_no, reason, detail, row_data, file_status) "
              f"VALUES {values};")
+
+
+# -----------------------------------------------------------------------------
+# load_history: the append-only ledger of every load attempt (migration 2)
+# -----------------------------------------------------------------------------
+HISTORY_TABLE = f"{CTL_SCHEMA}.load_history"
+
+
+def history_insert_sql(track, layer, source, run_id, uri, schema, table, *, read, inserted, updated, unchanged, rejected, dup,
+                       s3_meta=None, reset=False, status="SUCCESS", message=None, count_target=None, where="true"):
+    """
+    One load_history row. The counts are SQL scalar expressions evaluated INSIDE the load transaction, so the row exists only if
+    the data does. rows_before (the ledger baseline) is stored on the first row of a table - the rows it already held - or as 0 when
+    the load replaced the table (`reset`).
+    """
+    from sweep_s3meta import meta_sql_values
+    tgt = f"{q(schema)}.{q(table)}"
+    lm, etag, size = meta_sql_values(s3_meta)
+    ins = f"COALESCE({inserted}, 0)"
+    if reset:
+        before = "0"
+    else:
+        before = (f"CASE WHEN NOT EXISTS (SELECT 1 FROM {HISTORY_TABLE} h WHERE h.target_schema = {lit(schema)} "
+                  f"AND h.target_table = {lit(table)} AND h.status = 'SUCCESS') THEN (SELECT count(*) FROM {count_target or tgt}) - {ins} END")
+    n = lambda e: f"COALESCE({e}, 0)"
+    return (f"INSERT INTO {HISTORY_TABLE} (run_id, track, layer, source, uri, target_schema, target_table, status, rows_read, "
+            f"rows_inserted, rows_updated, rows_unchanged, rows_rejected, rows_duplicates, rows_before, s3_last_modified, s3_etag, "
+            f"s3_size, message, started_at, finished_at) SELECT {lit(run_id)}, {lit(track)}, {lit(layer)}, {lit(source)}, {lit(uri)}, "
+            f"{lit(schema)}, {lit(table)}, {lit(status)}, {n(read)}, {ins}, {n(updated)}, {n(unchanged)}, {n(rejected)}, {n(dup)}, "
+            f"{before}, {lm}, {etag}, {size}, {lit(message) if message else 'NULL'}, NULL, now() WHERE {where};\n")
+
+
+def record_history_failure(track, layer, source, run_id, uri, schema, table, message, read=0):
+    """FAILED row (autocommit): the data transaction rolled back, the attempt stays on record. Never raises."""
+    try:
+        run_psql(f"INSERT INTO {HISTORY_TABLE} (run_id, track, layer, source, uri, target_schema, target_table, status, rows_read, "
+                 f"message, finished_at) VALUES ({lit(run_id)}, {lit(track)}, {lit(layer)}, {lit(source)}, {lit(uri)}, {lit(schema)}, "
+                 f"{lit(table)}, 'FAILED', {int(read or 0)}, {lit(str(message)[:2000])}, now());")
+    except Exception:       # noqa: BLE001 - the failure itself is already reported; a lost history row must not hide it
+        pass

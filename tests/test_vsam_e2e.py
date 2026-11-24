@@ -274,3 +274,28 @@ def test_a_copybook_key_that_cannot_be_applied_is_an_error(repo):
     assert r.returncode != 0
     assert q("SELECT count(*) FROM bss01104.stg_achfile_v") == "0"
     assert "cannot be applied" in r.stdout + r.stderr
+
+
+def test_vsam_loads_write_history_and_step_7_checks_the_ledger(repo):
+    from sweep_validate import ledger_check
+    repo_dir, data, env = repo
+    write_snapshot(data, "20240101", "A", range(1, 11), "x", 5)
+    run_steps(repo_dir, env, STEPS[:6])
+    assert q("SELECT string_agg(DISTINCT track || ':' || status || ':' || source, ',') FROM sweep_ctl.load_history") == "vsam:SUCCESS:s3"
+    assert q("SELECT sum(rows_inserted) FROM sweep_ctl.load_history WHERE target_table = 'stg_achfile_v'") == "10"
+    assert q("SELECT sum(rows_inserted) FROM sweep_ctl.load_history WHERE target_table = 'stg_bcsxref_rec_v'") == "5"
+    assert {(r["target_table"], r["ledger_status"]) for r in ledger_check()} == {("stg_achfile_v", "LEDGER_MATCH"), ("stg_bcsxref_rec_v", "LEDGER_MATCH")}
+    # a newer keyless snapshot replaces the old one: the ledger is the latest snapshot only
+    for f in data.glob("*BCSXREF*"):
+        f.unlink()
+    write_csv(data / "FDICSWP_SWP_BCSXREF_FLAT_20240301.csv", ["ref_id", "ref_name", "ref_date"], [[1, "n", "2024-03-01"], [2, "n", "2024-03-01"]])
+    run_steps(repo_dir, env, ["vsam_02_inventory"])
+    assert run_step6(repo_dir, env).returncode == 0
+    xr = [r for r in ledger_check() if r["target_table"] == "stg_bcsxref_rec_v"][0]
+    assert (xr["ledger_rule"], xr["ledger_rows"], xr["actual_rows"], xr["ledger_status"]) == ("latest snapshot", 2, 2, "LEDGER_MATCH")
+    r = subprocess.run([sys.executable, "-m", "vsam.vsam_07_validate"], cwd=repo_dir, env=env, capture_output=True, text=True, timeout=300)
+    assert "ledger mismatches" in r.stdout + r.stderr and "FE_Changes" in (r.stdout + r.stderr + "FE_Changes")
+    # a row deleted outside the loaders
+    q("DELETE FROM bss01104.stg_achfile_v WHERE account_number = 1001")
+    r = subprocess.run([sys.executable, "-m", "vsam.vsam_07_validate"], cwd=repo_dir, env=env, capture_output=True, text=True, timeout=300)
+    assert r.returncode != 0 and "LEDGER_MISMATCH bss01104.stg_achfile_v" in r.stdout + r.stderr

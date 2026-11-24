@@ -84,6 +84,8 @@ from sweep_common import (
     PGPORT,
     PGUSER,
 )
+from sweep_fwd_ddl import FeIndex, load_fe_changes
+from sweep_validate import FE_STATUSES, LEDGER_MISMATCH, FeLog, drop_discrepancies, ledger_check
 from sweep_s3meta import has_meta, make_meta, meta_equal, meta_from_row
 from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
 from sweep_layers import add_layer_arg, ensure_layer
@@ -264,7 +266,45 @@ def run_full_parity_audit(exact_counts=False, tables_filter=None, schemas_filter
 
     oracle_triggers, oracle_views, views_triggers_comparison = compare_views_and_triggers(db_connected, discrepancies, meta, pg_cat, schemas_filter)
 
+    # FE overlay (differences an applied FE file explains are FE_ADDED / FE_CHANGED / FE_DROPPED and count as PASS)
+    fe = load_fe_changes() if db_connected else FeIndex()
+    felog = FeLog(fe)
+    for r in table_comparison:
+        st = felog.table(r["target_schema"], r["target_table"], r["table_status"])
+        if st:
+            r["table_status"], r["notes"] = st, f"{r['notes']} - explained by an applied FE file"
+            drop_discrepancies(discrepancies, r["target_schema"], r["target_table"], categories=("TABLE",))
+    for r in column_comparison:
+        st = felog.column(r["target_schema"], r["target_table"], r["column_name"], r["overall_status"])
+        if st:
+            r["overall_status"] = st
+            drop_discrepancies(discrepancies, r["target_schema"], r["target_table"], r["column_name"], categories=("COLUMN",))
+
     row_count_audit = reconcile_row_counts(db_connected, discrepancies, exact_counts, meta, oracle_tables, pg_cat, pg_child_partitions, s3_loaded_map, s3_planned_map, schemas_filter, tables_filter, s3_file_state)
+
+    for r in row_count_audit:
+        key = (r["target_schema"], r["target_table"])
+        if fe.table_dropped(*key):
+            r["parity_status"] = "FE_DROPPED"
+            felog.add("FE_DROPPED", key[0], key[1], file=fe.dropped_tables[key], was="row count", detail="table dropped by an applied FE file")
+            drop_discrepancies(discrepancies, key[0], key[1], categories=("ROW_COUNT", "S3_FILE"))
+
+    # ledger check: count(table) == rows before + sum(rows_inserted) of sweep_ctl.load_history
+    ledger = ledger_check(schemas_filter, tables_filter, fe) if db_connected else []
+    by_table = {(r["target_schema"], r["target_table"]): r for r in row_count_audit}
+    for lr in ledger:
+        row = by_table.get((lr["target_schema"], lr["target_table"]))
+        if row is not None:
+            row.update(ledger_rows=lr["ledger_rows"], ledger_status=lr["ledger_status"], ledger_note=lr["note"])
+        if lr["ledger_status"] == LEDGER_MISMATCH:
+            discrepancies.append({
+                "Object_Category": "LEDGER", "Target_Schema": lr["target_schema"], "Target_Table": lr["target_table"],
+                "Object_Name": lr["target_table"], "Discrepancy_Type": "LEDGER_MISMATCH",
+                "Oracle_Expected": f"{lr['ledger_rows']:,} rows by sweep_ctl.load_history ({lr['ledger_rule']})",
+                "Postgres_Actual": f"{lr['actual_rows']} rows - {lr['note']}",
+                "Actionable_Recommendation": "Rows were deleted or added outside the loaders; review sweep_ctl.load_history and reload the table."})
+    ledger_bad = sum(1 for lr in ledger if lr["ledger_status"] == LEDGER_MISMATCH)
+    fe_ok = ("MATCH", "AUDIT_COLUMN_OK") + FE_STATUSES
 
     # -------------------------------------------------------------------------
     # LEVEL 9: Executive Summary Dashboard & Verdict
@@ -274,10 +314,10 @@ def run_full_parity_audit(exact_counts=False, tables_filter=None, schemas_filter
     total_schemas_matched = sum(1 for s in schema_comparison if s["status"] == "MATCH")
 
     total_tables_ora = len(oracle_tables)
-    total_tables_matched = sum(1 for t in table_comparison if t["table_status"] == "MATCH")
+    total_tables_matched = sum(1 for t in table_comparison if t["table_status"] in ("MATCH",) + FE_STATUSES)
 
     total_cols_ora = sum(len(c_dict) for c_dict in oracle_cols_map.values())
-    total_cols_matched = sum(1 for c in column_comparison if c["overall_status"] in ("MATCH", "AUDIT_COLUMN_OK"))
+    total_cols_matched = sum(1 for c in column_comparison if c["overall_status"] in fe_ok)
     type_mismatches_cnt = sum(1 for c in column_comparison if c["overall_status"] == "TYPE_MISMATCH")
 
     total_cons_ora = sum(len(c_dict) for c_dict in oracle_cons_map.values())
@@ -295,7 +335,7 @@ def run_full_parity_audit(exact_counts=False, tables_filter=None, schemas_filter
     total_trgs_ora = len(oracle_triggers)
     total_trgs_matched = sum(1 for trg in views_triggers_comparison if trg["object_type"] == "TRIGGER" and trg["status"] == "MATCH")
 
-    row_matched_cnt = sum(1 for r in row_count_audit if r["parity_status"] in ("EXACT_MATCH", "APPROX_MATCH", "EMPTY_TABLE"))
+    row_matched_cnt = sum(1 for r in row_count_audit if r["parity_status"] in ("EXACT_MATCH", "APPROX_MATCH", "EMPTY_TABLE") + FE_STATUSES)
 
     total_s3_planned = sum(p["files"] for p in s3_planned_map.values())
     total_s3_loaded = sum(l["files"] for l in s3_loaded_map.values())
@@ -326,6 +366,8 @@ def run_full_parity_audit(exact_counts=False, tables_filter=None, schemas_filter
         {"Metric": "Views & Materialized Views", "Value": f"{total_views_matched} of {total_views_ora} Matched", "Parity_Assessment": f"{round((total_views_matched/max(total_views_ora,1))*100,1)}%"},
         {"Metric": "Table Triggers", "Value": f"{total_trgs_matched} of {total_trgs_ora} Matched", "Parity_Assessment": f"{round((total_trgs_matched/max(total_trgs_ora,1))*100,1)}%"},
         {"Metric": "Table Row Count Parity", "Value": f"{row_matched_cnt} of {len(row_count_audit)} Tables Aligned", "Parity_Assessment": f"{round((row_matched_cnt/max(len(row_count_audit),1))*100,1)}%"},
+        {"Metric": "Ledger (rows vs sweep_ctl.load_history)", "Value": f"{sum(1 for lr in ledger if lr['ledger_status'] != LEDGER_MISMATCH)} of {len(ledger)} Tables Match", "Parity_Assessment": "ZERO MISMATCHES" if not ledger_bad else f"{ledger_bad} MISMATCHES"},
+        {"Metric": "Differences explained by FE files", "Value": len(felog.rows), "Parity_Assessment": "PASS (listed in sheet FE_Changes)"},
         {"Metric": "S3 Data Files Ingestion Parity", "Value": f"{total_s3_loaded} of {total_s3_planned} Loaded into DB", "Parity_Assessment": f"{round((total_s3_loaded/max(total_s3_planned,1))*100,1)}%"}
     ]
 
@@ -357,6 +399,7 @@ def run_full_parity_audit(exact_counts=False, tables_filter=None, schemas_filter
         "Sequence_Comparison": sequence_comparison,
         "Views_and_Triggers": views_triggers_comparison,
         "Row_Count_Audit": row_count_audit,
+        "FE_Changes": felog.sheet(),
         "Discrepancies": discrepancies if discrepancies else [{"Status": "Zero discrepancies detected. 100% object and data parity achieved."}]
     }
 

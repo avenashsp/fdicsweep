@@ -22,7 +22,8 @@ together, so they share one transaction and one connection):
 """
 from sweep_common import VSAM_LOAD_LOG_TABLE, lit, q
 from sweep_delta import capture_setup_sql, capture_spec, registry_sql
-from sweep_loadpipe import MAX_DUP_ROWS_PRINTED, MAX_REJECT_ROWS_PRINTED, REJECT_TABLE, TEXT_TYPES, upsert_statements
+from sweep_loadpipe import (MAX_DUP_ROWS_PRINTED, MAX_REJECT_ROWS_PRINTED, REJECT_TABLE, TEXT_TYPES, history_insert_sql,
+                            upsert_statements)
 from sweep_s3meta import meta_sql_values
 
 WS = "E' \\t\\r\\n'"          # SQL constant holding the whitespace characters that are trimmed
@@ -229,6 +230,22 @@ def build_unit_script(unit):
             f"AND split_part(k, '|', 2) = '{i}' GROUP BY 1) a WHERE n > 0 "
             f"UNION ALL SELECT 'bcs', 0 WHERE NOT EXISTS (SELECT 1 FROM _c WHERE split_part(k, '|', 1) IN {done_kinds} "
             f"AND split_part(k, '|', 2) = '{i}' AND n > 0)) z;\n")
+        # load_history: one row per file and destination schema that received rows; the file-level counts (read, rejected,
+        # duplicates) sit on the first destination that received rows (dests[0] when none did)
+        tot = lambda d: "(" + " + ".join(f"COALESCE((SELECT n FROM _c WHERE k = {lit(f'{kind}|{i}|{d}')}), 0)"
+                                         for kind in ("inserted", "updated", "unchanged")) + ")"
+        for k, d in enumerate(dests):
+            c = lambda kind: f"(SELECT n FROM _c WHERE k = {lit(f'{kind}|{i}|{d}')})"
+            earlier = "".join(f" AND {tot(e)} = 0" for e in dests[:k])
+            carries = f"({tot(d)} > 0{earlier})"
+            none_at_all = "true" + "".join(f" AND {tot(e)} = 0" for e in dests)
+            fc = lambda kind: f"(SELECT CASE WHEN {carries} OR ({none_at_all} AND {k} = 0) THEN n END FROM _c WHERE k = {lit(f'{kind}|{i}')})"
+            add(history_insert_sql(
+                "vsam", unit.get("layer") or "bronze", "s3", unit.get("run_id"), uri, d, table,
+                read=fc("raw"), inserted=c("inserted"), updated=c("updated"), unchanged=c("unchanged"),
+                rejected=fc("rejected"), dup=fc("dup"), s3_meta=f["s3_meta"],
+                reset=not keyed and f is files[0],
+                where=f"{tot(d)} > 0 OR ({none_at_all} AND {k} = 0)"))
     add("COMMIT;\n")
     return "".join(s)
 

@@ -39,7 +39,7 @@ from sweep_common import (
 )
 import sweep_bg
 from sweep_targeting import add_targeting_args
-from sweep_layers import add_layer_arg
+from sweep_layers import LayerError, add_layer_arg, ensure_layer, get_layer
 
 logger = get_logger("sweep_cli", to_file=False)
 
@@ -634,6 +634,16 @@ def cmd_migrate(args):
         return _layer_error(e)
 
 
+def cmd_validate(args):
+    import sweep_reconcile as rc
+    try:
+        layer = ensure_layer(args, None, db=False).name
+        return rc.validate_layer_cmd(layer, [t for t in (args.tables or "").split(",") if t.strip()] or None, args.exact,
+                                     tuple(t.strip() for t in args.tracks.split(",") if t.strip()))
+    except LayerError as e:
+        return _layer_error(e)
+
+
 def cmd_layers(args):
     from sweep_layers import LayerError
     import sweep_layer_cmds as lc
@@ -716,6 +726,7 @@ def main():
     p_mon.add_argument("--interval", type=int, default=3, help="Refresh interval in seconds (default: 3)")
     p_mon.add_argument("--no-color", action="store_true", help="Disable colored output")
     p_mon.add_argument("--track", choices=["all", "oracle", "vsam"], default="all", help="Track to monitor: oracle, vsam, or all (default: all)")
+    add_layer_arg(p_mon)
 
     p_log = subparsers.add_parser("logs", aliases=["log"], help="View or tail execution logs")
     p_log.add_argument("-n", "--lines", type=int, default=40, help="Lines to tail (default: 40)")
@@ -777,6 +788,12 @@ def main():
     f_pr.add_argument("--to", dest="to_layer", required=True)
     f_ck = f_sub.add_parser("check", help="Dry-run every pending file with the compatibility check; nothing is written (read-only)")
     _fwd_common(f_ck)
+
+    p_val = subparsers.add_parser("validate", help="Validate one layer: one Excel report and a verdict (bronze: Oracle 08 + VSAM 07 + ledger; others: reconcile + schema)")
+    add_layer_arg(p_val)
+    p_val.add_argument("--tables", help="Comma-separated tables (schema.table)")
+    p_val.add_argument("--exact", action="store_true", help="Exact counts / hash every row (default: a 1 percent sample of the keys)")
+    p_val.add_argument("--tracks", default="oracle,vsam", help="Bronze only: tracks to validate (default: oracle,vsam)")
 
     p_lay = subparsers.add_parser("layers", help="Layer manifests, model scan, reconcile and checks")
     l_sub = p_lay.add_subparsers(dest="layers_cmd", help="layers subcommands")
@@ -966,6 +983,8 @@ def main():
         sys.exit(cmd_migrate(args))
     elif args.command == "layers":
         sys.exit(cmd_layers(args))
+    elif args.command == "validate":
+        sys.exit(cmd_validate(args))
     elif args.command == "oracle":
         handle_oracle(args)
     elif args.command == "vsam":
@@ -975,11 +994,19 @@ def main():
     elif args.command == "status":
         sweep_bg.print_status()
     elif args.command == "monitor":
+        mon_layer = None
+        if getattr(args, "layer", None) or os.environ.get("SWEEP_LAYER"):
+            try:
+                mon_layer = get_layer(getattr(args, "layer", None) or os.environ["SWEEP_LAYER"])
+            except LayerError as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                sys.exit(2)
         sweep_bg.monitor_live(
             interval=args.interval,
             watch=args.watch,
             use_color=not getattr(args, "no_color", False),
-            track=getattr(args, "track", "all")
+            track=getattr(args, "track", "all"),
+            layer=mon_layer,
         )
     elif args.command in ("logs", "log"):
         sweep_bg.tail_logs(lines=args.lines, follow=args.follow, log_file=args.file, track=getattr(args, "track", None))

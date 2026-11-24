@@ -46,6 +46,7 @@ from sweep_common import (
     run_psql_script,
     norm_col,
     q,
+    LAYER,
     lit,
     format_size_actual,
     DB_ERRORS,
@@ -62,7 +63,7 @@ from sweep_targeting import Selector, add_targeting_args, selector_or_exit, vali
 from sweep_layers import add_layer_arg, ensure_layer, require_bronze, restrict_to_manifest
 from sweep_delta import ensure_delta_table, fast_registry_sql
 from sweep_fwd_rules import load_rules, resolve_columns, rules_for
-from sweep_loadpipe import tables_with_rows
+from sweep_loadpipe import history_insert_sql, record_history_failure, tables_with_rows
 from sweep_migrate import require_migrated
 from sweep_merge import current_run_id
 logger = get_logger("oracle_06_load_data", "oracle_06_load_data")
@@ -319,13 +320,17 @@ def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False, max_rejec
         s3_meta = head_object(uri, region)
         stream_cmd = stream_program_literal(uri, region)
         log_sql = load_log_insert(uri, schema, table, size_bytes, file_format, worker_id, s3_meta)
+        _c = lambda k: f"(SELECT n FROM _c WHERE k = '{k}')"
+        hist = lambda **kw: history_insert_sql("oracle", LAYER or "bronze", "s3", current_run_id(), uri, schema, table, s3_meta=s3_meta, **kw)
         name = job.get("filename", Path(uri).name)
 
         use_fast = fast_bulk and not has_rules and not has_constraints(meta) and is_table_empty(schema, table)
         if use_fast:
             logger.info(f"[Worker {worker_id}] Started stream: {name} ({format_size_actual(size_mb_val)}) -> {schema}.{table} (fast bulk - empty table without constraints)")
             script = build_fast_script(schema, table, header_cols, stream_cmd, meta, trigger_mode,
-                                       fast_registry_sql(schema, table, current_run_id(), uri, header_cols, "bronze") + log_sql)
+                                       fast_registry_sql(schema, table, current_run_id(), uri, header_cols, "bronze") + log_sql
+                                       + hist(read=f"(SELECT count(*) FROM {q(schema)}.{q(table)})", inserted=f"(SELECT count(*) FROM {q(schema)}.{q(table)})",
+                                              updated="0", unchanged="0", rejected="0", dup="0", reset=True))
         else:
             how = f"upsert on {', '.join(plan['arbiter']['cols'])}" if plan["arbiter"] else "append - no key"
             logger.info(f"[Worker {worker_id}] Started stream: {name} ({format_size_actual(size_mb_val)}) -> {schema}.{table} (staged load, {how}; triggers off via {trigger_mode})")
@@ -333,6 +338,8 @@ def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False, max_rejec
                 logger.warning(f"[Worker {worker_id}] CHECK {skipped} references columns that are not in the file; the table still enforces it")
             ensure_delta_table(schema, table)        # applied rows are captured for `promote` (unless the table is empty / --full)
             capture = {"run_id": current_run_id(), "layer": "bronze", "full": FULL_LOAD, "uris": uri, "downstream": True}
+            log_sql += "\n" + hist(read=_c("raw"), inserted=_c("inserted"), updated=_c("updated"), unchanged=_c("unchanged"),
+                                    rejected=_c("rejected"), dup=_c("dup"))
             script = build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trigger_mode, max_rejects, uri, log_sql,
                                          capture=capture, raw_cols=file_cols, col_map=resolution.col_map, defaults=resolution.defaults)
 
@@ -354,6 +361,7 @@ def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False, max_rejec
                     persist_failed_file_rejects(uri, schema, table, reject_rows)
                 except RuntimeError as e:
                     logger.warning(f"[Worker {worker_id}] Could not store the rejected rows of {uri}: {e}")
+            record_history_failure("oracle", LAYER or "bronze", "s3", current_run_id(), uri, schema, table, err, counts.get("raw", 0))
             return _failed(err, sec, **extra)
 
         if use_fast:
@@ -378,6 +386,7 @@ def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False, max_rejec
                            unchanged=counts.get("unchanged", 0), **extra)
     except Exception as e:  # noqa: BLE001 - a worker must report any failure, never crash the pool
         logger.error(f"[Worker {worker_id}] Load failed for {uri}: {e}")
+        record_history_failure("oracle", LAYER or "bronze", "s3", current_run_id(), uri, schema, table, clip_error(e))
         return _failed(clip_error(e), round(time.time() - t0, 2))
     finally:
         record_stream_end(worker_id)

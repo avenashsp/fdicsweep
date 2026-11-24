@@ -249,3 +249,20 @@ def test_wrong_database_for_a_layer_is_refused_by_promote(chain_env, tmp_path, m
     monkeypatch.setattr(sl, "LAYERS_FILE", f)
     with pytest.raises((SystemExit, RuntimeError, sl.LayerError)):
         sp.promote("bronze", "silver")
+
+
+def test_promote_writes_load_history_rows_with_the_layer_and_a_failed_attempt(chain_env):
+    env = chain_env
+    day1(env)
+    psql(env.dbs["silver"], "ALTER TABLE app.customer DROP COLUMN qty")
+    env.bronze_load(DELTA1)
+    assert env.promote("bronze", "silver")[1] == 1
+    h = psql(env.dbs["silver"], "SELECT layer || ':' || source || ':' || status || ':' || rows_inserted FROM sweep_ctl.load_history")
+    assert h == "silver:promote:FAILED:0"
+    psql(env.dbs["silver"], "ALTER TABLE app.customer ADD COLUMN qty int; UPDATE app.customer SET qty = id * 10")
+    assert env.promote("bronze", "silver")[1] == 0
+    h = psql(env.dbs["silver"], "SELECT string_agg(layer || ':' || status || ':' || rows_inserted || '/' || rows_updated || ':' || coalesce(rows_before::text, '-'), ' ' ORDER BY id) "
+                                "FROM sweep_ctl.load_history")
+    assert h == "silver:FAILED:0/0:- silver:SUCCESS:1/1:3"                        # baseline = the 3 rows silver already held
+    from sweep_validate import ledger_check
+    assert [r["ledger_status"] for r in ledger_check(dbname=env.dbs["silver"])] == ["LEDGER_MATCH"]

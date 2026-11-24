@@ -32,7 +32,36 @@ C_GREEN  = "\033[1;32m"  # All Column Headers & Overview Labels
 C_WHITE  = "\033[97m"    # All Row Items & Data Values
 
 
-def render_dashboard(use_color=True, track="all"):
+def layer_info_lines(layer):
+    """Header lines of `monitor --layer L`: layer + database, the last promote into the layer (compact) and the pending FE files."""
+    from sweep_common import CTL_SCHEMA, clip_error, query_db_dicts
+    from sweep_fwd_ddl import FwdError, list_files, pending_files
+    from sweep_layers import LayerError, use_layer
+    out = [f"LAYER: {layer.name}    DATABASE: {layer.database}"]
+    try:
+        with use_layer(layer):
+            last = query_db_dicts(
+                f"SELECT run_id, source_layer, count(*) AS tables, COALESCE(sum(inserted), 0) AS ins, COALESCE(sum(updated), 0) AS upd, "
+                f"count(*) FILTER (WHERE status = 'FAILED') AS failed, max(finished_at)::timestamp(0) AS at FROM {CTL_SCHEMA}.promote_log "
+                f"WHERE target_layer = {layer.name!r} AND run_id = (SELECT run_id FROM {CTL_SCHEMA}.promote_log WHERE target_layer = {layer.name!r} "
+                f"ORDER BY id DESC LIMIT 1) GROUP BY run_id, source_layer", dbname=layer.database)
+            if last:
+                r = last[0]
+                out.append(f"last promote: {r['source_layer']}>{layer.name} {r['at']}  {r['tables']} table(s)  +{r['ins']} inserted  ~{r['upd']} updated  "
+                           f"{r['failed']} failed  (run {r['run_id']})")
+            else:
+                out.append("last promote: none")
+            try:
+                pend = pending_files(layer, list_files())
+                out.append("pending FE files: " + (f"{len(pend)} ({', '.join(f.name for f in pend[:5])}{' ...' if len(pend) > 5 else ''})" if pend else "0"))
+            except FwdError as e:
+                out.append(f"pending FE files: unknown ({e})")
+    except (RuntimeError, LayerError) as e:
+        out.append(f"layer database not readable: {clip_error(e)}")
+    return out
+
+
+def render_dashboard(use_color=True, track="all", layer=None):
     """
     Renders the live operational dataload monitoring dashboard.
     When track='all', clearly displays both ORACLE and VSAM track progress side-by-side,
@@ -73,6 +102,11 @@ def render_dashboard(use_color=True, track="all"):
         lines.append(b_main)
         lines.append(f"{t_pad}{t_main}")
         lines.append(b_main)
+
+    if layer is not None:
+        for ln in layer_info_lines(layer):
+            lines.append(f"{C_WHITE}{ln}{C_RESET}" if use_color else ln)
+        lines.append(("=" * W))
 
     def format_2col_row(l_lbl, l_val, r_lbl, r_val):
         l_plain = f"{l_lbl:<14}: {l_val}" if l_lbl else ""
@@ -264,7 +298,7 @@ def render_dashboard(use_color=True, track="all"):
     return "\n".join(lines)
 
 
-def monitor_live(interval=3, watch=False, use_color=True, track="all"):
+def monitor_live(interval=3, watch=False, use_color=True, track="all", layer=None):
     """
     Operational dashboard for active data ingestion.
     By default (watch=False), prints the dashboard once without auto refresh.
@@ -272,7 +306,7 @@ def monitor_live(interval=3, watch=False, use_color=True, track="all"):
     """
     if not watch:
         # Non-auto-refresh mode: render snapshot once and exit immediately
-        print(render_dashboard(use_color=use_color, track=track))
+        print(render_dashboard(use_color=use_color, track=track, layer=layer))
         sys.stdout.flush()
         return
 
@@ -280,7 +314,7 @@ def monitor_live(interval=3, watch=False, use_color=True, track="all"):
     try:
         while True:
             sys.stdout.write("\033[2J\033[H")
-            sys.stdout.write(render_dashboard(use_color=use_color, track=track) + "\n")
+            sys.stdout.write(render_dashboard(use_color=use_color, track=track, layer=layer) + "\n")
             sys.stdout.flush()
             time.sleep(interval)
     except KeyboardInterrupt:
