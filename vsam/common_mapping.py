@@ -170,7 +170,7 @@ def get_active_schemas_map() -> dict:
             "112": "bss01112",
             "115": "bss01115",
             "116": "bss01116",
-            "099": "bss00099",
+            "099": "bss00098",
         }
     return active_map
 
