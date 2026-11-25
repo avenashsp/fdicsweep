@@ -1,4 +1,4 @@
-# Medallion layers, promote and migrate (v6.0.0)
+# Medallion layers, promote and migrate (v6.1.0)
 
 SWEEP now fills **four PostgreSQL databases in ONE Aurora cluster**, one per layer, in a fixed chain:
 

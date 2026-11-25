@@ -1,4 +1,4 @@
-# Data models (v6.0.0) - `data_models/` and `sweep.py models`
+# Data models (v6.1.0) - `data_models/` and `sweep.py models`
 
 The data models are **Python scripts in this repository** (`data_models/<NN>_<name>.py`). They run in **silver**, after the bronze -> silver promote and **before** the promote to gold_backup. The runner starts each script in
 its own subprocess and gives it only the silver credentials.

@@ -1,4 +1,4 @@
-# FE SQL files - `sweep.py fwd-ddl` (v6.0.0)
+# FE SQL files - `sweep.py fwd-ddl` (v6.1.0)
 
 Forward engineering (FE) asks for tables to be created and Oracle / VSAM tables to be changed: add, drop or rename columns, retype, new constraints, indexes, views, triggers. Those
 changes are **SQL files in `fwd_ddl/`** that the Database team applies in **every layer**, schema first, then data. The files contain **structure only**.

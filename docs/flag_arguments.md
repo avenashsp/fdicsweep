@@ -1,4 +1,4 @@
-# SWEEP Migration Framework - Complete CLI Flags Reference (v6.0.0)
+# SWEEP Migration Framework - Complete CLI Flags Reference (v6.1.0)
 
 Complete flags reference for all CLI commands and python scripts in the **SWEEP Unified Data Migration Framework** across both **Oracle** and **VSAM** tracks.
 
@@ -342,7 +342,7 @@ Automated end-to-end execution across tracks.
 
 ---
 
-## 5a. New in 6.0.0: targeting flags, layers, promote, chain, migrate
+## 5a. New in 6.0.0 and 6.1.0: targeting flags, layers, promote, chain, migrate, fwd-ddl, validate, models
 
 ### Uniform targeting flags (every step)
 

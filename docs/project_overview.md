@@ -1,10 +1,12 @@
-# SWEEP Unified Data Migration Framework (v6.0.0)
+# SWEEP Unified Data Migration Framework (v6.1.0)
+
+> **6.1.0 - FE SQL files, validation and data models.** `sweep.py fwd-ddl` applies the forward-engineering SQL files of `fwd_ddl/` in every layer (immutable, one transaction per file, pragmas the loaders obey); every load attempt is a row of `sweep_ctl.load_history` and the ledger check compares each table with it; `sweep.py validate --layer L` gives one report and a verdict per layer; the data models are scripts of `data_models/` that `sweep.py models run` runs in silver (only silver credentials, delta mode, update in place) between the silver and gold_backup promotes. See `fwd_ddl.md` and `data_models.md`.
 
 > **6.0.0 - medallion layers.** The target is four databases in one Aurora cluster (bronze SWEEPB -> silver SWEEPS -> gold_backup SWEEPGB -> gold SWEEPG). S3 is read once, into bronze; `sweep.py promote` / `chain` move the applied deltas one hop at a time (strict sequence order, gated by gold_backup, never deleting rows, never touching gold's schema). Every step takes `--layer`, the uniform targeting flags and writes merge-safe outputs. See [layers_and_promote.md](layers_and_promote.md) and [targeting_and_outputs.md](targeting_and_outputs.md).
 
 ## 1. Executive Summary
 
-**SWEEP** (v6.0.0) is an enterprise-grade, high-throughput unified database migration framework built to migrate multi-terabyte financial datasets from both **Oracle SQL DDL dumps** and **VSAM flat files (COBOL copybooks)** into **AWS RDS Aurora PostgreSQL** with per-file transactional atomicity on the Oracle track, loud failures instead of silent data loss, and high ingestion velocity.
+**SWEEP** (v6.1.0) is an enterprise-grade, high-throughput unified database migration framework built to migrate multi-terabyte financial datasets from both **Oracle SQL DDL dumps** and **VSAM flat files (COBOL copybooks)** into **AWS RDS Aurora PostgreSQL** with per-file transactional atomicity on the Oracle track, loud failures instead of silent data loss, and high ingestion velocity.
 
 Unlike traditional migration tools that stage gigabytes or terabytes of CSV data onto local bastion disks or perform slow row-by-row ORM inserts, SWEEP uses a **zero-disk streaming pipeline** that pulls compressed data directly from Amazon S3, uncompresses it in memory via Unix pipes, and streams it into PostgreSQL with the CSV `\copy` protocol (Oracle track; the VSAM track routes rows by schema and sends them as batched `INSERT`s - see "Reliability & Safety Guarantees").
 
@@ -78,7 +80,7 @@ VSAM files always have a header row, but its names and column order differ from 
 - PostgreSQL **16 or later** is required (`pg_input_is_valid`); the loaders and `sweep.py check` verify it.
 - The primary key of `sweep_ctl.oracle_load_log` is `uri` (`vsam_load_log`: `uri, target_schema`); see `docs/sweep_outputs.md` for the full column list.
 
-### 7. Reliability & Safety Guarantees (v6.0.0)
+### 7. Reliability & Safety Guarantees (v6.1.0)
 - **Exit codes:** every step exits non-zero when it cannot do its job (missing inputs, failed loads, failed DDL, failed validation), so `run-all` and CI stop at the first failing step.
 - **No shell injection:** S3 keys and file names are never interpolated into shell command lines. Python callers use argument lists; the one `\copy ... FROM PROGRAM '...'` command string is built with `shlex.quote`. Keys containing spaces, quotes, `;` or `$()` load correctly.
 - **Stream errors are visible:** S3 / gzip failures surface as errors (not as "empty file"); header and sample peeks check the pipeline's exit status and stderr.
@@ -88,6 +90,8 @@ VSAM files always have a header row, but its names and column order differ from 
 - **Lookup failures never guess:** a failed "is the table empty?" or "does it have a PK?" query fails the file instead of falling back to a bulk append that could create duplicates.
 
 ### 8. Dual-Track Operational Monitoring
+- `python3 sweep.py monitor --layer L` adds the layer and database name, the last promote into the layer and the pending FE files to the header.
+- `python3 sweep.py validate --layer L`: one Excel report and a verdict per layer (bronze: Oracle 08 + VSAM 07 + ledger; others: reconcile / superset check + schema comparison + ledger; differences explained by FE files are `FE_*` and pass).
 - `python3 sweep.py monitor`: Real-time dashboard showing live throughput, in-flight streams, progress bars, committed row totals, and average speeds across Oracle and VSAM tracks simultaneously.
 - `python3 sweep.py status`: Real-time process table showing background daemon state, runtime, PIDs, and finish codes.
 - `python3 sweep.py check`: Pre-flight environment diagnostics validating Python modules, PostgreSQL connectivity, AWS CLI/Boto3, and input directory structures.
@@ -98,12 +102,15 @@ VSAM files always have a header row, but its names and column order differ from 
 
 ```
 fdicsweep/
-├── sweep.py                     # Root unified CLI entrypoint (v6.0.0)
+├── sweep.py                     # Root unified CLI entrypoint (v6.1.0)
 ├── sweep_layers.py / .json      # layer profiles, --layer guard, manifests
 ├── sweep_promote.py             # promote / chain / status / purge
 ├── sweep_delta.py               # delta capture and registry
 ├── sweep_migrate.py             # versioned sweep_ctl migrations
-├── sweep_reconcile.py           # layers reconcile / check
+├── sweep_reconcile.py           # layers reconcile / check / validate
+├── sweep_validate.py            # ledger check (load_history) and the FE overlay of the validation reports
+├── sweep_fwd_ddl.py / sweep_fwd_rules.py  # fwd-ddl: FE SQL files, compatibility check, loader rules
+├── sweep_models.py              # data-model runner: models list / run / status
 ├── sweep_targeting.py           # uniform selectors
 ├── sweep_merge.py / sweep_ddlfrag.py   # merge-safe outputs, per-table DDL fragments
 ├── sweep.env                    # Environment variables (RDS endpoint, credentials, S3 buckets) - git-ignored
@@ -164,15 +171,23 @@ fdicsweep/
 │   ├── reports/                 # Formatted Excel audit reports (git-ignored)
 │   └── logs/                    # Timestamped execution logs (git-ignored)
 │
+├── fwd_ddl/                     # FE SQL files V<n>__<description>.sql (applied by `sweep.py fwd-ddl`)
+├── data_models/                 # data models (NN_name.py), config/ (edited by people), work/ + logs/ (git-ignored)
+├── layers/                      # layer manifests <layer>_tables.csv, drafts
+├── tools/make_package.py        # builds the encoded docx package of the codebase
 ├── tests/                       # pytest suite (unit + PostgreSQL integration tests)
 ├── .github/workflows/ci.yml     # CI: compile, pyflakes, pytest against PostgreSQL 16
-├── docs/                        # DOCUMENTATION (v6.0.0)
+├── docs/                        # DOCUMENTATION (v6.1.0)
 │   ├── project_overview.md      # Architecture, executive summary, design principles
 │   ├── commands_oracle.md       # Complete CLI command reference for Oracle track
 │   ├── commands_vsam.md         # Complete CLI command reference for VSAM track
 │   ├── flag_arguments.md        # Comprehensive CLI flags & environment variables reference
-│   └── sweep_outputs.md         # Operational monitoring sample outputs & Excel structures
-└── CHANGELOG_v6.0.0.md                 # Release changelog and version history (newest first)
+│   ├── sweep_outputs.md         # Operational monitoring sample outputs & Excel structures
+│   ├── layers_and_promote.md    # Layers, manifests, delta capture, promote, chain, migrate, reconcile, validate
+│   ├── targeting_and_outputs.md # Uniform targeting flags, merge-safe outputs, log tables
+│   ├── fwd_ddl.md               # FE SQL files: fwd-ddl, pragmas, compatibility check
+│   └── data_models.md           # Data models: runner contract, header, delta mode, rules R1-R13
+└── CHANGELOG_v6.1.0.md                 # Release changelog and version history (newest first)
 ```
 
 > **How steps are launched.** Steps are modules run from the repository root: `python3 -m oracle.oracle_06_load_data ...`
@@ -193,7 +208,7 @@ fdicsweep/
 | **05** | `python3 sweep.py oracle apply-ddl`| Provision DB schemas | Target schemas and bare tables in PostgreSQL |
 | **06** | `python3 sweep.py oracle load-data` | Multi-worker streaming | Data committed via `\copy`; `sweep_ctl.oracle_load_log` |
 | **07** | `python3 sweep.py oracle load-obj`  | Compile DB objects | PKs, indexes, FKs, views, triggers compiled |
-| **08** | `python3 sweep.py oracle validate`  | Parity reconciliation | Multi-tab reconciliation audit Excel report |
+| **08** | `python3 sweep.py oracle validate`  | Parity reconciliation | Multi-tab reconciliation audit Excel report (ledger columns, `FE_Changes`) |
 
 ### VSAM Pipeline Workflow
 | Step | Command | Focus Area | Output Artifacts |
@@ -204,4 +219,15 @@ fdicsweep/
 | **04** | `python3 sweep.py vsam gen-ddl` | Consolidated DDL | `gen_ddl/all_tables.sql`, `all_pk.sql`, per-schema SQL |
 | **05** | `python3 sweep.py vsam apply-ddl`| Provision DB schemas | Schemas & bare tables in PostgreSQL |
 | **06** | `python3 sweep.py vsam load-data` | Staged load & upsert| Data committed; `LoadSummary`, `SchemaBreakdown`, `Reject_Summary`, `Rejected_Rows` |
-| **07** | `python3 sweep.py vsam validate`  | Parity reconciliation | Multi-tab reconciliation audit Excel report |
+| **07** | `python3 sweep.py vsam validate`  | Parity reconciliation | Multi-tab reconciliation audit Excel report (`Ledger`, `FE_Changes`) |
+
+### Day-2 stages after bronze (6.1.0)
+
+| Stage | Command | What |
+| :--- | :--- | :--- |
+| FE files | `python3 sweep.py fwd-ddl apply --layer bronze`, then `fwd-ddl promote --from L --to L` | structure first, in every layer |
+| Promote | `python3 sweep.py promote --from bronze --to silver` | the captured deltas, one hop |
+| Models | `python3 sweep.py models run` | the `data_models/` scripts in silver (only when an input changed) |
+| Promote | `promote --from silver --to gold_backup`, then `--to gold` | deltas and model outputs |
+| Validate | `python3 sweep.py validate --layer L` | one report and a verdict per layer |
+| All of it | `python3 sweep.py chain [--until ...]` | stops at the first failure |

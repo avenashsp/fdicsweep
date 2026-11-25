@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sweep-migration"
-version = "6.0.0"
+version = "6.1.0"
 description = "SWEEP: Oracle dump and VSAM flat-file migration framework for AWS RDS Aurora PostgreSQL"
 readme = "README.md"
 requires-python = ">=3.9"

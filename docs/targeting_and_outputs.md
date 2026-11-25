@@ -1,4 +1,4 @@
-# Targeted runs, merge-safe outputs and the load log tables (v6.0.0)
+# Targeted runs, merge-safe outputs and the load log tables (v6.1.0)
 
 ## 1. Uniform targeting flags
 
@@ -40,6 +40,8 @@ Safeguards for every merge: a run without filters replaces the whole file; write
 Layer-dependent outputs (generated DDL) live under per-layer folders (`outputs/<...>/<layer>/`) and reports / the VSAM load log CSV carry the database name; layer-independent metadata (Steps 01-03) stays shared.
 
 ## 3. Log tables
+
+> **6.1.0:** every load attempt (Oracle / VSAM Step 06 and `promote`) is also one append-only row of `sweep_ctl.load_history`, written in the load transaction (failed attempts get a FAILED row). Oracle Step 08, VSAM Step 07 and `validate` compare each table with it (`count == rows_before + sum(rows_inserted)`; a keyless VSAM table with its latest snapshot). FE rules from `fwd_ddl/` (`ignore-column`, `rename-column`, `default-column`, `skip-table`) apply to the targeted loads too. See [fwd_ddl.md](fwd_ddl.md).
 
 | Table | Key | Content |
 |---|---|---|

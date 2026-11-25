@@ -1,4 +1,4 @@
-# SWEEP: Unified Data Migration Framework (v6.0.0)
+# SWEEP: Unified Data Migration Framework (v6.1.0)
 
 SWEEP migrates large financial datasets into **AWS RDS Aurora PostgreSQL** from two sources:
 
@@ -146,4 +146,4 @@ python3 tools/make_package.py         # fdicsweep_package_v<version>.docx in pac
 - [Targeted runs, merge-safe outputs, log tables](docs/targeting_and_outputs.md)
 - [Flag and environment reference](docs/flag_arguments.md)
 - [Sample outputs](docs/sweep_outputs.md)
-- [Changelog](CHANGELOG_v6.0.0.md)
+- [Changelog](CHANGELOG_v6.1.0.md)
