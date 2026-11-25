@@ -268,3 +268,21 @@ def test_chunked_load_of_a_truncated_stream_commits_nothing(pg_db, tmp_path):
     o = o6.load_single_file(_job(bad, "pn", "t"), worker_id=1, chunk_rows=1000, chunk_min_mb=0)
     assert o.status == "FAILED"
     assert _q("SELECT count(*) FROM pn.t") == "0" and _q(f"SELECT count(*) FROM {c.LOAD_LOG_TABLE}") == "0"
+
+
+# ---------------------------------------------------------------- a row with several violations is ONE rejected row (5.4.2)
+def test_row_with_several_violations_is_counted_once(gz_file):
+    _t("po", "t", "id int primary key, a text not null, b text not null, n int check (n > 0)")
+    body = "id,a,b,n\n1,ok,ok,1\n2,,,-5\n3,x,,1\n4,ok,ok,2\n"        # row 2 breaks a, b and the CHECK; row 3 breaks b
+    o = _load(gz_file, "a.csv.gz", body, "po", "t")
+    assert (o.status, o.read, o.inserted, o.rejected) == ("SUCCESS", 4, 2, 2), o.error
+    assert o.read == o.inserted + o.updated + o.unchanged + o.rejected + o.duplicates
+    assert _q(f"SELECT count(*) FROM {pl.REJECT_TABLE} WHERE row_no = 2") == "3"             # every reason is still listed
+    assert _q(f"SELECT count(DISTINCT row_no) FROM {pl.REJECT_TABLE}") == "2"
+
+
+def test_row_with_several_violations_is_counted_once_when_chunked(gz_file):
+    _t("pp", "t", "id int primary key, a text not null, b text not null")
+    body = "id,a,b\n1,,\n2,x,y\n3,,\n4,x,y\n5,,\n"
+    o = _chunked(gz_file, "a.csv.gz", body, "pp", "t", rows=2)
+    assert (o.status, o.read, o.inserted, o.rejected) == ("SUCCESS", 5, 2, 3), o.error

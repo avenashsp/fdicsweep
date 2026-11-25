@@ -115,3 +115,13 @@ def test_keyless_table_files_replace_it_together_or_not_at_all(pg_db, tmp_path):
     assert c.run_psql("SELECT string_agg(b, ',') FROM bcs.kk", tuples_only=True) == "new,new"       # old snapshot kept
     assert c.run_psql("SELECT count(*) FROM sweep_ctl.load_log WHERE status = 'SUCCESS' AND uri LIKE '%#bcs'", tuples_only=True) == "4"   # no row for the failed attempt
     assert c.run_psql("SELECT count(*) FROM sweep_ctl.load_log WHERE status = 'FAILED'", tuples_only=True) == "2"
+
+
+@pytest.mark.integration
+def test_vsam_row_with_two_not_null_violations_is_one_rejected_row(pg_db, tmp_path):
+    c.run_psql("CREATE SCHEMA IF NOT EXISTS bcs; CREATE TABLE bcs.kk (a int NOT NULL, b text NOT NULL)")
+    p = tmp_path / "f.csv"
+    p.write_text("a,b\n,\n2,x\n,y\n")
+    res = v6.run_unit("kk", [_spec(p, 1, p.name)], 1, {"max_rejects": 0, "heads": {}, "replica": False}, {})
+    assert res[0]["status"] == "SUCCESS", res[0]["error"]
+    assert (res[0]["total_records"], res[0]["rows_loaded"], res[0]["rows_rejected"]) == (3, 1, 2)

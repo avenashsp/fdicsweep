@@ -199,9 +199,9 @@ def staged_chunk(schema, table, header_cols, meta, plan, max_rejects, ci=1):
         add("DELETE FROM _stg s WHERE EXISTS (SELECT 1 FROM _rej r WHERE r.row_no = s._row_no);\n")
 
     # 7. report what was found (echoed to the client even if the file then fails), then the reject limit
-    add(f"INSERT INTO _c SELECT 'rejected{sfx}', count(*) FROM _rej WHERE reason <> 'DUP_IN_FILE' "
+    add(f"INSERT INTO _c SELECT 'rejected{sfx}', count(DISTINCT row_no) FROM _rej WHERE reason <> 'DUP_IN_FILE' "
         f"AND row_no >= (SELECT n FROM _c WHERE k = 'lo{sfx}');\n"
-        f"INSERT INTO _c SELECT 'dup{sfx}', count(*) FROM _rej WHERE reason = 'DUP_IN_FILE' "
+        f"INSERT INTO _c SELECT 'dup{sfx}', count(DISTINCT row_no) FROM _rej WHERE reason = 'DUP_IN_FILE' "
         f"AND row_no >= (SELECT n FROM _c WHERE k = 'lo{sfx}');\n"
         f"INSERT INTO _c SELECT 'staged{sfx}', count(*) FROM _stg;\n")
     add(COUNTS_ECHO +

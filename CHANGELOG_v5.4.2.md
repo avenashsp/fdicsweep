@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [5.4.2] - 2026-11-25
+
+### Fixed
+- **"Row count check failed: N rows read but N+k accounted for" (Oracle and VSAM Step 06).** `rejected` (and `dup`) were counted as rows of the temp reject table, which holds one entry per *reason*. A source row that broke several rules at once (two empty NOT NULL columns, NOT NULL + CHECK, two missing foreign-key parents, ...) was therefore counted more than once and the file rolled back. They now count **distinct rows**; every reason is still listed in `sweep_ctl.load_rejects` and the Rejected_Rows sheet. The Excel `rows_rejected` / `skipped recs` figures count rows as well. Tests added for one-pass and chunked loads (Oracle) and VSAM.
+
+---
+
 ## [5.4.1] - 2026-11-24
 
 Fix for "could not extend file ... No space left on device" when loading a 4.5 GB Oracle file (the staged path kept the whole file in local temp tables).
@@ -76,7 +83,7 @@ Oracle Step 06 robust load release. The VSAM track is unchanged apart from the s
 ### Changed
 - `oracle_06_load_data.load_single_file` returns a `LoadOutcome` (status, rows, seconds, error + counts).
 - Staging temp tables live on instance-local storage, so size ~ file size; use `--fast-bulk` for very large initial loads.
-- Version 5.3.0; changelog renamed `CHANGELOG_v5.4.1.md`.
+- Version 5.3.0; changelog renamed `CHANGELOG_v5.4.2.md`.
 
 ---
 

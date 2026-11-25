@@ -1,4 +1,4 @@
-# SWEEP CLI Command Reference - Oracle Migration Track (v5.4.1)
+# SWEEP CLI Command Reference - Oracle Migration Track (v5.4.2)
 
 Complete command reference for the **Oracle Migration Track** of the SWEEP Unified Data Migration Framework.
 
@@ -367,7 +367,7 @@ python3 sweep.py oracle load-data --min-size-mb 100 --max-size-mb 1000 --workers
 python3 sweep.py oracle load-data --min-size-mb 1000 --workers 2 --bg
 ```
 
-### Step 06 options (v5.4.1)
+### Step 06 options (v5.4.2)
 
 ```bash
 python3 sweep.py oracle load-data                           # default: rejected rows never fail a file (--max-rejects 0)
