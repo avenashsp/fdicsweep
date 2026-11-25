@@ -209,36 +209,34 @@ def test_fast_bulk_allows_not_null_and_identity_columns_and_registers_a_full_cop
     ("id int, v text, CONSTRAINT ck CHECK (id > 0)", "CHECK"),
     ("id int primary key, v text, CONSTRAINT fk FOREIGN KEY (id) REFERENCES pg.parent(id)", "foreign key"),
 ])
-def test_fast_bulk_skip_reason_is_logged_and_staged_load_used(gz_file, caplog, ddl, why):
+def test_fast_bulk_skip_reason_is_logged_and_staged_load_used(gz_file, grab, ddl, why):
     _t("pg", "parent", "id int primary key")
     c.run_psql("INSERT INTO pg.parent VALUES (1)")
     _t("pg", "t", ddl)
-    with caplog.at_level("WARNING"):
-        o = _load(gz_file, "a.csv.gz", "id,v\n1,a\n", "pg", "t", fast_bulk=True)
+    msgs = grab(o6.logger)
+    o = _load(gz_file, "a.csv.gz", "id,v\n1,a\n", "pg", "t", fast_bulk=True)
     assert o.status == "SUCCESS" and o.path == "staged", o.error
-    assert any("--fast-bulk skipped" in r.message and why in r.message for r in caplog.records)
+    assert any("--fast-bulk skipped" in m and why in m for m in msgs)
 
 
-def test_fast_bulk_skipped_when_table_is_not_empty(gz_file, caplog):
+def test_fast_bulk_skipped_when_table_is_not_empty(gz_file, grab):
     _t("ph", "t", "id int, v text")
     c.run_psql("INSERT INTO ph.t VALUES (0, 'x')")
-    with caplog.at_level("WARNING"):
-        o = _load(gz_file, "a.csv.gz", "id,v\n1,a\n", "ph", "t", fast_bulk=True)
-    assert o.path == "staged" and any("table is not empty" in r.message for r in caplog.records)
+    msgs = grab(o6.logger)
+    o = _load(gz_file, "a.csv.gz", "id,v\n1,a\n", "ph", "t", fast_bulk=True)
+    assert o.path == "staged" and any("table is not empty" in m for m in msgs)
 
 
-def test_fast_bulk_is_skipped_for_fe_rules_and_generated_always_identity(gz_file, caplog, monkeypatch):
+def test_fast_bulk_is_skipped_for_fe_rules_and_generated_always_identity(gz_file, grab, monkeypatch):
     _t("pq", "t", "id int, v text")
     _rules(monkeypatch, ("ignore-column", "pq", "t", "old", "", ""))
-    with caplog.at_level("WARNING"):
-        o = _load(gz_file, "a.csv.gz", "id,v,old\n1,a,x\n", "pq", "t", fast_bulk=True)
+    msgs = grab(o6.logger)
+    o = _load(gz_file, "a.csv.gz", "id,v,old\n1,a,x\n", "pq", "t", fast_bulk=True)
     assert (o.status, o.path) == ("SUCCESS", "staged"), o.error
-    assert any("FE column rules" in r.message for r in caplog.records)
+    assert any("FE column rules" in m for m in msgs)
     monkeypatch.setattr(o6, "fwd_rules", lambda: [])
     _t("pq", "t2", "id bigint GENERATED ALWAYS AS IDENTITY, v text")
-    caplog.clear()
-    with caplog.at_level("WARNING"):
-        o = _load(gz_file, "b.csv.gz", "v\nx\n", "pq", "t2", fast_bulk=True)
+    o = _load(gz_file, "b.csv.gz", "v\nx\n", "pq", "t2", fast_bulk=True)
     assert o.path == "fast bulk"                                           # the file does not carry the ALWAYS column: fine
     _t("pq", "t3", "id bigint GENERATED ALWAYS AS IDENTITY, v text")
     mt = pl.fast_bulk_blockers({"keys": [], "checks": [], "fks": [], "columns": {"id": {"identity": "a"}}}, ["id"], True)
