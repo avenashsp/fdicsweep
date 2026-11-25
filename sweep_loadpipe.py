@@ -7,8 +7,11 @@ report bad rows in sweep_ctl.load_rejects and reconcile the row counts. This mod
 identical: the reject table, trigger handling probe, output markers, and the "update only rows that differ" upsert.
 """
 import json
+import subprocess
+import tempfile
 
 from sweep_common import CTL_SCHEMA, lit, q, query_db_dicts, run_psql
+from sweep_platform import group_popen_kwargs, kill_process_group
 
 REJECT_TABLE = f"{CTL_SCHEMA}.load_rejects"
 MAX_REJECT_ROWS_PRINTED = 1000       # rejected rows echoed back per file (and stored when the file fails)
@@ -133,7 +136,9 @@ def upsert_statements(tgt, header_cols, cols, arbiter, present, identity, stg="_
     no_update: columns that are inserted but never overwritten on a conflict (FE default-column values).
     capture = {"delta": '"sweep_delta"."s__t"', "seq": "<sql>", "skip": "<sql boolean>"}: the rows that were really applied
     (inserted or changed, after the only-if-different filter) are also written to the delta table with _op 'I' / 'U',
-    unless `skip` is true (empty target / full copy: the next hop copies the whole table instead).
+    unless `skip` is true (empty target / full copy: the next hop copies the whole table instead). An optional "row_base" (SQL
+    expression) is added to the delta's _row_no: a chunked load applies the file in several statements, and promote reads the delta
+    ORDER BY _row_no, so the numbers must keep increasing from chunk to chunk (a key in two chunks: the later row wins).
     """
     out = []
     head = ", ".join(q(c) for c in header_cols)
@@ -141,6 +146,7 @@ def upsert_statements(tgt, header_cols, cols, arbiter, present, identity, stg="_
     select = f"SELECT {head} FROM {stg} AS s {where}"
     on_conflict = ""
     cap_cols = ", ".join(q(c) for c in header_cols)
+    rown = f"row_number() OVER () + {capture['row_base']}" if capture and capture.get("row_base") else "row_number() OVER ()"
     if arbiter:
         a_set = set(arbiter["cols"])
         upd = [c for c in header_cols if c not in a_set and cols[c]["identity"] != "a" and c not in no_update]
@@ -168,7 +174,7 @@ def upsert_statements(tgt, header_cols, cols, arbiter, present, identity, stg="_
         if capture:
             icols = ", ".join(f"i.{q(c)}" for c in header_cols)
             delta_cte = (f", d AS (INSERT INTO {capture['delta']} ({cap_cols}, _seq, _op, _row_no) SELECT {icols}, {capture['seq']}, "
-                         f"CASE WHEN e.{e_first} IS NULL THEN 'I' ELSE 'U' END, row_number() OVER () "
+                         f"CASE WHEN e.{e_first} IS NULL THEN 'I' ELSE 'U' END, {rown} "
                          f"FROM ins i LEFT JOIN {existing} e ON {e_join} WHERE NOT {capture['skip']} RETURNING 1)")
         out.append(f"WITH ins AS ({ins_cols} {select}{on_conflict} RETURNING {ret}), "
                    f"x AS (SELECT count(*) AS tot, count(e.{e_first}) AS upd FROM ins i LEFT JOIN {existing} e ON {e_join}){delta_cte} "
@@ -178,7 +184,7 @@ def upsert_statements(tgt, header_cols, cols, arbiter, present, identity, stg="_
         delta_cte = ""
         if capture:
             delta_cte = (f", d AS (INSERT INTO {capture['delta']} ({cap_cols}, _seq, _op, _row_no) SELECT {cap_cols}, {capture['seq']}, 'I', "
-                         f"row_number() OVER () FROM ins WHERE NOT {capture['skip']} RETURNING 1)")
+                         f"{rown} FROM ins WHERE NOT {capture['skip']} RETURNING 1)")
         ret = cap_cols if capture else "1"
         out.append(f"WITH ins AS ({ins_cols} {select} RETURNING {ret}){delta_cte} "
                    f"INSERT INTO _c SELECT 'inserted{sfx}', count(*) FROM ins UNION ALL SELECT 'updated{sfx}', 0;\n")
@@ -188,15 +194,24 @@ def upsert_statements(tgt, header_cols, cols, arbiter, present, identity, stg="_
 
 
 def parse_output(stdout):
-    """Counts (last @@COUNTS@@ wins), reject summary and sample rows echoed by the staged script."""
-    counts, summary, rows = {}, [], []
+    """
+    Counts (last @@COUNTS@@ wins), reject summary and sample rows echoed by the staged script. A chunked load echoes after every
+    chunk: @@REJ_BEGIN@@ starts a fresh (cumulative) summary and a sample row echoed again is kept once.
+    """
+    counts, summary, rows, seen = {}, [], [], set()
     for line in (stdout or "").splitlines():
         if line.startswith("@@COUNTS@@"):
             counts = {k: int(v) for k, v in json.loads(line[10:]).items()}
+        elif line.startswith("@@REJ_BEGIN@@"):
+            summary = []
         elif line.startswith("@@REJ_SUMMARY@@"):
             summary.append(json.loads(line[15:]))
         elif line.startswith("@@REJ_ROW@@"):
-            rows.append(json.loads(line[11:]))
+            r = json.loads(line[11:])
+            key = (r.get("f"), r.get("row_no"), r.get("reason"), r.get("detail"))
+            if key not in seen:
+                seen.add(key)
+                rows.append(r)
     return counts, summary, rows
 
 
@@ -250,3 +265,82 @@ def record_history_failure(track, layer, source, run_id, uri, schema, table, mes
                  f"{lit(table)}, 'FAILED', {int(read or 0)}, {lit(str(message)[:2000])}, now());")
     except Exception:       # noqa: BLE001 - the failure itself is already reported; a lost history row must not hide it
         pass
+
+
+# -----------------------------------------------------------------------------
+# Chunked loads: the file is fed through the psql script in blocks of N records
+# -----------------------------------------------------------------------------
+def csv_chunks(stream, chunk_rows, flush_bytes=4 << 20):
+    """
+    Splits a CSV byte stream (header record first) into chunks of `chunk_rows` records. Yields ("data", bytes) pieces and
+    ("end", records) when a chunk is complete. A record may span lines (quoted newlines): a line ends a record only when the
+    number of double quotes since the record started is even. The header record is not data and is dropped.
+    """
+    pieces, size, records, quotes, header_seen = [], 0, 0, 0, False
+
+    def take():
+        nonlocal pieces, size
+        data = b"".join(pieces)
+        pieces, size = [], 0
+        return data
+
+    for line in iter(stream.readline, b""):
+        quotes += line.count(b'"')
+        if header_seen:
+            pieces.append(line)
+            size += len(line)
+        if quotes % 2:                                    # inside a quoted field: the record goes on
+            if size >= flush_bytes:
+                yield "data", take()
+            continue
+        quotes = 0
+        if not header_seen:
+            header_seen = True
+            continue
+        records += 1
+        if records >= chunk_rows:
+            yield "data", take()
+            yield "end", records
+            records = 0
+        elif size >= flush_bytes:
+            yield "data", take()
+    if pieces:
+        data = take()
+        yield "data", data if data.endswith(b"\n") else data + b"\n"
+    if records or pieces:
+        yield "end", records
+
+
+def chunked_script(prologue, copy_stdin_sql, chunk_sql, epilogue, argv, chunk_rows, on_chunk=None):
+    """
+    Generator of script pieces for run_psql_script_stream: the prologue, then for every chunk the \\copy command, its rows, the end
+    marker and the SQL of the chunk (`chunk_sql(n)`), finally the epilogue. If the source stream fails it raises: the transaction
+    rolls back and nothing is committed.
+    """
+    yield prologue
+    with tempfile.TemporaryFile() as errf:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=errf, **group_popen_kwargs())
+        try:
+            n, copy_open = 0, False
+            for kind, payload in csv_chunks(proc.stdout, chunk_rows):
+                if kind == "data":
+                    if not copy_open:
+                        yield copy_stdin_sql
+                        copy_open = True
+                    yield payload
+                else:
+                    n += 1
+                    yield "\\.\n"
+                    copy_open = False
+                    yield chunk_sql(n)
+                    if on_chunk:
+                        on_chunk(n, payload)
+            rc = proc.wait()
+            if rc != 0:
+                errf.seek(0)
+                raise RuntimeError(f"source stream failed (exit {rc}): {errf.read().decode('utf-8', 'replace').strip()[:500]}")
+        finally:
+            if proc.poll() is None:
+                kill_process_group(proc)
+                proc.wait()
+    yield epilogue

@@ -266,3 +266,19 @@ def test_promote_writes_load_history_rows_with_the_layer_and_a_failed_attempt(ch
     assert h == "silver:FAILED:0/0:- silver:SUCCESS:1/1:3"                        # baseline = the 3 rows silver already held
     from sweep_validate import ledger_check
     assert [r["ledger_status"] for r in ledger_check(dbname=env.dbs["silver"])] == ["LEDGER_MATCH"]
+
+
+def test_promote_counts_a_row_that_breaks_several_rules_once(chain_env):
+    env = chain_env
+    for l in LAYERS:
+        env.manifest(l, [{"schema": "app", "table": "strict"}])
+    psql(env.dbs["bronze"], "CREATE SCHEMA app; CREATE TABLE app.strict (id int PRIMARY KEY, a text, b text)")
+    for l in LAYERS[1:]:                                       # stricter than bronze: the delta carries rows the next layer rejects
+        psql(env.dbs[l], "CREATE SCHEMA app; CREATE TABLE app.strict (id int PRIMARY KEY, a text NOT NULL, b text NOT NULL)")
+    env.bronze_load("id,a,b\n1,x,y\n2,,\n3,x,\n", table="strict")        # row 2 breaks two NOT NULL rules, row 3 one
+    results, code = env.promote("bronze", "silver")
+    assert code == 0 and results[0]["status"] == "SUCCESS", results
+    assert (results[0]["inserted"], results[0]["rejected"]) == (1, 2)                               # two rejected ROWS (three reasons)
+    assert psql(env.dbs["silver"], "SELECT inserted || '/' || rejected FROM sweep_ctl.promote_log") == "1/2"
+    assert psql(env.dbs["silver"], "SELECT count(*) || '/' || count(DISTINCT row_no) FROM sweep_ctl.load_rejects WHERE track = 'oracle'") == "3/2"
+    assert psql(env.dbs["silver"], "SELECT rows_read || '/' || rows_inserted || '/' || rows_rejected FROM sweep_ctl.load_history") == "3/1/2"

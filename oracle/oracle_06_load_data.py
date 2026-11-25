@@ -44,6 +44,7 @@ from sweep_common import (
     query_db_dicts,
     run_psql,
     run_psql_script,
+    run_psql_script_stream,
     norm_col,
     q,
     LAYER,
@@ -52,12 +53,14 @@ from sweep_common import (
     DB_ERRORS,
 )
 from oracle.oracle_06_pipeline import (
-    build_fast_script, build_staged_script, ensure_reject_table, has_constraints, load_log_insert, load_table_meta,
-    parse_output, persist_failed_file_rejects, plan_load, probe_trigger_mode,
+    build_fast_script, build_staged_script, copy_from_stdin, csum, ensure_reject_table, fast_bulk_blockers, load_log_insert,
+    load_table_meta, parse_output, persist_failed_file_rejects, plan_load, probe_trigger_mode, staged_chunk, staged_epilogue,
+    staged_prologue,
 )
+from sweep_loadpipe import chunked_script
 from sweep_s3meta import classify_loaded, head_many, head_object, make_meta, meta_from_row
 from oracle.oracle_06_order import plan_levels
-from sweep_streaming import read_stream_head, stream_program_literal
+from sweep_streaming import read_stream_head, stream_argv, stream_program_literal
 from sweep_platform import atomic_write_json
 from sweep_targeting import Selector, add_targeting_args, selector_or_exit, validate_or_exit
 from sweep_layers import add_layer_arg, ensure_layer, require_bronze, restrict_to_manifest
@@ -68,6 +71,8 @@ from sweep_migrate import require_migrated
 from sweep_merge import current_run_id
 logger = get_logger("oracle_06_load_data", "oracle_06_load_data")
 LOCK = threading.Lock()
+DEFAULT_CHUNK_ROWS = 2_000_000    # a staged load of a big file runs in chunks of this many records (0 = never chunk)
+DEFAULT_CHUNK_MIN_MB = 256         # files at least this big (compressed size) are loaded in chunks
 MAX_REJECT_ROWS_IN_REPORT = 10000   # rows shown in the Rejected_Rows sheet; all are in sweep_ctl.load_rejects
 FULL_LOAD = False              # --full: promote copies the whole table instead of a captured delta
 DEFAULT_MAX_REJECTS = 0       # 0 = valid rows always load; the file fails only on technical errors (--max-rejects N to fail at N rejects)
@@ -221,6 +226,7 @@ class LoadOutcome(NamedTuple):
     reject_summary: tuple = ()
     reject_rows: tuple = ()
     trigger_mode: str = ""
+    path: str = ""            # how the file was loaded: fast bulk / staged / staged, chunked
 
 
 META_CACHE = {}
@@ -275,7 +281,7 @@ def plan_file(job, region):
 
 
 def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False, max_rejects=DEFAULT_MAX_REJECTS,
-                     fast_bulk=False, trigger_mode="replica"):
+                     fast_bulk=False, trigger_mode="replica", chunk_rows=DEFAULT_CHUNK_ROWS, chunk_min_mb=DEFAULT_CHUNK_MIN_MB):
     """
     Loads one S3 file in ONE database transaction (see oracle_06_pipeline for the steps).
     Bad rows are rejected and reported; the file fails (and rolls back completely) only when the number of
@@ -320,39 +326,59 @@ def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False, max_rejec
         s3_meta = head_object(uri, region)
         stream_cmd = stream_program_literal(uri, region)
         log_sql = load_log_insert(uri, schema, table, size_bytes, file_format, worker_id, s3_meta)
-        _c = lambda k: f"(SELECT n FROM _c WHERE k = '{k}')"
+        _c = csum                                  # counters are summed over all chunks (a single pass has one)
         hist = lambda **kw: history_insert_sql("oracle", LAYER or "bronze", "s3", current_run_id(), uri, schema, table, s3_meta=s3_meta, **kw)
         name = job.get("filename", Path(uri).name)
 
-        use_fast = fast_bulk and not has_rules and not has_constraints(meta) and is_table_empty(schema, table)
+        use_fast = False
+        if fast_bulk:
+            why = fast_bulk_blockers(meta, header_cols, is_table_empty(schema, table), has_rules)
+            use_fast = not why
+            if why:
+                logger.warning(f"[Worker {worker_id}] --fast-bulk skipped for {schema}.{table} - using the staged load: {'; '.join(why)}")
+        chunked = (not use_fast) and chunk_rows > 0 and size_mb_val >= chunk_min_mb
         if use_fast:
-            logger.info(f"[Worker {worker_id}] Started stream: {name} ({format_size_actual(size_mb_val)}) -> {schema}.{table} (fast bulk - empty table without constraints)")
+            path = "fast bulk"
+            logger.info(f"[Worker {worker_id}] Started stream: {name} ({format_size_actual(size_mb_val)}) -> {schema}.{table} (fast bulk - direct COPY, no staging)")
             script = build_fast_script(schema, table, header_cols, stream_cmd, meta, trigger_mode,
                                        fast_registry_sql(schema, table, current_run_id(), uri, header_cols, "bronze") + log_sql
                                        + hist(read=f"(SELECT count(*) FROM {q(schema)}.{q(table)})", inserted=f"(SELECT count(*) FROM {q(schema)}.{q(table)})",
                                               updated="0", unchanged="0", rejected="0", dup="0", reset=True))
         else:
             how = f"upsert on {', '.join(plan['arbiter']['cols'])}" if plan["arbiter"] else "append - no key"
-            logger.info(f"[Worker {worker_id}] Started stream: {name} ({format_size_actual(size_mb_val)}) -> {schema}.{table} (staged load, {how}; triggers off via {trigger_mode})")
+            path = "staged, chunked" if chunked else "staged"
+            logger.info(f"[Worker {worker_id}] Started stream: {name} ({format_size_actual(size_mb_val)}) -> {schema}.{table} "
+                        f"({path} load, {how}; triggers off via {trigger_mode}{f'; chunks of {chunk_rows:,} rows' if chunked else ''})")
             for skipped in plan["skipped_checks"]:
                 logger.warning(f"[Worker {worker_id}] CHECK {skipped} references columns that are not in the file; the table still enforces it")
             ensure_delta_table(schema, table)        # applied rows are captured for `promote` (unless the table is empty / --full)
             capture = {"run_id": current_run_id(), "layer": "bronze", "full": FULL_LOAD, "uris": uri, "downstream": True}
             log_sql += "\n" + hist(read=_c("raw"), inserted=_c("inserted"), updated=_c("updated"), unchanged=_c("unchanged"),
                                     rejected=_c("rejected"), dup=_c("dup"))
-            script = build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trigger_mode, max_rejects, uri, log_sql,
-                                         capture=capture, raw_cols=file_cols, col_map=resolution.col_map, defaults=resolution.defaults)
+            if not chunked:
+                script = build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trigger_mode, max_rejects, uri, log_sql,
+                                             capture=capture, raw_cols=file_cols, col_map=resolution.col_map, defaults=resolution.defaults)
 
         # High-performance bulk load options. psql runs in its own process group, with a hard
         # timeout (SWEEP_LOAD_TIMEOUT) that also kills the S3/gzip pipeline it spawned.
-        res = run_psql_script(
-            script,
-            options="-c synchronous_commit=off -c statement_timeout=0 -c lock_timeout=0",
-        )
+        load_options = "-c synchronous_commit=off -c statement_timeout=0 -c lock_timeout=0"
+        if chunked:
+            # still ONE transaction: the rows are staged chunk by chunk so the temp tables never hold the whole file; the delta is
+            # captured under one sequence number and registered once; the counters of all chunks are summed
+            res = run_psql_script_stream(
+                chunked_script(staged_prologue(schema, table, file_cols, meta, trigger_mode), copy_from_stdin(file_cols),
+                               lambda ci: staged_chunk(schema, table, header_cols, meta, plan, max_rejects, ci, capture=capture,
+                                                       col_map=resolution.col_map, defaults=resolution.defaults),
+                               staged_epilogue(schema, table, header_cols, meta, trigger_mode, uri, log_sql, capture=capture),
+                               stream_argv(uri, region), chunk_rows,
+                               on_chunk=lambda ci, n: logger.info(f"[Worker {worker_id}] {name}: chunk {ci} applied ({n:,} rows)")),
+                options=load_options)
+        else:
+            res = run_psql_script(script, options=load_options)
         sec = round(time.time() - t0, 2)
         counts, summary, reject_rows = parse_output(res.stdout)
         extra = dict(rejected=counts.get("rejected", 0), duplicates=counts.get("dup", 0), read=counts.get("raw", 0),
-                     reject_summary=tuple(summary), reject_rows=tuple(reject_rows), trigger_mode=trigger_mode)
+                     reject_summary=tuple(summary), reject_rows=tuple(reject_rows), trigger_mode=trigger_mode, path=path)
 
         if res.returncode != 0:
             err = clip_error(res.stderr or res.stdout or "psql failed")
@@ -400,7 +426,8 @@ def _legacy_selector(tables_filter, exclude_tables, file_uri, filename, dry_run)
 
 
 def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=None, file_uri=None, filename=None, limit_files=None, max_size_mb=None, min_size_mb=None, dry_run=False, gate_pass=False, reload=False,
-                    max_rejects=DEFAULT_MAX_REJECTS, fast_bulk=False, trigger_mode="auto", selector=None, layer=None):
+                    max_rejects=DEFAULT_MAX_REJECTS, fast_bulk=False, trigger_mode="auto", selector=None, layer=None,
+                    chunk_rows=DEFAULT_CHUNK_ROWS, chunk_min_mb=DEFAULT_CHUNK_MIN_MB):
     ts = get_timestamp()
     sel = selector or _legacy_selector(tables_filter, exclude_tables, file_uri, filename, dry_run)
     dry_run = dry_run or sel.dry_run
@@ -573,6 +600,8 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
         ensure_reject_table()
         if trigger_mode == "auto":
             trigger_mode = probe_trigger_mode()
+        logger.info(f"Staged loads of files >= {chunk_min_mb:g} MB run in chunks of {chunk_rows:,} rows" if chunk_rows > 0
+                    else "Chunked staging is off (--chunk-rows 0)")
         logger.info(f"Triggers are switched off per load transaction via: {trigger_mode} "
                     f"({'session_replication_role = replica' if trigger_mode == 'replica' else 'ALTER TABLE ... DISABLE TRIGGER (table lock until commit)'})")
         logger.info(("A file fails when " + str(max_rejects) + " rejected rows are reached"
@@ -599,7 +628,8 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
             for idx, job in enumerate(level_jobs):
                 worker_id = (idx % workers) + 1
                 f = executor.submit(load_single_file, job, worker_id, dry_run=dry_run, max_rejects=max_rejects,
-                                    fast_bulk=fast_bulk, trigger_mode=trigger_mode)
+                                    fast_bulk=fast_bulk, trigger_mode=trigger_mode,
+                                    chunk_rows=chunk_rows, chunk_min_mb=chunk_min_mb)
                 futures[f] = job
 
             for future in as_completed(futures):
@@ -625,6 +655,7 @@ def run_stream_load(workers=DEFAULT_WORKERS, tables_filter=None, exclude_tables=
 
                 results.append({
                     "load_level": job.get("load_level", ""),
+                    "load_path": out.path,
                 "load_order_rank": job.get("load_order_rank", ""),
                     "target_schema": job["target_schema"],
                     "target_table": job["target_table"],
@@ -738,7 +769,13 @@ if __name__ == "__main__":
     parser.add_argument("--max-rejects", type=int, default=DEFAULT_MAX_REJECTS,
                         help=f"Fail (and roll back) a file when this many rows are rejected (default {DEFAULT_MAX_REJECTS} = never; only technical errors fail a file)")
     parser.add_argument("--fast-bulk", action="store_true",
-                        help="Direct COPY for an empty table without constraints (fastest first load; one bad row fails the file)")
+                        help="Direct COPY (no temp staging) for an empty table without keys / CHECK / foreign keys; NOT NULL and identity columns are fine "
+                             "(fastest first load; one bad row fails the file). Otherwise the staged load is used and the log says why")
+    parser.add_argument("--chunk-rows", type=int, default=DEFAULT_CHUNK_ROWS,
+                        help=f"Staged loads of big files run in chunks of this many records inside the one transaction, so temp storage holds one "
+                             f"chunk instead of the whole file (default {DEFAULT_CHUNK_ROWS:,}; 0 = never chunk)")
+    parser.add_argument("--chunk-min-mb", type=float, default=DEFAULT_CHUNK_MIN_MB,
+                        help=f"Only files at least this big (compressed size, MB) are loaded in chunks (default {DEFAULT_CHUNK_MIN_MB})")
     parser.add_argument("--trigger-mode", choices=["auto", "replica", "disable"], default="auto",
                         help="How triggers are switched off during a load: session_replication_role=replica (no table lock), "
                              "or ALTER TABLE DISABLE TRIGGER (needs table ownership, locks the table). auto = replica if allowed")
@@ -758,6 +795,8 @@ if __name__ == "__main__":
         max_rejects=args.max_rejects,
         fast_bulk=args.fast_bulk,
         trigger_mode=args.trigger_mode,
+        chunk_rows=args.chunk_rows,
+        chunk_min_mb=args.chunk_min_mb,
         selector=selector_or_exit(args, logger),
         layer=layer,
     )

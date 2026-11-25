@@ -22,7 +22,8 @@ rows can break the same rules everywhere):
     END
 
 Rejected rows never fail the file unless their number reaches `max_rejects` (default 0 = never).
-`fast_bulk` keeps the old direct COPY for an empty, constraint-free table (no bad-row isolation).
+`fast_bulk` is a direct COPY for an empty table without keys / CHECK / foreign keys (no bad-row isolation; NOT NULL and identity columns are fine).
+Big files are staged in CHUNKS inside the same transaction (staged_prologue, staged_chunk per chunk, staged_epilogue).
 """
 from sweep_common import ORACLE_LOAD_LOG_TABLE, lit, q
 from sweep_loadpipe import (  # re-exported: the Oracle loader and its tests import these from here
@@ -35,7 +36,8 @@ from sweep_s3meta import meta_sql_values
 __all__ = [
     "MAX_DUP_ROWS_PRINTED", "MAX_REJECT_ROWS_PRINTED", "REJECT_TABLE", "REJECT_TABLE_DDL", "TEXT_TYPES", "_cmp",
     "ensure_reject_table", "load_table_meta", "parse_output", "persist_failed_file_rejects", "probe_trigger_mode", "upsert_statements",
-    "build_fast_script", "build_staged_script", "has_constraints", "load_log_insert", "load_table_meta", "plan_load",
+    "build_fast_script", "build_staged_script", "fast_bulk_blockers", "has_constraints", "staged_prologue", "staged_chunk", "staged_epilogue",
+    "copy_from_stdin", "copy_from_program", "csum", "load_log_insert", "load_table_meta", "plan_load",
 ]
 
 # -----------------------------------------------------------------------------
@@ -102,37 +104,57 @@ def build_fast_script(schema, table, header_cols, stream_cmd, meta, trigger_mode
         + on + log_sql + "\nCOMMIT;\n")
 
 
-def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trigger_mode, max_rejects, uri, log_sql, *,
-                        track="oracle", copy_from=None, keep_target=False, capture=None, pre_sql="", apply_pre_sql="", post_sql="",
-                        dry_run_sql=None, raw_cols=None, col_map=None, defaults=None):
+COUNTS_ECHO = ("SELECT '@@COUNTS@@' || json_object_agg(kk, nn) FROM (SELECT split_part(k, '|', 1) AS kk, sum(n) AS nn "
+               "FROM _c WHERE split_part(k, '|', 1) <> 'lo' GROUP BY 1) x;\n")
+
+
+def csum(kind):
+    """SQL scalar: the counter `kind` summed over all chunks (a single pass has one unsuffixed counter; a chunked load `kind|<n>`)."""
+    return f"(SELECT COALESCE(sum(n), 0) FROM _c WHERE split_part(k, '|', 1) = '{kind}')"
+
+
+def staged_prologue(schema, table, raw_cols, meta, trigger_mode, pre_sql=""):
+    """BEGIN, lock / statement timeouts, triggers off, the temp tables (raw rows, counters, rejects)."""
+    off, _ = _trigger_off_on(schema, table, meta, trigger_mode)
+    raw_defs = ", ".join(f"{q(c)} text" for c in raw_cols)
+    return ("\\set ON_ERROR_STOP on\n\\pset tuples_only on\n\\pset format unaligned\nBEGIN;\n" + pre_sql + off +
+            f"CREATE TEMP TABLE _raw (_row_no bigint GENERATED ALWAYS AS IDENTITY, {raw_defs}) ON COMMIT DROP;\n"
+            "CREATE TEMP TABLE _c (k text PRIMARY KEY, n bigint NOT NULL DEFAULT 0) ON COMMIT DROP;\n"
+            "CREATE TEMP TABLE _rej (row_no bigint, reason text, detail text, row_data jsonb) ON COMMIT DROP;\n")
+
+
+def copy_from_program(raw_cols, stream_cmd):
+    col_list = ", ".join(q(c) for c in raw_cols)
+    return f"\\copy _raw ({col_list}) FROM PROGRAM '{stream_cmd}' WITH (FORMAT csv, HEADER true, ENCODING 'UTF8');\n"
+
+
+def copy_from_stdin(raw_cols):
+    """Chunked loads feed the rows through the script itself (the feeder drops the header record)."""
+    col_list = ", ".join(q(c) for c in raw_cols)
+    return f"\\copy _raw ({col_list}) FROM STDIN WITH (FORMAT csv, HEADER false, ENCODING 'UTF8');\n"
+
+
+def staged_chunk(schema, table, header_cols, meta, plan, max_rejects, ci=None, *, keep_target=False, capture=None, apply_pre_sql="",
+                 dry_run_sql=None, col_map=None, defaults=None):
     """
-    The staged one-transaction script (see the module docstring). Besides Step 06 it is the apply script of `sweep.py promote`:
-      copy_from      replaces the `\\copy _raw ... FROM PROGRAM` line (e.g. FROM STDIN for the streamed transport)
-      keep_target    conflict policy keep_target: existing keys are not updated
-      capture        {run_id, layer, full, uris, downstream}: copy the applied delta to sweep_delta and register it
-      pre_sql        right after BEGIN (lock / statement timeouts), apply_pre_sql right before the apply (e.g. TRUNCATE)
-      post_sql       after the apply (sequences) ; dry_run_sql: report counts and ROLLBACK instead of applying
-      raw_cols       the columns of the FILE in file order (raw staging); col_map {table column: file column} and defaults
-                     {table column: SQL expression} come from the FE loader rules (sweep_fwd_rules): header_cols are TABLE columns
+    Everything that happens to the rows currently in _raw (the whole file, or one chunk of it): validation, typed staging, key / FK /
+    alternate-key handling, the upsert and - for the first chunk - the delta capture set-up. `ci` is the chunk number: counters get
+    the suffix `|ci` (`raw|3`, `inserted|3` ...) and are SUMMED by everything that reads them; _raw and _stg are emptied so the next
+    chunk starts clean. ci=None is the single pass (counters without suffix). header_cols are TABLE columns; col_map {table column:
+    file column} and defaults {table column: SQL expression} come from the FE rules (sweep_fwd_rules).
+    capture {run_id, layer, full, uris, downstream}: the applied rows go to the delta table - ONE registry entry and ONE sequence number
+    per file (set up in the first chunk, registered by the epilogue); `row_base` keeps the delta's _row_no increasing across chunks.
     """
     col_map, defaults = col_map or {}, defaults or {}
     rawname = lambda c: col_map.get(c, c)
     tgt = f"{q(schema)}.{q(table)}"
     cols = meta["columns"]
-    off, on = _trigger_off_on(schema, table, meta, trigger_mode)
-    raw_cols = raw_cols or [rawname(c) for c in header_cols if c not in defaults]
-    col_list = ", ".join(q(c) for c in raw_cols)
-    raw_defs = ", ".join(f"{q(c)} text" for c in raw_cols)
+    sfx = f"|{ci}" if ci else ""
     s = []
     add = s.append
-    add("\\set ON_ERROR_STOP on\n\\pset tuples_only on\n\\pset format unaligned\nBEGIN;\n")
-    add(pre_sql)
-    add(off)
-    add(f"CREATE TEMP TABLE _raw (_row_no bigint GENERATED ALWAYS AS IDENTITY, {raw_defs}) ON COMMIT DROP;\n")
-    add(copy_from or f"\\copy _raw ({col_list}) FROM PROGRAM '{stream_cmd}' WITH (FORMAT csv, HEADER true, ENCODING 'UTF8');\n")
-    add("CREATE TEMP TABLE _c (k text PRIMARY KEY, n bigint NOT NULL DEFAULT 0) ON COMMIT DROP;\n"
-        "CREATE TEMP TABLE _rej (row_no bigint, reason text, detail text, row_data jsonb) ON COMMIT DROP;\n"
-        "INSERT INTO _c SELECT 'raw', count(*) FROM _raw;\n")
+    add(f"INSERT INTO _c SELECT 'raw{sfx}', count(*) FROM _raw;\n")
+    if ci:
+        add(f"INSERT INTO _c SELECT 'lo{sfx}', coalesce(min(_row_no), 0) FROM _raw;\n")
 
     # 1. malformed values (type / length) - one pass over the raw rows
     typed = [c for c in header_cols if not _is_text(cols[c]["type"]) and c not in defaults]
@@ -154,7 +176,7 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
                        else f"{r}::{t} AS {q(c)}" if _is_text(t)
                        else f"NULLIF({r}, '')::{t} AS {q(c)}")
     add(f"CREATE TEMP TABLE _stg ON COMMIT DROP AS SELECT _row_no, {', '.join(sel)} FROM _raw r "
-        "WHERE NOT EXISTS (SELECT 1 FROM _rej b WHERE b.row_no = r._row_no);\nDROP TABLE _raw;\n")
+        "WHERE NOT EXISTS (SELECT 1 FROM _rej b WHERE b.row_no = r._row_no);\nTRUNCATE _raw;\n")
 
     # 3. NOT NULL + CHECK in one pass
     tests = [f"CASE WHEN {q(c)} IS NULL THEN {lit('NOT_NULL:' + c)} END" for c in plan["not_null"]]
@@ -200,11 +222,14 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
                 f"FROM _stg s JOIN {tgt} t ON {join} WHERE {diff};\n")
         add("DELETE FROM _stg s WHERE EXISTS (SELECT 1 FROM _rej r WHERE r.row_no = s._row_no);\n")
 
-    # 7. report what was found (echoed to the client even if the file then fails), then the threshold
-    add("INSERT INTO _c SELECT 'rejected', count(*) FROM _rej WHERE reason <> 'DUP_IN_FILE';\n"
-        "INSERT INTO _c SELECT 'dup', count(*) FROM _rej WHERE reason = 'DUP_IN_FILE';\n"
-        "INSERT INTO _c SELECT 'staged', count(*) FROM _stg;\n"
-        "SELECT '@@COUNTS@@' || json_object_agg(k, n) FROM _c;\n"
+    # 7. report what was found (echoed to the client even if the file then fails), then the reject limit. A source row that breaks several
+    #    rules has one entry per reason in _rej but is ONE rejected row. A chunk counts only its own rows (row_no is the file's record number).
+    mine = f" AND row_no >= (SELECT n FROM _c WHERE k = 'lo{sfx}')" if ci else ""
+    add(f"INSERT INTO _c SELECT 'rejected{sfx}', count(DISTINCT row_no) FROM _rej WHERE reason <> 'DUP_IN_FILE'{mine};\n"
+        f"INSERT INTO _c SELECT 'dup{sfx}', count(DISTINCT row_no) FROM _rej WHERE reason = 'DUP_IN_FILE'{mine};\n"
+        f"INSERT INTO _c SELECT 'staged{sfx}', count(*) FROM _stg;\n")
+    add(COUNTS_ECHO +
+        "SELECT '@@REJ_BEGIN@@';\n"
         "SELECT '@@REJ_SUMMARY@@' || json_build_object('reason', reason, 'detail', detail, 'n', n) "
         "FROM (SELECT reason, detail, count(*) AS n FROM _rej GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 200) g;\n"
         "SELECT '@@REJ_ROW@@' || json_build_object('row_no', row_no, 'reason', reason, 'detail', detail, 'row', row_data) "
@@ -212,12 +237,11 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
         "SELECT '@@REJ_ROW@@' || json_build_object('row_no', row_no, 'reason', reason, 'detail', detail, 'row', row_data) "
         f"FROM (SELECT * FROM _rej WHERE reason = 'DUP_IN_FILE' ORDER BY row_no LIMIT {MAX_DUP_ROWS_PRINTED}) a;\n")
     if max_rejects and max_rejects > 0:
-        add("DO $$ DECLARE n bigint; msg text; BEGIN "
-            "SELECT c.n INTO n FROM _c c WHERE c.k = 'rejected'; "
-            f"IF n >= {int(max_rejects)} THEN "
+        add(f"DO $$ DECLARE nrej bigint; msg text; BEGIN nrej := {csum('rejected')}; "
+            f"IF nrej >= {int(max_rejects)} THEN "
             "SELECT string_agg('record ' || row_no || ' ' || reason || ' ' || coalesce(detail, ''), '; ') INTO msg "
             "FROM (SELECT * FROM _rej WHERE reason <> 'DUP_IN_FILE' ORDER BY row_no LIMIT 5) f; "
-            f"RAISE EXCEPTION 'Too many rejected rows: % (limit {int(max_rejects)}). First: %', n, msg; END IF; END $$;\n")
+            f"RAISE EXCEPTION 'Too many rejected rows: % (limit {int(max_rejects)}). First: %', nrej, msg; END IF; END $$;\n")
 
     if dry_run_sql is not None:                       # promote --dry-run: counts only, nothing is applied
         add(dry_run_sql)
@@ -227,21 +251,31 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
     # 8. apply: INSERT ... ON CONFLICT on the arbiter key, updating only rows that differ
     cap_spec = None
     if capture:
-        add(capture_setup_sql(schema, table, capture.get("full", False), seq=capture.get("seq"), strict=capture.get("strict", True)))
-        cap_spec = capture_spec(schema, table) if capture.get("downstream", True) else None
+        if not ci or ci == 1:                         # the empty-table / --full decision is made BEFORE the first rows are applied
+            add(capture_setup_sql(schema, table, capture.get("full", False), seq=capture.get("seq"), strict=capture.get("strict", True)))
+        base = f"(SELECT COALESCE(sum(n), 0) FROM _c WHERE split_part(k, '|', 1) = 'raw' AND k <> 'raw{sfx}')" if ci else None
+        cap_spec = dict(capture_spec(schema, table), row_base=base) if capture.get("downstream", True) else None
     add(apply_pre_sql)
     for stmt in upsert_statements(tgt, header_cols, cols, plan["arbiter"], plan["present"], plan["identity"],
-                                  keep_target=keep_target, capture=cap_spec, no_update=set(defaults)):
+                                  keep_target=keep_target, capture=cap_spec, no_update=set(defaults), sfx=sfx):
         add(stmt)
+    if ci:
+        add("DROP TABLE _stg;\n")
+    return "".join(s)
 
+
+def staged_epilogue(schema, table, header_cols, meta, trigger_mode, uri, log_sql, *, track="oracle", capture=None, post_sql=""):
+    """Row-count check over ALL chunks, the rejects, the one registry entry, sequences, triggers back on, log rows, COMMIT."""
+    _, on = _trigger_off_on(schema, table, meta, trigger_mode)
+    s = []
+    add = s.append
     # 9. nothing may disappear silently
     add("DO $$ DECLARE raw_n bigint; acc bigint; BEGIN "
-        "SELECT n INTO raw_n FROM _c WHERE k = 'raw'; "
-        "SELECT sum(n) INTO acc FROM _c WHERE k IN ('inserted', 'updated', 'unchanged', 'rejected', 'dup'); "
+        f"raw_n := {csum('raw')}; "
+        "SELECT sum(n) INTO acc FROM _c WHERE split_part(k, '|', 1) IN ('inserted', 'updated', 'unchanged', 'rejected', 'dup'); "
         "IF raw_n IS DISTINCT FROM acc THEN RAISE EXCEPTION 'Row count check failed: % rows read but % accounted for "
-        "(inserted + updated + unchanged + rejected + duplicates)', raw_n, acc; END IF; END $$;\n"
-        "SELECT '@@COUNTS@@' || json_object_agg(k, n) FROM _c;\n")
-
+        "(inserted + updated + unchanged + rejected + duplicates)', raw_n, acc; END IF; END $$;\n")
+    add(COUNTS_ECHO)
     # 10. persist rejects + log, restore triggers, commit
     add(f"DELETE FROM {REJECT_TABLE} WHERE uri = {lit(uri)} AND target_schema = {lit(schema)} AND target_table = {lit(table)};\n"
         f"INSERT INTO {REJECT_TABLE} (track, uri, target_schema, target_table, row_no, reason, detail, row_data, file_status) "
@@ -250,12 +284,61 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
         f"(SELECT * FROM _rej WHERE reason = 'DUP_IN_FILE' ORDER BY row_no LIMIT {MAX_REJECT_ROWS_PRINTED})) z;\n")
     if capture:
         add(registry_sql(schema, table, capture["run_id"], capture.get("uris", uri), header_cols, capture.get("layer"),
-                         "(SELECT n FROM _c WHERE k = 'inserted')", "(SELECT n FROM _c WHERE k = 'updated')",
+                         csum('inserted'), csum('updated'),
                          keep_delta=capture.get("downstream", True), message=capture.get("message")))
     add(post_sql)
     add(on)
     add(log_sql + "\nCOMMIT;\n")
     return "".join(s)
+
+
+def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trigger_mode, max_rejects, uri, log_sql, *,
+                        track="oracle", copy_from=None, keep_target=False, capture=None, pre_sql="", apply_pre_sql="", post_sql="",
+                        dry_run_sql=None, raw_cols=None, col_map=None, defaults=None):
+    """
+    The staged one-transaction script for a whole file in ONE pass (prologue + one chunk + epilogue; see the module docstring).
+    Besides Step 06 it is the apply script of `sweep.py promote` (which never chunks):
+      copy_from      replaces the `\\copy _raw ... FROM PROGRAM` line (e.g. FROM STDIN for the streamed transport)
+      keep_target    conflict policy keep_target: existing keys are not updated
+      capture        {run_id, layer, full, uris, downstream}: copy the applied delta to sweep_delta and register it
+      pre_sql        right after BEGIN (lock / statement timeouts), apply_pre_sql right before the apply (e.g. TRUNCATE)
+      post_sql       after the apply (sequences) ; dry_run_sql: report counts and ROLLBACK instead of applying
+      raw_cols       the columns of the FILE in file order (raw staging); col_map {table column: file column} and defaults
+                     {table column: SQL expression} come from the FE loader rules (sweep_fwd_rules): header_cols are TABLE columns
+    A chunked Step 06 load assembles the same pieces (staged_prologue / staged_chunk per chunk / staged_epilogue) in oracle_06_load_data.
+    """
+    col_map, defaults = col_map or {}, defaults or {}
+    raw_cols = raw_cols or [col_map.get(c, c) for c in header_cols if c not in defaults]
+    head = (staged_prologue(schema, table, raw_cols, meta, trigger_mode, pre_sql)
+            + (copy_from or copy_from_program(raw_cols, stream_cmd))
+            + staged_chunk(schema, table, header_cols, meta, plan, max_rejects, None, keep_target=keep_target, capture=capture,
+                           apply_pre_sql=apply_pre_sql, dry_run_sql=dry_run_sql, col_map=col_map, defaults=defaults))
+    if dry_run_sql is not None:
+        return head
+    return head + staged_epilogue(schema, table, header_cols, meta, trigger_mode, uri, log_sql, track=track, capture=capture, post_sql=post_sql)
+
+
+def fast_bulk_blockers(meta, header_cols, table_is_empty, has_rules=False):
+    """
+    Reasons why a table cannot take the direct-COPY path (empty list = it can). NOT NULL columns and identity columns do NOT block it:
+    COPY enforces NOT NULL itself (a violation fails the file) and identity columns are GENERATED BY DEFAULT. Keys, CHECK and foreign
+    keys need the staged path (duplicate handling, bad-row isolation), and so do FE column rules (ignore / rename / default).
+    """
+    why = []
+    if has_rules:
+        why.append("FE column rules (ignore / rename / default) apply to this table")
+    if not table_is_empty:
+        why.append("table is not empty")
+    if meta["keys"]:
+        why.append("table has a primary / unique key (" + ", ".join(k["name"] for k in meta["keys"][:3]) + ")")
+    if meta["checks"]:
+        why.append("table has CHECK constraint(s) (" + ", ".join(c["name"] for c in meta["checks"][:3]) + ")")
+    if meta["fks"]:
+        why.append("table has foreign key(s) (" + ", ".join(f["name"] for f in meta["fks"][:3]) + ")")
+    always = [c for c in header_cols if meta["columns"][c]["identity"] == "a"]
+    if always:
+        why.append("file carries GENERATED ALWAYS identity column(s) (" + ", ".join(always) + ")")
+    return why
 
 
 def load_log_insert(uri, schema, table, size_bytes, file_format, worker_id, s3_meta=None):

@@ -142,8 +142,8 @@ def build_unit_script(unit):
                 f"(PARTITION BY _dest, {kc} ORDER BY _row_no DESC) AS rn FROM _s{i}) w WHERE rn > 1) l "
                 f"WHERE s._row_no = l._row_no RETURNING s._row_no, s._dest, to_jsonb(s) - '_row_no' - '_dest' AS js) "
                 f"INSERT INTO _rej SELECT {i}, _dest, _row_no, 'DUP_IN_FILE', {lit('key (' + ','.join(arbiter) + ')')}, js FROM d;\n")
-        add(f"INSERT INTO _c SELECT 'rejected|{i}', count(*) FROM _rej WHERE f = {i} AND reason <> 'DUP_IN_FILE';\n"
-            f"INSERT INTO _c SELECT 'dup|{i}', count(*) FROM _rej WHERE f = {i} AND reason = 'DUP_IN_FILE';\n")
+        add(f"INSERT INTO _c SELECT 'rejected|{i}', count(DISTINCT row_no) FROM _rej WHERE f = {i} AND reason <> 'DUP_IN_FILE';\n"
+            f"INSERT INTO _c SELECT 'dup|{i}', count(DISTINCT row_no) FROM _rej WHERE f = {i} AND reason = 'DUP_IN_FILE';\n")
         for d in dests:
             add(f"INSERT INTO _c SELECT 'staged|{i}|{d}', count(*) FROM _s{i} WHERE _dest = {lit(d)};\n")
 
