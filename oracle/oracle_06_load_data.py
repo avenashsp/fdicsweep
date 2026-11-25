@@ -62,7 +62,7 @@ from sweep_platform import atomic_write_json
 from sweep_targeting import Selector, add_targeting_args, selector_or_exit, validate_or_exit
 from sweep_layers import add_layer_arg, ensure_layer, require_bronze, restrict_to_manifest
 from sweep_delta import ensure_delta_table, fast_registry_sql
-from sweep_fwd_rules import load_rules, resolve_columns, rules_for
+from sweep_fwd_rules import resolve_columns, rules_for
 from sweep_loadpipe import history_insert_sql, record_history_failure, tables_with_rows
 from sweep_migrate import require_migrated
 from sweep_merge import current_run_id
@@ -245,12 +245,12 @@ FWD_RULES = None
 
 
 def fwd_rules():
-    """FE loader rules of the database being loaded (read once per run)."""
-    global FWD_RULES
-    with LOCK:
-        if FWD_RULES is None:
-            FWD_RULES = load_rules()
-        return FWD_RULES
+    """
+    Step 06 loads BRONZE, the raw mirror of the source: FE files are never applied there (they run in silver and move on to gold_backup and
+    gold), so a bronze load has no loader rules. The FE rules are applied by `promote` (bronze -> silver). Always empty; the file header is
+    still checked against the table, and an unknown column fails the file.
+    """
+    return []
 
 
 def plan_file(job, region):

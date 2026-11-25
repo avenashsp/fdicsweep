@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-sweep_fwd_ddl.py - `sweep.py fwd-ddl`: the forward-engineering (FE) SQL files, applied by the Database team in ALL layers.
+sweep_fwd_ddl.py - `sweep.py fwd-ddl`: the forward-engineering (FE) SQL files, applied by the Database team in SILVER and then moved on to gold_backup and gold. They never run in bronze,
+which stays the raw mirror of the source; `promote` bridges the difference (the rules below are applied while bronze deltas enter silver).
 
 FE asks for tables to be created and Oracle / VSAM tables to be altered (add / drop / rename columns, retype ...). The changes are
 SQL files in `fwd_ddl/` (STRUCTURE ONLY) named `V<number>__<description>.sql`, applied in numeric order, once per database:
@@ -9,8 +10,8 @@ SQL files in `fwd_ddl/` (STRUCTURE ONLY) named `V<number>__<description>.sql`, a
   * ONE transaction per file (`-- sweep:no-transaction` for statements that cannot run in one); the catalog of the database is
     snapshotted before and after the file inside the same transaction and the difference is stored in sweep_ctl.fwd_ddl_changes;
   * data statements (INSERT / UPDATE / DELETE / COPY / TRUNCATE / MERGE, CREATE TABLE AS with data) are refused without --allow-data;
-  * pragmas (`-- sweep:layers`, `ignore-column`, `rename-column`, `default-column`, `skip-table`, `no-transaction`) register the loader
-    rules the Oracle / VSAM Step 06 loaders read from sweep_ctl.fwd_ddl_rules, so a delta file keeps loading after the change;
+  * pragmas (`-- sweep:layers`, `ignore-column`, `rename-column`, `default-column`, `skip-table`, `no-transaction`) register the
+    rules `promote` reads from sweep_ctl.fwd_ddl_rules of the target layer, so a bronze delta keeps loading into silver after the change;
   * the compatibility check compares, for every table the file touches, the SOURCE columns (Oracle: the Step 01 metadata; VSAM: the
     Step 02 column map) with the table after the file and BLOCKs the apply when the next delta load would fail;
   * `fwd-ddl promote` applies to the next layer the files the previous layer applied (the layers are separate databases).
@@ -190,7 +191,7 @@ class FwdFile:
     path: Path
     text: str
     checksum: str
-    layers: tuple = ("bronze", "silver", "gold_backup", "gold")
+    layers: tuple = ("silver", "gold_backup", "gold")
     rules: list = field(default_factory=list)          # (rule, schema, table, column, new_name, expression)
     no_transaction: bool = False
     statements: list = field(default_factory=list)     # (text, line)
@@ -710,9 +711,21 @@ def print_results(layer, results, sel=None):
             print(f"    compatibility {k['status']:<5} {k['schema']}.{k['t']}" + (f": {k['reason']}" if k["reason"] else ""))
 
 
+NOT_IN_BRONZE = ("FE files are never applied in {name}: bronze is the raw mirror of the source. Apply them in silver "
+                 "(`python3 sweep.py fwd-ddl apply --layer silver`); `fwd-ddl promote` moves them silver -> gold_backup -> gold")
+
+
+def fe_layers():
+    """The layers that get FE files: every layer except the first (bronze)."""
+    return [l for l in chain() if l.upstream is not None]
+
+
 def cmd_status(args):
-    """Read-only. Without --layer: every layer, and which layers are behind."""
-    layers = [get_layer(args.layer)] if getattr(args, "layer", None) else chain()
+    """Read-only. Without --layer: every FE layer (silver, gold_backup, gold), and which layers are behind."""
+    if getattr(args, "layer", None) and get_layer(args.layer).upstream is None:
+        print(NOT_IN_BRONZE.format(name=get_layer(args.layer).name))
+        return 0
+    layers = [get_layer(args.layer)] if getattr(args, "layer", None) else fe_layers()
     try:
         files = list_files()
     except FwdError as e:
@@ -753,6 +766,9 @@ def _selected_files(args, files):
 
 def cmd_apply(args):
     layer = ensure_layer(args, logger, required=True, db=False, ddl_what="fwd-ddl apply")
+    if layer.upstream is None:
+        print(f"Error: {NOT_IN_BRONZE.format(name=layer.name)}")
+        return 2
     dry = bool(getattr(args, "dry_run", False))
     try:
         files = list_files()
@@ -794,6 +810,9 @@ def cmd_promote(args):
         src, tgt = get_layer(args.from_layer), get_layer(args.to_layer)
         if tgt.upstream != src.name:
             raise LayerError(f"fwd-ddl promote moves ONE hop: {tgt.name!r} follows {tgt.upstream!r}, not {src.name!r}")
+        if src.upstream is None:
+            print(f"Error: {NOT_IN_BRONZE.format(name=src.name)}")
+            return 2
         from sweep_layers import require_ddl
         require_ddl(tgt, args, logger, "fwd-ddl promote")
         files = list_files()
@@ -833,7 +852,10 @@ def cmd_promote(args):
 
 def cmd_check(args):
     """Dry-run of every pending file (and the compatibility check) in each layer; nothing is written. gold / gold_backup need --allow-ddl."""
-    layers = [get_layer(args.layer)] if getattr(args, "layer", None) else chain()
+    if getattr(args, "layer", None) and get_layer(args.layer).upstream is None:
+        print(f"Error: {NOT_IN_BRONZE.format(name=get_layer(args.layer).name)}")
+        return 2
+    layers = [get_layer(args.layer)] if getattr(args, "layer", None) else fe_layers()
     try:
         files = list_files()
     except FwdError as e:

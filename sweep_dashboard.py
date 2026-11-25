@@ -51,6 +51,9 @@ def layer_info_lines(layer):
                            f"{r['failed']} failed  (run {r['run_id']})")
             else:
                 out.append("last promote: none")
+            if layer.upstream is None:
+                out.append("pending FE files: n/a (FE files are applied in silver, never in bronze)")
+                return out
             try:
                 pend = pending_files(layer, list_files())
                 out.append("pending FE files: " + (f"{len(pend)} ({', '.join(f.name for f in pend[:5])}{' ...' if len(pend) > 5 else ''})" if pend else "0"))

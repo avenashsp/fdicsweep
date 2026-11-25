@@ -1,4 +1,4 @@
-# Medallion layers, promote and migrate (v6.1.0)
+# Medallion layers, promote and migrate (v6.2.0)
 
 SWEEP now fills **four PostgreSQL databases in ONE Aurora cluster**, one per layer, in a fixed chain:
 
@@ -55,7 +55,7 @@ python3 sweep.py promote --purge [--dry-run]
 * **Model outputs** (`track=model_output`): the data models of `data_models/` run in silver (`python3 sweep.py models run`, see [data_models.md](data_models.md)); then `promote --from silver --to gold_backup`, then `--to gold`. Upsert on the primary key of the **changed rows only** (`IS DISTINCT FROM`); never a replace or truncate. **`promote --from silver` refuses a model output** whose model has no SUCCESS newer than its latest silver input delta (`--ignore-model-status` overrides).
 * **`--status`** prints the delta x layer matrix (`SUCCESS` / `FAILED` / `PENDING` / `BLOCKED`). **`--purge`** removes delta tables once **every** later layer applied them plus `SWEEP_DELTA_RETENTION_DAYS` (default 14); the registry rows stay.
 * **`--full`** copies the whole source table (baseline or resynchronization) instead of the deltas.
-* **Schema first, then data:** a hop is refused while the target layer has pending FE files that the source layer has already applied (`python3 sweep.py fwd-ddl promote --from L --to L` first; `--ignore-pending-fwd` overrides). See [fwd_ddl.md](fwd_ddl.md).
+* **FE files and promote:** FE files run in silver (never in bronze) and move on with `fwd-ddl promote`. A hop silver -> gold_backup / gold_backup -> gold is refused while the target layer has pending FE files that the source layer already applied (`python3 sweep.py fwd-ddl promote --from L --to L` first; `--ignore-pending-fwd` overrides). **bronze -> silver applies the FE rules of silver** (`ignore-column`, `rename-column`, `default-column`, `skip-table`) while it stages the bronze delta; a bronze column that is missing in silver and has no rule is still schema drift. See [fwd_ddl.md](fwd_ddl.md).
 * **`sweep_ctl.load_history`:** every load attempt - an S3 file (Oracle / VSAM Step 06) or a promote hop - is one append-only row (run id, track, layer, source, uri, table, SUCCESS / FAILED, rows read / inserted / updated / unchanged / rejected / duplicates, `rows_before` on the first row of a table = its ledger baseline, S3 metadata), written **inside the load transaction**; a failed attempt gets a FAILED row of its own.
 
 ### Gold safeguards (gold is live)
@@ -75,7 +75,7 @@ python3 sweep.py chain [--until bronze|silver|models|gold_backup|gold] [--skip-m
 The order of a Day-2 run, **stopping at the first failure**:
 
 ```
-load bronze from S3 -> fwd-ddl apply (bronze) -> fwd-ddl promote + promote (silver) -> RUN THE DATA MODELS in silver
+load bronze from S3 (raw, no FE files) -> promote bronze -> silver -> fwd-ddl apply (silver) -> RUN THE DATA MODELS in silver
   -> fwd-ddl promote + promote (gold_backup: deltas and model outputs together) -> fwd-ddl promote + promote (gold)
 ```
 

@@ -60,8 +60,7 @@ from sweep_common import (
 from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
 from sweep_layers import add_layer_arg, ensure_layer, require_bronze, restrict_to_manifest
 from sweep_delta import ensure_delta_table
-from sweep_fwd_ddl import load_fe_changes
-from sweep_fwd_rules import load_rules, resolve_columns, rules_for
+from sweep_fwd_rules import resolve_columns, rules_for
 from sweep_merge import current_run_id
 from sweep_migrate import require_migrated
 from sweep_loadpipe import (REJECT_TABLE, ensure_reject_table, load_table_meta, parse_output, probe_trigger_mode,
@@ -794,7 +793,7 @@ def main():
     if sel.dry_run:
         # reads each file header and runs the same plan check as the real load (table, columns, required columns, FE rules) WITHOUT loading
         problems = 0
-        rules_all = load_rules()
+        rules_all = []           # bronze never has FE rules (FE files run in silver); `promote` applies them
         for n, t in enumerate(tasks):
             label = f"{t.get('s3_filename') or Path(t['full_path']).name} -> {','.join(t.get('target_schemas') or [])}.{t['target_table']}"
             try:
@@ -851,7 +850,7 @@ def main():
 
     # HEAD right before loading: the load_log rows store exactly what was loaded
     heads = head_many([t["full_path"] for t in tasks])
-    run = {"fwd_rules": load_rules(), "fe": load_fe_changes(), "max_rejects": args.max_rejects, "heads": heads, "replica": probe_trigger_mode() == "replica",
+    run = {"fwd_rules": [], "fe": None, "max_rejects": args.max_rejects, "heads": heads, "replica": probe_trigger_mode() == "replica",
            "capture": {"run_id": current_run_id(), "layer": "bronze", "full": args.full}}
 
     results = [{"s3_filename": t.get("s3_filename"), "filename": t.get("s3_filename"), "table": t["target_table"], "uri": t["full_path"],

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [6.2.0] - 2026-11-25
+
+**FE (forward-engineering) SQL files never run in bronze any more.** Bronze stays the raw mirror of the source; the FE files are applied in **silver** and moved on silver -> gold_backup -> gold. See `docs/fwd_ddl.md`.
+
+### Changed
+- **`fwd-ddl`** refuses bronze: `apply --layer bronze`, `promote --from bronze ...` and `check --layer bronze` exit with code 2 (`FE files are never applied in bronze`); `status` says so for bronze and, like `check`, lists only silver, gold_backup and gold without `--layer`. `--allow-ddl` is still required on gold_backup and gold. The `layers` pragma defaults to silver, gold_backup and gold.
+- **`promote` applies the FE rules of the TARGET layer** (`sweep_ctl.fwd_ddl_rules`: `ignore-column`, `rename-column`, `default-column`, `skip-table`) while it stages a delta, so a bronze delta keeps loading into an FE-changed silver table. A source column that is missing in the table and has no rule is still schema drift (the message now names the pragmas); a `skip-table` table is reported `SKIPPED`. The Oracle and VSAM Step 06 loaders load bronze and have no FE rules any more (an unknown column fails the file).
+- **FE gate of `promote`:** only between FE layers (silver -> gold_backup, gold_backup -> gold) while the target has pending FE files the source already applied; bronze -> silver is never gated.
+- **`chain` order:** load bronze -> promote bronze -> silver -> `fwd-ddl apply` (silver) -> data models -> `fwd-ddl promote` + promote gold_backup (deltas and model outputs) -> `fwd-ddl promote` + promote gold. It never runs the models while silver has pending FE files; `--until silver` stops after the silver FE files.
+- **`monitor --layer bronze`** shows `pending FE files: n/a`. `validate` / the validation steps classify `FE_*` differences from silver downwards; bronze has none.
+- Version 6.2.0; the changelog file is `CHANGELOG_v6.2.0.md`.
+
+### Tests
+- FE tests now apply in silver; new tests: bronze refusal (apply / promote / check / status), promote applying ignore / rename / default / skip rules and still failing on a source column without a rule, the FE gate only between FE layers, the new chain order, and a bronze loader that ignores a stray rules row.
+
+---
+
 ## [6.1.0] - 2026-11-25
 
 Adds the **FE SQL files**, the **validation / ledger / monitor** features and the **data models inside the repository** on top of the 6.0.0 medallion chain. Schema first (FE files), then data (promote), then the models, then the next layer. See `docs/fwd_ddl.md` and `docs/data_models.md`.

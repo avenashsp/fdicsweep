@@ -280,49 +280,19 @@ def env_of(d):
 _ENV = {}
 
 
-def test_vsam_loader_rules_ignore_rename_default_skip_and_unknown_column(repo):
+def test_vsam_bronze_loader_has_no_fe_rules_unknown_column_fails_and_dry_run_says_so(repo):
     d, data, env = repo
     _ENV[str(d)] = env
     for step in STEPS[:6]:
         run(d, env, step)
-    # FE dropped the column the source file still carries -> without a rule the file FAILS (it used to be dropped silently)
+    # a column the table lost (FE files run in silver, so this only happens by hand) -> the file FAILS, it is not dropped silently
     _fe_sql("ALTER TABLE @S@.stg_achfile_v DROP COLUMN effective_date")
     _newer_snapshot(d, data)
     r = run(d, env, "vsam_06_load_data", check=False)
     assert "not found in table: effective_date" in (r.stdout + r.stderr) and "docs/fwd_ddl.md" in (r.stdout + r.stderr)
     assert _q("SELECT status_code FROM bss01104.stg_achfile_v WHERE account_number = 1001") == "A"           # nothing changed
-    # dry-run reports the same problem before the real run
     r = run(d, env, "vsam_06_load_data", "--dry-run", check=False)
     assert r.returncode != 0 and "PROBLEM" in r.stdout and "effective_date" in r.stdout
-    _rule("ignore-column", "effective_date")
-    assert "OK" in run(d, env, "vsam_06_load_data", "--dry-run").stdout
-    run(d, env, "vsam_06_load_data")
-    assert _q("SELECT status_code FROM bss01104.stg_achfile_v WHERE account_number = 1001") == "Z"           # loaded, column ignored
-
-    # rename: the table column is called status now
-    _fe_sql("ALTER TABLE @S@.stg_achfile_v RENAME COLUMN status_code TO status")
-    _newer_snapshot(d, data, status="Y")
+    _rule("ignore-column", "effective_date")                                                                 # a rules row in bronze is never applied
+    assert run(d, env, "vsam_06_load_data", "--dry-run", check=False).returncode != 0
     assert run(d, env, "vsam_06_load_data", check=False).returncode != 0
-    _rule("rename-column", "status_code", "status")
-    run(d, env, "vsam_06_load_data")
-    assert _q("SELECT status FROM bss01104.stg_achfile_v WHERE account_number = 1001") == "Y"
-
-    # default: a new NOT NULL column the file does not have
-    _fe_sql("ALTER TABLE @S@.stg_achfile_v ADD COLUMN region text NOT NULL DEFAULT 'x'; ALTER TABLE @S@.stg_achfile_v ALTER COLUMN region DROP DEFAULT")
-    _q("UPDATE bss01104.stg_achfile_v SET region = 'old'")
-    _newer_snapshot(d, data, status="X")
-    assert run(d, env, "vsam_06_load_data", check=False).returncode != 0
-    _rule("default-column", "region", expr="'new'")
-    run(d, env, "vsam_06_load_data")
-    assert _q("SELECT status || ':' || region FROM bss01104.stg_achfile_v WHERE account_number = 1001") == "X:old"      # existing rows keep their value
-    _fe_sql("ALTER TABLE @S@.stg_achfile_v ADD COLUMN extra_new int")                                   # nullable: adding columns needs no rule
-    _newer_snapshot(d, data, status="W")
-    run(d, env, "vsam_06_load_data")
-    assert _q("SELECT status FROM bss01104.stg_achfile_v WHERE account_number = 1001") == "W"
-
-    # skip-table: the table was dropped by FE
-    _fe_sql("DROP TABLE @S@.stg_achfile_v")
-    _rule("skip-table")
-    _newer_snapshot(d, data, status="V")
-    r = run(d, env, "vsam_06_load_data")
-    assert "SKIPPED" in r.stdout and "skip-table rule" in r.stdout

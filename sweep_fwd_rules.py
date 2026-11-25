@@ -2,20 +2,21 @@
 """
 sweep_fwd_rules.py - the loader rules registered by FE files (`-- sweep:ignore-column | rename-column | default-column | skip-table`).
 
-The Step 06 loaders read the rules of the table from sweep_ctl.fwd_ddl_rules of the database they load into (bronze) and apply them
-while staging a file:
+FE files are applied in silver (never in bronze). `promote` reads the rules of the table from sweep_ctl.fwd_ddl_rules of the TARGET layer
+and applies them while staging the delta of the previous layer (the Step 06 loaders load bronze and have no rules):
   ignore-column   the file still carries the column, the table no longer has it: it stays in the raw staging table and is left out of the typed one
   rename-column   the file column old_name loads into the table column new_name
   default-column  the file has no such column: the typed staging table gets the SQL expression (existing rows are never overwritten with it)
   skip-table      the table was dropped: its files are reported SKIPPED, not failed
-A file column that is not in the table and has no rule still FAILS (an unexpected source change is never hidden). Delta capture and promote use
-the TABLE's column names, so the other layers need no rules.
+A source column that is not in the table and has no rule still FAILS (an unexpected source change is never hidden). Delta capture uses the
+TABLE's column names, so the deltas from silver onwards already match the tables of the next layers.
 """
 from dataclasses import dataclass, field
 
 from sweep_common import CTL_SCHEMA, query_db_dicts
 
-FWD_HELP = "add a `-- sweep:ignore-column` / `rename-column` pragma to an FE file (see docs/fwd_ddl.md) or fix the source file"
+FWD_HELP = ("bronze mirrors the source: fix the source file or the table; a deliberate change is made in silver with an FE file "
+            "(`-- sweep:ignore-column` / `rename-column`, see docs/fwd_ddl.md), which `promote` applies")
 
 
 def load_rules():

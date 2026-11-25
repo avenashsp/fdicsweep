@@ -1,4 +1,4 @@
-# SWEEP: Unified Data Migration Framework (v6.1.0)
+# SWEEP: Unified Data Migration Framework (v6.2.0)
 
 SWEEP migrates large financial datasets into **AWS RDS Aurora PostgreSQL** from two sources:
 
@@ -72,10 +72,10 @@ python3 sweep.py oracle load-data --layer bronze               # S3 is read into
 python3 sweep.py promote --from bronze --to silver             # one hop, applying the captured deltas in sequence order
 python3 sweep.py promote --from silver --to gold_backup --dry-run
 python3 sweep.py fwd-ddl status                                 # FE SQL files (fwd_ddl/) applied / pending per layer
-python3 sweep.py fwd-ddl apply --layer bronze                   # then: fwd-ddl promote --from bronze --to silver ...
+python3 sweep.py fwd-ddl apply --layer silver                   # FE files run in silver only; then: fwd-ddl promote --from silver --to gold_backup ...
 python3 sweep.py models run                                     # the data models (data_models/) in silver, when an input changed
 python3 sweep.py validate --layer silver                        # one report and a verdict per layer
-python3 sweep.py chain --until gold_backup                     # load bronze, FE files, silver, models, gold_backup, review ...
+python3 sweep.py chain --until gold_backup                     # load bronze, promote to silver, FE files, models, gold_backup, review ...
 python3 sweep.py promote --from gold_backup --to gold          # ... then gold (explicit; gold is the live database)
 python3 sweep.py promote --status                              # delta x layer status matrix
 ```
@@ -146,4 +146,4 @@ python3 tools/make_package.py         # fdicsweep_package_v<version>.docx in pac
 - [Targeted runs, merge-safe outputs, log tables](docs/targeting_and_outputs.md)
 - [Flag and environment reference](docs/flag_arguments.md)
 - [Sample outputs](docs/sweep_outputs.md)
-- [Changelog](CHANGELOG_v6.1.0.md)
+- [Changelog](CHANGELOG_v6.2.0.md)

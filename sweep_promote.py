@@ -32,6 +32,7 @@ from sweep_delta import REGISTRY, TOOL_AUDIT_COLS, ensure_delta_table
 from sweep_layers import (LayerError, chain, get_layer, layer_conn, read_manifest, same_credentials, use_layer, validate_manifest_rows)
 from sweep_loadpipe import (ensure_reject_table, history_insert_sql, load_table_meta, parse_output, persist_failed_file_rejects,
                             probe_trigger_mode, record_history_failure)
+from sweep_fwd_rules import load_rules, resolve_columns, rules_for
 from sweep_merge import current_run_id
 from sweep_s3meta import canon_time
 from sweep_platform import group_popen_kwargs, kill_process_group
@@ -264,8 +265,11 @@ def apply_one(src, tgt, mrow, delta, opts, meta_cache):
     mode, policy = mrow["promote_mode"], mrow["conflict_policy"]
     if mode == "replace" and not tgt.allow_ddl:
         raise PromoteError(f"promote_mode=replace is refused on layer {tgt.name}: nothing is ever truncated or replaced there")
+    rules = rules_for(opts.get("fwd_rules") or [], schema, table)       # the FE rules of the TARGET layer (sweep_ctl.fwd_ddl_rules)
     tmeta = meta_cache.get((schema, table)) or load_table_meta(schema, table)
     meta_cache[(schema, table)] = tmeta
+    if rules.skip:
+        raise PromoteError(f"SKIP table {schema}.{table} was dropped by an FE file in {tgt.name} (skip-table rule)")
     if not tmeta["columns"]:
         raise PromoteError(f"table {schema}.{table} does not exist in {tgt.database}: tables are created by Steps 04/05 or a "
                            f"controlled migration, never by promote")
@@ -275,13 +279,21 @@ def apply_one(src, tgt, mrow, delta, opts, meta_cache):
         src_cols = table_columns(schema, table, src.database)
         if not src_cols:
             raise PromoteError(f"table {schema}.{table} does not exist in the source layer {src.name}")
-        header_cols = [n for n, g in src_cols if not g and n not in TOOL_AUDIT_COLS]
+        file_cols = [n for n, g in src_cols if not g and n not in TOOL_AUDIT_COLS]
     else:
-        header_cols = [x for x in delta["columns"] if x]
-    missing = [x for x in header_cols if x not in tmeta["columns"]]
+        file_cols = [x for x in delta["columns"] if x]
+    # the columns of the source map onto the table through the FE rules of the target layer (ignore / rename / default);
+    # a source column the table lacks and no rule covers is still schema drift - an unexpected change is never hidden
+    missing = [x for x in file_cols if x not in rules.ignore and rules.rename.get(x, x) not in tmeta["columns"]]
     if missing:
         raise PromoteError(f"schema drift: column(s) {', '.join(missing)} of {src.name}.{schema}.{table} are missing in {tgt.name}; "
-                           f"no automatic ALTER is ever made - the Database team adds them with a controlled migration")
+                           f"no automatic ALTER is ever made - the Database team adds them with a controlled migration, "
+                           f"or an FE file maps them (`-- sweep:ignore-column` / `rename-column`, docs/fwd_ddl.md)")
+    resolution = resolve_columns(file_cols, tmeta["columns"], rules)
+    if resolution.problem:
+        raise PromoteError(f"schema drift: {resolution.problem}")
+    raw_cols = [x for x in file_cols if x not in resolution.ignored]          # what is copied from the source
+    header_cols = resolution.table_cols                                       # the table columns that are loaded (incl. default columns)
     plan, problem = plan_load(tmeta, header_cols)
     if problem:
         raise PromoteError(f"schema drift: {problem}" if "NOT NULL" in problem else problem)
@@ -318,10 +330,10 @@ def apply_one(src, tgt, mrow, delta, opts, meta_cache):
     log_sql += "\n" + history_insert_sql(track, tgt.name, "promote", opts["run_id"], uri, schema, table,
                                          read=_c("raw"), inserted=_c("inserted"), updated=_c("updated"), unchanged=_c("unchanged"),
                                          rejected=_c("rejected"), dup=_c("dup"), reset=replace)
-    argv = source_argv(layer_conn(src), source_copy_sql(header_cols, schema, table, seq, delta["delta_table"]))
+    argv = source_argv(layer_conn(src), source_copy_sql(raw_cols, schema, table, seq, delta["delta_table"]))
     transport = opts["transport"]
     if transport == "stream":
-        col_list = ", ".join(q(x) for x in header_cols)
+        col_list = ", ".join(q(x) for x in raw_cols)
         copy_from, stream_cmd = f"\\copy _raw ({col_list}) FROM STDIN WITH (FORMAT csv, HEADER true, ENCODING 'UTF8');\n{STREAM_MARK}\n", ""
     else:
         copy_from, stream_cmd = None, program_literal(argv)
@@ -332,7 +344,7 @@ def apply_one(src, tgt, mrow, delta, opts, meta_cache):
     script = build_staged_script(
         schema, table, header_cols, stream_cmd, tmeta, plan, trig, 0, uri, log_sql, track=track, copy_from=copy_from,
         keep_target=keep_target, capture=None if dry else capture, pre_sql=timeout_sql(tgt), apply_pre_sql=apply_pre,
-        post_sql=sequence_sql(schema, table, tmeta),
+        post_sql=sequence_sql(schema, table, tmeta), raw_cols=raw_cols, col_map=resolution.col_map, defaults=resolution.defaults,
         dry_run_sql=dry_run_counts_sql(tgt_sql, header_cols, tmeta["columns"], plan, keep_target, replace) if dry else None)
     res = run_apply_script(script, transport, argv, "-c synchronous_commit=off" if not dry else "-c statement_timeout=0")
     if os.environ.get("SWEEP_PROMOTE_DEBUG_DIR"):          # keeps the generated script and its output for troubleshooting
@@ -411,6 +423,10 @@ def promote_table(src, tgt, mrow, opts, meta_cache):
     name = f"{mrow['schema']}.{mrow['table']}"
     res = {"table": name, "track": mrow["track"], "mode": mrow["promote_mode"], "inserted": 0, "updated": 0, "unchanged": 0,
            "rejected": 0, "deltas": 0, "status": "UP_TO_DATE", "message": ""}
+    if rules_for(opts.get("fwd_rules") or [], mrow["schema"], mrow["table"]).skip:     # dropped by an FE file of the target layer
+        res.update(status="SKIPPED", message=f"table {name} was dropped by an FE file in {tgt.name} (skip-table rule)")
+        logger.warning(f"{name}: {res['message']}")
+        return res
     try:
         deltas = with_lock_retry(lambda: plan_deltas(src, tgt, mrow, opts))
     except (PromoteError, RuntimeError) as e:
@@ -501,7 +517,7 @@ def promote(from_layer, to_layer, tables=None, full=False, dry_run=False, worker
     from sweep_migrate import LATEST_VERSION
     src, tgt = check_hop(from_layer, to_layer)
     rows = select_rows(src, tgt, tables)
-    if not ignore_pending_fwd:       # schema first, then data: the FE files of the source layer must be in the target layer
+    if not ignore_pending_fwd and src.upstream is not None:   # schema first, then data: the FE files of an FE layer (silver ->) must be in the next layer. bronze has none
         pending = fwd_pending_between(src, tgt)
         if pending:
             raise LayerError(f"{tgt.name} has {len(pending)} pending FE file(s) that {src.name} already applied: {', '.join(pending[:5])}"
@@ -535,6 +551,7 @@ def promote(from_layer, to_layer, tables=None, full=False, dry_run=False, worker
                 raise LayerError(f"{dbname} (layer {lay.name}) is not migrated: run `python3 sweep.py migrate --layer {lay.name}` first")
         opts["transport"] = pick_transport(transport)
         ensure_reject_table()
+        opts["fwd_rules"] = load_rules()
         logger.info(f"promote {src.name} -> {tgt.name}: {len(rows)} table(s), transport {opts['transport']}, run {opts['run_id']}"
                     + (" [DRY RUN]" if dry_run else "") + (" [FULL]" if full else ""))
         jobs = [{"target_schema": r["schema"], "target_table": r["table"], "size_bytes": 0, "filename": f"{r['schema']}.{r['table']}", "row": r}
@@ -689,8 +706,9 @@ def run_chain(until=None, load_cmds=None, workers=4, transport=None, tables=None
               models_args=None):
     """
     The order of a Day-2 run (schema first, then data, per layer):
-      load bronze from S3 -> fwd-ddl apply (bronze) -> fwd-ddl promote + data promote (silver) -> RUN THE DATA MODELS in silver ->
+      load bronze from S3 (raw, no FE files ever) -> data promote bronze -> silver -> fwd-ddl apply (silver) -> RUN THE DATA MODELS in silver ->
       fwd-ddl promote + data promote (gold_backup: Oracle deltas AND model outputs) -> fwd-ddl promote + data promote (gold)
+    The FE rules of silver (ignore / rename / default / skip) are applied by the bronze -> silver promote.
     It stops at the first failure. `until` is one of bronze, silver, models, gold_backup, gold. It never continues past silver while silver
     has pending FE files (the models read the FE-changed tables). `skip_models` promotes without running the models.
     FE files for gold_backup / gold are applied only with `allow_ddl` (they are DDL on live layers).
@@ -711,10 +729,6 @@ def run_chain(until=None, load_cmds=None, workers=4, transport=None, tables=None
         if subprocess.run(cmd, cwd=str(c.BASE_DIR), env=os.environ.copy()).returncode != 0:
             logger.error(f"chain stopped: the {names[0]} load failed")
             return EXIT_FAILED
-    logger.info("chain: FE (fwd-ddl) files of bronze")
-    if fd.cmd_apply(_fwd_args("bronze", dry_run=dry_run)) != 0:
-        logger.error("chain stopped: fwd-ddl apply on bronze failed (nothing was promoted)")
-        return EXIT_FAILED
     if not reached("silver"):
         return 0
     hops = list(zip(layers, layers[1:]))                      # bronze->silver, silver->gold_backup, gold_backup->gold
@@ -732,7 +746,7 @@ def run_chain(until=None, load_cmds=None, workers=4, transport=None, tables=None
                 if pend:
                     logger.error(f"chain stopped: silver has {pend} pending FE file(s); apply them before the models run")
                     return EXIT_FAILED
-        pending = fwd_pending_between(src, tgt)
+        pending = fwd_pending_between(src, tgt) if src.upstream is not None else []     # FE files start in silver
         if pending:
             if not tgt.allow_ddl and not allow_ddl:
                 logger.error(f"chain stopped: {len(pending)} FE file(s) must be applied to {tgt.name} ({', '.join(pending[:3])}); "
@@ -747,8 +761,12 @@ def run_chain(until=None, load_cmds=None, workers=4, transport=None, tables=None
         if code != 0:
             logger.error(f"chain stopped at {tgt.name}: {src.name} -> {tgt.name} had failures (later layers are not touched)")
             return code
-        if tgt.name == "silver":
-            pend = fd.pending_count("silver")
+        if src.upstream is None:           # data reached the first FE layer (silver): now its FE files, schema AFTER the raw data of bronze
+            logger.info(f"chain: FE (fwd-ddl) files of {tgt.name}")
+            if fd.cmd_apply(_fwd_args(tgt.name, dry_run=dry_run, allow_ddl=allow_ddl or tgt.allow_ddl)) != 0:
+                logger.error(f"chain stopped: fwd-ddl apply on {tgt.name} failed (nothing was promoted further)")
+                return EXIT_FAILED
+            pend = 0 if dry_run else fd.pending_count(tgt.name)
             summary = "none" if not pend else f"{pend} pending - apply them before data modelling"
             logger.info(f"chain: silver is ready for the data models; pending FE files in silver: {summary}")
             if pend:
