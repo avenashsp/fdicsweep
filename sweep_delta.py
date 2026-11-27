@@ -17,7 +17,8 @@ DELTA_SCHEMA = "sweep_delta"
 REGISTRY = f"{CTL_SCHEMA}.delta_registry"
 # audit columns the TOOL sets itself (never copied between layers); createddate / createdby / modifieddate / modifiedby can be
 # source data, so they travel with the rows when a file or delta carries them
-TOOL_AUDIT_COLS = {"createddate_m", "createdby_m"}
+from sweep_audit import AUDIT_SET
+TOOL_AUDIT_COLS = AUDIT_SET      # the six canonical audit columns (never compared by delta / self-compare)
 
 
 def delta_table_name(schema, table):

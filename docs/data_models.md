@@ -1,4 +1,4 @@
-# Data models (v6.2.3) - `data_models/` and `sweep.py models`
+# Data models (v6.3.0) - `data_models/` and `sweep.py models`
 
 The data models are **Python scripts in this repository** (`data_models/<NN>_<name>.py`). They run in **silver**, after the bronze -> silver promote and **before** the promote to gold_backup. The runner starts each script in
 its own subprocess and gives it only the silver credentials.
@@ -13,8 +13,9 @@ python3 sweep.py chain [--until bronze|silver|models|gold_backup|gold] [--skip-m
 ## 1. Layout
 
 ```
-data_models/37_brokerglpair.py         the script (committed)
-data_models/37_brokerglpair.analysis.md the analysis note written before the script was changed (rule R8)
+data_models/DM03_bank.py                the script (committed); numbered `NN_name.py` or `DMnn_name.py`, ordered by the number
+data_models/DM03_bank.analysis.md       the analysis note (rule R8)
+data_models/_dm_support.py              shared helpers of DM01-DM06 (a file starting with `_` is never a model)
 data_models/models.json                optional per-model overrides (see 3)
 data_models/config/<model>/            files people edit (committed), SWEEP_MODEL_CONFIG
 data_models/work/<model>/<run_id>/     files the script generates (git-ignored), SWEEP_MODEL_WORKDIR
@@ -43,7 +44,7 @@ A literal dict at the top of the script, read with `ast.literal_eval` (the scrip
 
 ```python
 SWEEP_MODEL = {
-    "name": "brokerglpair",
+    "name": "dm02_brokerglpair",
     "inputs": ["bss00098.stg_genledgeinterface_v", "bcs.broker"],
     "outputs": ["bcs.brokerglpair"],
     "depends_on": [],
@@ -84,7 +85,7 @@ The runner verifies every output table: it exists and has a **primary key** or i
 
 ## 9. Rules for adapting a script (R1 - R13)
 
-1. **R1** Do not change the core logic. Prove it: a test compares the adapted script's output rows with the original script's (`tests/test_brokerglpair.py`, golden comparison).
+1. **R1** Do not change the core logic. Prove it: a test compares the adapted script's output rows with the original script's (for DM01-DM06 the tests in `tests/test_dm_models.py` check dry-run default, the six audit columns and the cleanups).
 2. **R2** Add the `SWEEP_MODEL` header.
 3. **R3** The connection comes from the libpq environment; command-line options still override.
 4. **R4** `--execute` (dry run without it) and `--mode full|delta`.
@@ -93,15 +94,53 @@ The runner verifies every output table: it exists and has a **primary key** or i
 7. **R7** Print the `SWEEP_MODEL_RESULT` line and exit non-zero on error.
 8. **R8** Write an analysis note (`data_models/<script>.analysis.md`) before changing a script.
 9. **R9 (source schema)** The source schema is always `bss00098`. Never `bss00099`.
-10. **R10 (testing tables)** A table name ending in `_backup` is a testing table: the real name drops the suffix (the target of `37_brokerglpair.py` is `bcs.brokerglpair`). An **input** name ending in `_backup` is not changed but reported.
+10. **R10 (testing tables)** A table name ending in `_backup` is a testing table: the real name drops the suffix (the target of DM02 is `bcs.brokerglpair`). An **input** name ending in `_backup` is not changed but reported.
 11. **R11 (outputs)** An output table never has the name of a loaded table (the runner guard of section 6).
 12. **R12 (idempotent, never destructive)** A model never truncates, drops, or deletes and re-inserts. Default strategy: **`update_in_place`** with a key derived from the source key - insert when no output row has the key; update the non-key business columns only where a value differs (NULL-safe) in a row the model created (audit `modifiedby` / `modifieddate`); leave a row somebody else created alone and count it as `skipped_foreign`; `id`, `createddate` and `createdby` never change. Re-running the same delta changes nothing. A legacy `--replace` is refused when `SWEEP_RUN_ID` is set. If the key is not unique or the mapping is unclear, **STOP and ask**.
 13. **R13** Use `insert_missing` only when no key can be derived, and only after asking.
 
 A test fails when `bss00099` or an output name ending in `_backup` appears in `data_models/` or in a `SWEEP_MODEL` header.
 
-## 10. `37_brokerglpair.py`
+## 10. Real models DM01-DM06 (6.3.0)
 
-Source `bss00098.stg_genledgeinterface_v` (product codes 811, 812, 826, 827, 818, 819) and `bcs.broker` -> `bcs.brokerglpair`. The Hogan code -> broker mapping is `data_models/config/brokerglpair/hogan_broker_map.csv` (edit it there). Update key `(hogan_product_code, total_number)`.
-The result line reports `inserted`, `updated`, `unchanged`, `skipped_foreign`, `affected_source_rows`. In delta mode only the source rows of the delta window are processed; a changed `bcs.broker` or an input read in full affects every row.
-**Not verified against real data:** that the key pair is unique in the real source and that the real target has a unique index on it. The script checks at run time (`UPDATE KEY NOT UNIQUE` stops the run, also in the dry run; a key matching several target rows rolls the transaction back; a missing unique index is a warning) - see `data_models/37_brokerglpair.analysis.md`.
+The six real models are standalone scripts that also run under the runner. Run by hand: `python3 data_models/DMnn_<name>.py` (dry run) and
+`python3 data_models/DMnn_<name>.py --execute`; the runner calls them with `--execute --mode full|delta` (both are idempotent: a model compares its
+source with its target and writes only the difference). The connection comes from the libpq environment (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`,
+`PGDATABASE`), overridable with `--host/--port/--user/--password/--db`. No host or password is hard-coded.
+
+| Model (name in `model_run_log`) | Output | Natural key | Strategy |
+|---|---|---|---|
+| `DM01_program_bank_capacity.py` (dm01_program_bank_capacity) | `bcs.program_bank_capacity` | `(broker_id, bank_id)` | NEW insert / CHANGED update; override `(108, 1707) -> 25000000.0000` |
+| `DM02_brokerglpair.py` (dm02_brokerglpair) | `bcs.brokerglpair` | `(hogan_product_code, total_number)` | insert if missing (replaces the former `37_brokerglpair.py`); map file `data_models/config/dm02_brokerglpair/hogan_broker_map.csv` |
+| `DM03_bank.py` (dm03_bank) | `bcs.bank` | `bankid` | adds `bank_statement_mnemonic` (`ALTER TABLE`), fills it from `bcs.stg_program_bank_primary_rec_v`, five manual overrides; `createdby_m` flips to `fe_migration` |
+| `DM04_program_bank_rate.py` (dm04_program_bank_rate) | `bcs.program_bank_rate` | `(bank_id, cusip_id)` | NEW insert / CHANGED update (join of 6 tables) |
+| `DM05_program_bank_rate_tier.py` (dm05_program_bank_rate_tier) | `bcs.program_bank_rate_tier` | `(program_bank_rate_id, tier_type)` | like DM04; `depends_on` DM04, so it runs after it |
+| `DM06_ledger_config.py` (dm06_ledger_config) | `<schema>.ledger_config` in 9 schemas | `(broker_id, tran_code)` = `pk_ledger_config1` | insert if missing; `--replace` / `--truncate` by hand only |
+
+Discovery accepts the prefix `DM(\d+)[_-]name` next to the old `NN_name`; models are ordered by the number, and the name in `model_run_log` is the
+lower-cased stem **with** the DM number (`dm03_bank`). A model whose output is also an Oracle table (`bcs.bank`) must be listed in the **silver
+manifest with track `model_output`** (the output-name guard of section 6 then lets it write that table; the Oracle row stays in the bronze manifest).
+Each script has a sibling `DMnn_<name>.analysis.md`. The adaptations of the originals: no `_bkp3` / `_backup` suffix on any table, `bss00098`,
+libpq environment, the `SWEEP_MODEL` header, `--mode`, `SWEEP_MODEL_WORKDIR` for generated files, the `SWEEP_MODEL_RESULT` line, and the audit handling below.
+
+### Audit columns in the models
+
+No `CREATED_BY` constant, no `migration_hub`, no literal in `createdby` / `createddate` / `modifiedby` / `modifieddate`. A model session sets
+`sweep.loader = 'fe_migration'`. Every run first executes `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` for the six audit columns and creates `trg_sweep_audit` (idempotent).
+INSERT: `createdby = modifiedby = SESSION_USER`, `createddate = modifieddate = now()` (one call), `createddate_m = now()`, `createdby_m = 'fe_migration'`.
+UPDATE: the data columns + `modifiedby = SESSION_USER` + `modifieddate = now()` (DM03 also `createdby_m = 'fe_migration'`). The model's own rows are recognised by
+`createdby_m = 'fe_migration'`. Legacy variants a target carries (`created_at`, `created_by`, ...) are filled with `CURRENT_TIMESTAMP` / `SESSION_USER` and never renamed.
+Details and the rules for every layer: [audit_columns.md](audit_columns.md).
+
+### DDL capture and replay (silver -> gold backup -> gold)
+
+A model may run DDL in silver (DM03: `ALTER TABLE bcs.bank ADD COLUMN bank_statement_mnemonic`). The runner starts every model with
+`PGOPTIONS='-c sweep.loader=fe_migration -c sweep.capture=<run_id>:<model>'`; the event trigger `sweep_capture_ddl` (migration 3, needs `rds_superuser`
+on Aurora) writes every DDL command of that session into `sweep_ctl.model_ddl_history`. After the run the runner applies the audit post-step to every
+output / created / altered table (also captured) and stores the list in `model_run_log.ddl_capture`. A run is refused (precondition (e)) when the event trigger does not exist.
+
+`promote` then replays the table's DDL **before** it copies the rows: from the *source* catalog it generates idempotent statements (the table when missing,
+missing columns - NOT NULL only with a default -, primary / unique / check constraints and plain indexes by name, the audit trigger), runs them in the target
+and records them in the target's `model_run_log`, so the next hop replays them too. It never drops anything and is not counted as drift. On a layer with
+`allow_ddl=false` (gold backup, gold) the replay needs **`promote --allow-ddl`** (also `chain --allow-ddl`); without it the promote reports the drift and names the flag.
+

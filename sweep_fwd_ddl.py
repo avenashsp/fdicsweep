@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import sweep_audit
 import sweep_common as c
 from sweep_common import CTL_SCHEMA, clip_error, get_logger, lit, norm_col, query_db_dicts, run_psql, run_psql_script
 from sweep_layers import LayerError, chain, ensure_layer, get_layer, use_layer, verify_database
@@ -480,6 +481,9 @@ SELECT coalesce(a.kind, b.kind) AS kind, coalesce(a.schema, b.schema) AS schema,
  WHERE b.kind IS NULL OR a.kind IS NULL OR a.detail IS DISTINCT FROM b.detail;
 SELECT '@@FWDCHG@@' || json_build_object('kind', kind, 'action', action, 'schema', schema, 'object', object, 'detail', detail) FROM _fd{n} ORDER BY kind, schema, object;
 """)
+    # audit post-step (6.3.0): every table the file created or altered carries the six canonical audit columns and the audit trigger
+    # (the FE file itself stays untouched; it runs in silver only). It runs after the diff, so the columns are not listed as FE changes.
+    s.append(sweep_audit.ensure_for_query_sql(f"SELECT schema AS s, tbl AS t FROM _fd{n} WHERE kind IN ('table', 'column') AND action <> 'dropped' AND tbl IS NOT NULL"))
     s.append(compat_sql(n, src_cols, rules))
     if not force and apply_:
         s.append(f"DO $blk$ BEGIN IF EXISTS (SELECT 1 FROM _chk{n} WHERE status = 'BLOCK') THEN RAISE EXCEPTION 'FWD_BLOCK: compatibility check failed for {f.name}'; END IF; END $blk$;\n")

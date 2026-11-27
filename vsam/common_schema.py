@@ -2,24 +2,15 @@
 """
 vsam/common_schema.py - Target table DDL building and live PostgreSQL inspection / load-strategy decisions.
 """
+import sweep_audit
 from sweep_common import DB_ERRORS, norm_col, q, query_db_rows
 from vsam.common_config import logger
 
 
-AUDIT_COLS = [
-    '  "createddate" timestamp without time zone DEFAULT CURRENT_TIMESTAMP',
-    '  "createdby" character varying(40) DEFAULT CURRENT_USER',
-    '  "modifieddate" timestamp without time zone DEFAULT CURRENT_TIMESTAMP',
-    '  "modifiedby" character varying(40) DEFAULT CURRENT_USER',
-    '  "createddate_m" timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP',
-    '  "createdby_m" character varying(40) NOT NULL DEFAULT CURRENT_USER',
-]
+AUDIT_COLS = sweep_audit.create_table_lines()      # the six canonical audit columns (sweep_audit)
 
 
-AUDIT_COL_NAMES = {
-    "createddate", "createdby", "modifieddate", "modifiedby",
-    "createddate_m", "createdby_m"
-}
+AUDIT_COL_NAMES = set(sweep_audit.AUDIT_NAMES)
 
 
 def build_table_ddl(schema: str, table: str, columns: list, key_cols: list):
@@ -59,7 +50,8 @@ def build_table_ddl(schema: str, table: str, columns: list, key_cols: list):
     pre_sql = (
         f"CREATE TABLE IF NOT EXISTS {q(schema)}.{q(table)} (\n"
         + ",\n".join(col_lines)
-        + "\n);"
+        + "\n);\n"
+        + sweep_audit.trigger_sql(schema, table)
     )
 
     post_sql = ""
@@ -94,24 +86,12 @@ def check_table_exists(schema: str, table: str) -> bool:
 def table_ddl(schema, table, p):
     """
     CREATE TABLE IF NOT EXISTS for target table.
-    Natively embeds the FDICSweep application audit columns:
-      createdby_m   varchar(40) NOT NULL DEFAULT CURRENT_USER
-      createddate_m timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
-      modifiedby    varchar(40) DEFAULT CURRENT_USER
-      modifieddate  timestamp DEFAULT CURRENT_TIMESTAMP
+    Natively embeds the six canonical audit columns (see sweep_audit / docs/audit_columns.md).
     """
     key = p.get("key", [])
     lines = [f'  {q(c["name"])} {c["sql_type"]}' + (" NOT NULL" if c["name"] in key else "") for c in p["columns"]]
 
-    # FDICSweep Standard Application Audit Columns (All 6 native audit columns)
-    lines.extend([
-        "  \"createddate\" timestamp without time zone DEFAULT CURRENT_TIMESTAMP",
-        "  \"createdby\" character varying(40) DEFAULT CURRENT_USER",
-        "  \"modifieddate\" timestamp without time zone DEFAULT CURRENT_TIMESTAMP",
-        "  \"modifiedby\" character varying(40) DEFAULT CURRENT_USER",
-        "  \"createddate_m\" timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP",
-        "  \"createdby_m\" character varying(40) NOT NULL DEFAULT CURRENT_USER"
-    ])
+    lines.extend(sweep_audit.create_table_lines())      # the six canonical audit columns
 
     if key:
         lines.append(f"  CONSTRAINT {q('pk_' + table)} PRIMARY KEY (" + ", ".join(q(k) for k in key) + ")")

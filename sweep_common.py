@@ -17,9 +17,11 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
+from sweep_audit import AUDIT_NAMES, AUDIT_SET, TAG_LOADER, TAG_MODEL      # the six audit columns (single source: sweep_audit), re-exported
 from sweep_platform import make_symlink, group_popen_kwargs, kill_process_group
 
-__version__ = "6.2.3"
+_AUDIT_REEXPORTS = (AUDIT_NAMES, AUDIT_SET, TAG_LOADER, TAG_MODEL)
+__version__ = "6.3.0"
 
 def get_next_version(current_ver: str) -> str:
     """
@@ -511,6 +513,7 @@ PSQL_APP_NAME = "sweep"
 # Applied to every psql session: literals are escaped the standard way (backslash is a plain
 # character), which the hand-built SQL in the loaders relies on.
 BASE_PGOPTIONS = "-c standard_conforming_strings=on"
+LOADER_TAG = os.getenv("SWEEP_LOADER_TAG", "")            # set by a loader / promote / model process: every psql session then runs with `-c sweep.loader=<tag>` (sweep_audit)
 EXTRA_PGOPTIONS = ""        # set by sweep_layers.use_layer: the layer's lock_timeout / statement_timeout for every psql session
 DEFAULT_PSQL_TIMEOUT = int(os.getenv("SWEEP_PSQL_TIMEOUT", "7200"))
 CONNECT_RETRIES = int(os.getenv("SWEEP_CONNECT_RETRIES", "3"))
@@ -528,6 +531,16 @@ _TRANSIENT_CONNECT_ERRORS = (
 )
 
 
+def set_loader_tag(tag):
+    """Makes every psql session of this process (and of its worker processes) a loader session: `-c sweep.loader=<tag>`."""
+    global LOADER_TAG
+    LOADER_TAG = tag or ""
+    if tag:
+        os.environ["SWEEP_LOADER_TAG"] = tag
+    else:
+        os.environ.pop("SWEEP_LOADER_TAG", None)
+
+
 def psql_env(extra_env=None, options=None):
     """
     Environment for a psql child process: password (if any), application_name for session
@@ -542,6 +555,8 @@ def psql_env(extra_env=None, options=None):
     opts = [BASE_PGOPTIONS]
     if EXTRA_PGOPTIONS:
         opts.append(EXTRA_PGOPTIONS)
+    if LOADER_TAG:
+        opts.append(f"-c sweep.loader={LOADER_TAG}")
     if options:
         opts.append(options)
     if extra_env:

@@ -30,7 +30,8 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from sweep_common import BASE_DIR, CTL_SCHEMA, clip_error, get_logger, get_timestamp, lit, parse_env_line, q, query_db_dicts, run_psql
+import sweep_audit
+from sweep_common import BASE_DIR, CTL_SCHEMA, clip_error, get_logger, get_timestamp, lit, parse_env_line, q, query_db_dicts, run_psql, run_psql_script
 from sweep_layers import LayerError, get_layer, layer_conn, read_manifest, use_layer, verify_database
 from sweep_merge import current_run_id
 from sweep_platform import group_popen_kwargs, kill_process_group
@@ -117,8 +118,11 @@ def _names(path, key, value):
 
 def model_from_dict(path, d, source="header"):
     path = Path(path)
-    m = re.match(r"(\d+)[_-](.+)$", path.stem)
-    prefix, stem = (int(m.group(1)), m.group(2)) if m else (10 ** 6, path.stem)
+    m = re.match(r"(?i)(dm)?(\d+)[_-](.+)$", path.stem)
+    if m and m.group(1):                       # DM03_bank: ordered by its number, named dm03_bank (the dm number stays in the name)
+        prefix, stem = int(m.group(2)), path.stem.lower()
+    else:
+        prefix, stem = (int(m.group(2)), m.group(3)) if m else (10 ** 6, path.stem)
     warnings = [f"unknown key {k!r} in SWEEP_MODEL (ignored)" for k in d if k not in HEADER_KEYS]
     strategy = d.get("delta_strategy", "insert_missing" if source == "scan" else "update_in_place")
     if strategy not in STRATEGIES:
@@ -394,6 +398,13 @@ def check_preconditions(models, skip_promote_check=False, layer=None):
     except SystemExit:
         problems.append(f"the connected database is not the {layer.name} database ({layer.database})")
         return problems
+    try:
+        capture_ok = bool(query_db_dicts("SELECT 1 AS x FROM pg_event_trigger WHERE evtname = 'sweep_capture_ddl' AND evtenabled <> 'D'", dbname=layer.database))
+    except RuntimeError:
+        capture_ok = False
+    if not capture_ok:
+        problems.append("(e) the DDL capture event trigger sweep_capture_ddl does not exist in " + layer.database + ": a data model's DDL could not be replayed in "
+                        "gold backup / gold. Run `python3 sweep.py migrate --layer " + layer.name + "` as a user that may create event triggers (rds_superuser on Aurora)")
     pend = pending_count(layer.name)
     if pend is None:
         problems.append(f"(a) the FE state of {layer.name} cannot be read: run `python3 sweep.py migrate --layer {layer.name}`")
@@ -426,7 +437,33 @@ def loaded_tables():
                         names.add((sch.strip(), r["t"]))
             except RuntimeError:
                 pass
+    try:                       # a table the silver manifest lists with track model_output is an explicit model output (DM03: bcs.bank is also an Oracle table)
+        names -= {(r["schema"], r["table"]) for r in read_manifest(get_layer(SILVER), include_disabled=True) if r["track"] == "model_output"}
+    except LayerError:
+        pass
     return names
+
+
+def captured_ddl(layer, run_id, model):
+    """[{command, type, schema, identity}] the DDL the model ran in its session (event trigger -> sweep_ctl.model_ddl_history)."""
+    rows = query_db_dicts(f"SELECT command_tag AS command, object_type AS type, schema_name AS schema, object_identity AS identity "
+                          f"FROM {CTL_SCHEMA}.model_ddl_history WHERE capture_tag = {lit(f'{run_id}:{model.name}')} ORDER BY id", dbname=_db(layer))
+    return [dict(r) for r in rows]
+
+
+def audit_post_step(model, layer, ddl, tag):
+    """Every output table, and every table the model created or altered, carries the six canonical audit columns and the audit trigger."""
+    pairs = {tuple(o.split(".")) for o in model.outputs}
+    for d in ddl:
+        if (d.get("type") or "") == "table" and d.get("identity"):
+            sch, _, tbl = d["identity"].partition(".")
+            pairs.add((sch.strip('"'), tbl.strip('"')))
+    if pairs:
+        values = ", ".join(f"({lit(s_)}, {lit(t_)})" for s_, t_ in sorted(pairs))
+        res = run_psql_script(sweep_audit.ensure_for_query_sql(f"SELECT * FROM (VALUES {values}) v(s, t)"), dbname=_db(layer),
+                              options=sweep_audit.session_options(sweep_audit.TAG_MODEL, capture=tag))      # captured like the model's own DDL
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr or res.stdout or "psql failed")
 
 
 def output_collisions(model, loaded):
@@ -461,6 +498,7 @@ def model_env(model, layer, run_id, mode, deltas):
         env["PGPASSWORD"] = str(password)
     if conn.sslmode:
         env["PGSSLMODE"] = str(conn.sslmode)
+    env["PGOPTIONS"] = sweep_audit.session_options(sweep_audit.TAG_MODEL, capture=f"{run_id}:{model.name}")      # model session + DDL capture tag
     root = models_dir()
     workdir = root / "work" / model.name / run_id
     config = root / "config" / model.name
@@ -529,11 +567,12 @@ def verify_outputs(model, layer):
     return problems
 
 
-def record_run(layer, run_id, model, status, mode, started, exit_code, log_file, seqs, result, message):
+def record_run(layer, run_id, model, status, mode, started, exit_code, log_file, seqs, result, message, ddl_capture=None):
     j = lambda v: "NULL" if v is None else lit(json.dumps(v, sort_keys=True)) + "::jsonb"
-    run_psql(f"INSERT INTO {CTL_SCHEMA}.model_run_log (run_id, model, status, mode, started_at, ended_at, exit_code, log_file, input_seqs, result, message) "
+    run_psql(f"INSERT INTO {CTL_SCHEMA}.model_run_log (run_id, model, status, mode, started_at, ended_at, exit_code, log_file, input_seqs, result, message, ddl_capture) "
              f"VALUES ({lit(run_id)}, {lit(model)}, {lit(status)}, {lit(mode)}, {lit(started)}::timestamptz, now(), "
-             f"{'NULL' if exit_code is None else int(exit_code)}, {lit(log_file)}, {j(seqs)}, {j(result)}, {lit(message[:2000]) if message else 'NULL'});",
+             f"{'NULL' if exit_code is None else int(exit_code)}, {lit(log_file)}, {j(seqs)}, {j(result)}, {lit(message[:2000]) if message else 'NULL'}, "
+             f"{lit(json.dumps(ddl_capture, sort_keys=True)) if ddl_capture else 'NULL'});",
              dbname=_db(layer))
 
 
@@ -569,11 +608,18 @@ def execute_model(model, layer, plan, run_id, loaded):
         problems.append(f"the script exited 0 but printed no `{RESULT_PREFIX} {{json}}` line")
     elif str(result.get("status", "SUCCESS")).upper() not in ("SUCCESS", "OK"):
         problems.append(f"the script reported status {result.get('status')}: {result.get('error') or result.get('message') or ''}")
+    ddl = []
+    try:
+        if not problems:
+            audit_post_step(model, layer, captured_ddl(layer, run_id, model), f"{run_id}:{model.name}")      # audit columns + trigger on every output / created / altered table
+        ddl = captured_ddl(layer, run_id, model)                                                            # the model's DDL + the post-step (replayed by promote)
+    except RuntimeError as e:
+        problems.append(f"audit post-step failed: {clip_error(e)}")
     if not problems:
         problems += verify_outputs(model, layer)
     status = "FAILED" if problems else "SUCCESS"
     message = "; ".join(problems)
-    record_run(layer, run_id, model.name, status, mode, started, code, _rel(log_file), seqs, result, message)
+    record_run(layer, run_id, model.name, status, mode, started, code, _rel(log_file), seqs, result, message, ddl_capture=ddl)
     logger.info(f"model {model.name}: {status} in {time.time() - t0:.1f}s" + (f" - {message}" if message else f" {json.dumps(result, sort_keys=True)}"))
     return {"model": model.name, "status": status, "message": message, "result": result}
 

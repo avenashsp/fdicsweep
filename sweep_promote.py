@@ -17,6 +17,7 @@ S3 is read once, into bronze. Every other layer is filled from the previous one 
     gold and gold_backup. Model output tables (track model_output) are upserted on their key, changed rows only.
 """
 import json
+import re
 import os
 import shlex
 import subprocess
@@ -26,9 +27,10 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
+import sweep_audit
 import sweep_common as c
 from sweep_common import CTL_SCHEMA, clip_error, get_logger, lit, psql_base_args, psql_env, q, query_db_dicts, run_psql, run_psql_script
-from sweep_delta import REGISTRY, TOOL_AUDIT_COLS, ensure_delta_table
+from sweep_delta import REGISTRY, ensure_delta_table
 from sweep_layers import (LayerError, chain, get_layer, layer_conn, read_manifest, same_credentials, use_layer, validate_manifest_rows)
 from sweep_loadpipe import (ensure_reject_table, history_insert_sql, load_table_meta, parse_output, persist_failed_file_rejects,
                             probe_trigger_mode, record_history_failure)
@@ -247,6 +249,97 @@ def table_columns(schema, table, dbname):
     return [(r["name"], r["generated"]) for r in rows]
 
 
+# -----------------------------------------------------------------------------
+# data-model DDL replay (6.3.0)
+# -----------------------------------------------------------------------------
+def model_ddl_captured(src, schema, table):
+    """True when a SUCCESS run of a data model in the source layer captured DDL on schema.table (sweep_ctl.model_run_log.ddl_capture)."""
+    rows = query_db_dicts(
+        f"SELECT 1 AS x FROM {CTL_SCHEMA}.model_run_log WHERE status = 'SUCCESS' AND ddl_capture IS NOT NULL "
+        f"AND position({lit(json.dumps(schema + '.' + table))} IN ddl_capture) > 0 LIMIT 1", dbname=src.database)
+    return bool(rows)
+
+
+def model_ddl_replay_sql(src, schema, table, target_columns):
+    """
+    Idempotent statements that make schema.table of the target look like the source after a data model changed it: the table when it
+    is missing, the columns the target lacks (NOT NULL only with a default), primary / unique / check constraints and plain indexes by
+    name (IF NOT EXISTS / existence checks), then the audit trigger. Generated from the SOURCE catalog, so a column a model added (DM03's
+    bank_statement_mnemonic) or a table it created arrives before the rows are copied. Never drops anything.
+    """
+    tgt = f"{q(schema)}.{q(table)}"
+    qn = lit(tgt)
+    cols = query_db_dicts(
+        f"SELECT a.attname AS n, format_type(a.atttypid, a.atttypmod) AS t, a.attnotnull AS nn, pg_get_expr(d.adbin, d.adrelid) AS dflt, "
+        f"a.attidentity AS idn, a.attgenerated AS gen FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+        f"WHERE a.attrelid = to_regclass({qn}) AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum", dbname=src.database)
+    if not cols:
+        return []
+
+    def coldef(col, adding):
+        text = f"{q(col['n'])} {col['t']}"
+        if col["idn"] in ("a", "d"):
+            text += f" GENERATED {'ALWAYS' if col['idn'] == 'a' else 'BY DEFAULT'} AS IDENTITY"
+        elif col["gen"] == "s":
+            text += f" GENERATED ALWAYS AS ({col['dflt']}) STORED"
+        elif col["dflt"]:
+            text += f" DEFAULT {col['dflt']}"
+        if col["nn"] and (not adding or col["dflt"] or col["idn"]):
+            text += " NOT NULL"
+        return text
+
+    out = []
+    have = {x.lower() for x in target_columns}
+    if not target_columns:
+        out.append(f"CREATE TABLE IF NOT EXISTS {tgt} (\n  " + ",\n  ".join(coldef(col, False) for col in cols) + "\n);")
+    else:
+        for col in cols:
+            if col["n"].lower() not in have:
+                out.append(f"ALTER TABLE {tgt} ADD COLUMN IF NOT EXISTS {coldef(col, True)};")
+    for k in query_db_dicts(
+            f"SELECT conname AS n, pg_get_constraintdef(oid) AS d FROM pg_constraint WHERE conrelid = to_regclass({qn}) AND contype IN ('p', 'u', 'c') ORDER BY contype, conname",
+            dbname=src.database):
+        out.append(f"DO $r$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = to_regclass({qn}) AND conname = {lit(k['n'])}) "
+                   f"THEN ALTER TABLE {tgt} ADD CONSTRAINT {q(k['n'])} {k['d']}; END IF; END $r$;")
+    for i in query_db_dicts(
+            f"SELECT pg_get_indexdef(i.indexrelid) AS d FROM pg_index i WHERE i.indrelid = to_regclass({qn}) AND NOT i.indisprimary "
+            f"AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conindid = i.indexrelid) ORDER BY 1", dbname=src.database):
+        out.append(re.sub(r"^CREATE (UNIQUE )?INDEX ", lambda m: f"CREATE {m.group(1) or ''}INDEX IF NOT EXISTS ", i["d"], count=1) + ";")
+    if all(n in {col["n"] for col in cols} for n in sweep_audit.AUDIT_NAMES):
+        out.append(sweep_audit.trigger_sql(schema, table))
+    return out
+
+
+def replay_model_ddl(src, tgt, mrow, opts):
+    """
+    Runs BEFORE the rows of a table are copied. When a data model changed the table in the source layer (DDL captured in model_run_log) the
+    idempotent replay is applied to the target first; it is DDL, so a layer with allow_ddl=false needs `promote --allow-ddl`. The replayed
+    statements are recorded in the target's model_run_log, so the next hop replays them too. Returns the number of statements applied.
+    """
+    schema, table = mrow["schema"], mrow["table"]
+    if not model_ddl_captured(src, schema, table):
+        return 0
+    if not tgt.allow_ddl and not opts.get("allow_ddl"):
+        logger.warning(f"{schema}.{table}: a data model changed it in {src.name}; the DDL replay into {tgt.name} needs --allow-ddl (allow_ddl=false)")
+        return 0
+    have = [c for c, _ in table_columns(schema, table, tgt.database)]
+    stmts = model_ddl_replay_sql(src, schema, table, have)
+    if not stmts:
+        return 0
+    if opts["dry_run"]:
+        logger.info(f"{schema}.{table}: [dry run] would replay {len(stmts)} model DDL statement(s) in {tgt.name}")
+        return 0
+    script = ("\\set ON_ERROR_STOP on\nBEGIN;\n" + "\n".join(stmts) + "\n" +
+              f"INSERT INTO {CTL_SCHEMA}.model_run_log (run_id, model, status, mode, ended_at, message, ddl_capture) VALUES ({lit(opts['run_id'])}, "
+              f"{lit('promote:' + src.name)}, 'SUCCESS', 'ddl-replay', now(), {lit('DDL replayed from ' + src.name)}, "
+              f"{lit(json.dumps([{'command': 'REPLAY', 'type': 'table', 'schema': schema, 'identity': f'{schema}.{table}'}]))});\nCOMMIT;\n")
+    res = run_psql_script(script, dbname=tgt.database, options=sweep_audit.session_options(sweep_audit.TAG_LOADER))
+    if res.returncode != 0:
+        raise PromoteError("model DDL replay failed: " + clip_error(res.stderr or res.stdout or "psql failed"))
+    logger.info(f"{schema}.{table}: replayed {len(stmts)} model DDL statement(s) in {tgt.name}")
+    return len(stmts)
+
+
 def has_rows(schema, table, dbname):
     return bool(query_db_dicts(f"SELECT 1 AS x FROM {q(schema)}.{q(table)} LIMIT 1", dbname=dbname))
 
@@ -279,7 +372,7 @@ def apply_one(src, tgt, mrow, delta, opts, meta_cache):
         src_cols = table_columns(schema, table, src.database)
         if not src_cols:
             raise PromoteError(f"table {schema}.{table} does not exist in the source layer {src.name}")
-        file_cols = [n for n, g in src_cols if not g and n not in TOOL_AUDIT_COLS]
+        file_cols = [n for n, g in src_cols if not g]          # the six audit columns travel as data
     else:
         file_cols = [x for x in delta["columns"] if x]
     # the columns of the source map onto the table through the FE rules of the target layer (ignore / rename / default);
@@ -347,9 +440,10 @@ def apply_one(src, tgt, mrow, delta, opts, meta_cache):
         post_sql=sequence_sql(schema, table, tmeta) + (covered_registry_sql(schema, table, opts["run_id"], uri, header_cols,
                                                                             delta.get("origin_layer") or src.name, seq, delta["covers"])
                                                        if capture and len(delta.get("covers") or ()) > 1 else ""),
-        raw_cols=raw_cols, col_map=resolution.col_map, defaults=resolution.defaults,
+        raw_cols=raw_cols, col_map=resolution.col_map, defaults=resolution.defaults, audit="copy",
         dry_run_sql=dry_run_counts_sql(tgt_sql, header_cols, tmeta["columns"], plan, keep_target, replace) if dry else None)
-    res = run_apply_script(script, transport, argv, "-c synchronous_commit=off" if not dry else "-c statement_timeout=0")
+    tag_opt = sweep_audit.session_options(sweep_audit.TAG_MODEL if track == "model_output" else sweep_audit.TAG_LOADER)      # session tag by track
+    res = run_apply_script(script, transport, argv, ("-c synchronous_commit=off" if not dry else "-c statement_timeout=0") + " " + tag_opt)
     if os.environ.get("SWEEP_PROMOTE_DEBUG_DIR"):          # keeps the generated script and its output for troubleshooting
         d = Path(os.environ["SWEEP_PROMOTE_DEBUG_DIR"])
         d.mkdir(parents=True, exist_ok=True)
@@ -461,6 +555,14 @@ def promote_table(src, tgt, mrow, opts, meta_cache):
     except (PromoteError, RuntimeError) as e:
         res.update(status="FAILED", message=clip_error(e))
         return res
+    if deltas:
+        try:                                    # a data model's DDL (new table / column / index) arrives before the rows
+            if replay_model_ddl(src, tgt, mrow, opts):
+                meta_cache.pop((mrow["schema"], mrow["table"]), None)
+        except (PromoteError, RuntimeError) as e:
+            res.update(status="FAILED", message=clip_error(e))
+            logger.error(f"{name}: {res['message']}")
+            return res
     for d in deltas:
         t0 = time.time()
         try:
@@ -537,7 +639,7 @@ def fwd_pending_between(src, tgt):
 
 
 def promote(from_layer, to_layer, tables=None, full=False, dry_run=False, workers=4, transport=None, force_full_without_delta=False,
-            ignore_pending_fwd=False, ignore_model_status=False):
+            ignore_pending_fwd=False, ignore_model_status=False, allow_ddl=False):
     """
     Moves data one hop. Returns (results, exit_code). Tables are processed parent-first, level by level (all tables of a level
     finish before the next level starts, workers in parallel inside a level); every table is its own transaction.
@@ -565,7 +667,8 @@ def promote(from_layer, to_layer, tables=None, full=False, dry_run=False, worker
         raise LayerError("source and target layer must use the same host, port, user and password for the cross-database transfer "
                          "(the source psql inherits the target's credentials); use ~/.pgpass or aligned sweep.<layer>.env files")
     results = []
-    opts = {"run_id": current_run_id(), "full": full, "dry_run": dry_run, "transport": None, "force_full_without_delta": force_full_without_delta}
+    opts = {"run_id": current_run_id(), "full": full, "dry_run": dry_run, "transport": None, "force_full_without_delta": force_full_without_delta,
+            "allow_ddl": allow_ddl}
     with use_layer(tgt):
         from sweep_layers import verify_database
         verify_database(tgt)
@@ -786,7 +889,7 @@ def run_chain(until=None, load_cmds=None, workers=4, transport=None, tables=None
                 logger.error(f"chain stopped: fwd-ddl promote {src.name} -> {tgt.name} failed")
                 return EXIT_FAILED
         results, code = promote(src.name, tgt.name, tables=tables, dry_run=dry_run, workers=workers, transport=transport,
-                                ignore_pending_fwd=dry_run, ignore_model_status=skip_models or dry_run)
+                                ignore_pending_fwd=dry_run, ignore_model_status=skip_models or dry_run, allow_ddl=allow_ddl)
         if code != 0:
             logger.error(f"chain stopped at {tgt.name}: {src.name} -> {tgt.name} had failures (later layers are not touched)")
             return code

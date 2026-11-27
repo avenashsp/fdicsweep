@@ -61,3 +61,4 @@ sweep.*.env
 !sweep.*.env.sample
 data_models/work/
 data_models/logs/
+!data_models/config/**/*.csv

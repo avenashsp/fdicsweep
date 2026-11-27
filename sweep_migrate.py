@@ -236,6 +236,46 @@ CREATE TABLE IF NOT EXISTS sweep_ctl.model_run_log (
 CREATE INDEX IF NOT EXISTS idx_sweep_model_run_log_model ON sweep_ctl.model_run_log (model, id);
 """
 
+# Migration 3 (v6.3.0): canonical audit trigger function, DDL capture of data models (model_ddl_history)
+from sweep_audit import FUNCTION_SQL as _AUDIT_FUNCTION_SQL
+CTL_OBJECTS_V3_SQL = _AUDIT_FUNCTION_SQL + """
+-- DDL a data model ran in silver (captured by the event trigger below, replayed by promote into GB / gold)
+CREATE TABLE IF NOT EXISTS sweep_ctl.model_ddl_history (
+    id            bigserial PRIMARY KEY,
+    capture_tag   text NOT NULL,                 -- '<run_id>:<model>'
+    command_tag   text,
+    object_type   text,
+    schema_name   text,
+    object_identity text,
+    captured_by   text NOT NULL DEFAULT SESSION_USER,
+    captured_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sweep_model_ddl_history_tag ON sweep_ctl.model_ddl_history (capture_tag);
+ALTER TABLE sweep_ctl.model_run_log ADD COLUMN IF NOT EXISTS ddl_capture text;
+CREATE OR REPLACE FUNCTION sweep_ctl.fn_capture_ddl() RETURNS event_trigger AS $fn$
+DECLARE r record; tag text := nullif(current_setting('sweep.capture', true), '');
+BEGIN
+    IF tag IS NULL THEN RETURN; END IF;
+    FOR r IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
+        CONTINUE WHEN r.schema_name IN ('sweep_ctl', 'sweep_delta', 'pg_temp') OR r.in_extension;
+        INSERT INTO sweep_ctl.model_ddl_history (capture_tag, command_tag, object_type, schema_name, object_identity)
+        VALUES (tag, r.command_tag, r.object_type, r.schema_name, r.object_identity);
+    END LOOP;
+END
+$fn$ LANGUAGE plpgsql;
+DO $ev$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = 'sweep_capture_ddl') THEN
+        BEGIN
+            CREATE EVENT TRIGGER sweep_capture_ddl ON ddl_command_end EXECUTE FUNCTION sweep_ctl.fn_capture_ddl();
+        EXCEPTION WHEN insufficient_privilege THEN
+            RAISE NOTICE 'sweep: event trigger not created (needs rds_superuser); data-model DDL capture is unavailable';
+        END;
+    END IF;
+END
+$ev$;
+"""
+
 # Copies the rows of the old single load_log into the two new tables and renames it. Runs only while the old table
 # exists and has not been renamed yet, so a second run (or a fresh install) does nothing.
 LEGACY_COPY_SQL = """
@@ -272,8 +312,9 @@ $mig$;
 MIGRATIONS = [
     (1, "log_tables_delta_registry_promote_log", CTL_OBJECTS_SQL + LEGACY_COPY_SQL),
     (2, "fwd_ddl_load_history_model_runs", CTL_OBJECTS_V2_SQL),
+    (3, "audit_trigger_function_ddl_capture", CTL_OBJECTS_V3_SQL),
 ]
-CTL_ALL_SQL = CTL_OBJECTS_SQL + CTL_OBJECTS_V2_SQL      # the state a fresh install (sweep_meta.sql) creates
+CTL_ALL_SQL = CTL_OBJECTS_SQL + CTL_OBJECTS_V2_SQL + CTL_OBJECTS_V3_SQL      # the state a fresh install (sweep_meta.sql) creates
 LATEST_VERSION = MIGRATIONS[-1][0]
 
 _VERSION_TABLE_SQL = """

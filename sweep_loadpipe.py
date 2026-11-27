@@ -10,6 +10,7 @@ import json
 import subprocess
 import tempfile
 
+import sweep_audit
 from sweep_common import CTL_SCHEMA, lit, q, query_db_dicts, run_psql
 from sweep_platform import group_popen_kwargs, kill_process_group
 
@@ -136,7 +137,7 @@ def _cmp(expr, type_name):
 
 
 def upsert_statements(tgt, header_cols, cols, arbiter, present, identity, stg="_stg", where="", sfx="", existing="_existing",
-                      keep_target=False, capture=None, no_update=()):
+                      keep_target=False, capture=None, no_update=(), audit=None):
     """
     SQL statements that apply the staged rows `stg` to `tgt`:
       INSERT ... ON CONFLICT (key) DO UPDATE ... WHERE (target columns) IS DISTINCT FROM (file columns)
@@ -148,6 +149,11 @@ def upsert_statements(tgt, header_cols, cols, arbiter, present, identity, stg="_
 
     keep_target=True (conflict policy keep_target): rows whose key already exists are left alone (ON CONFLICT DO NOTHING).
     no_update: columns that are inserted but never overwritten on a conflict (FE default-column values).
+    audit: the six canonical audit columns (sweep_audit). A loader passes its tag ('dcc_migration'): an INSERT lists the six
+    explicitly (createdby / modifiedby SESSION_USER, createddate / modifieddate / createddate_m = now(), createdby_m = the tag; a value
+    the file carries wins unless it is NULL) and an UPDATE sets only modifiedby / modifieddate - created* and the _m columns of an
+    existing row are never overwritten and the six never count as a change. audit="copy" (promote) copies the six as data and an
+    UPDATE refreshes modifiedby / modifieddate / createdby_m / createddate_m from the source row (never createdby / createddate).
     capture = {"delta": '"sweep_delta"."s__t"', "seq": "<sql>", "skip": "<sql boolean>"}: the rows that were really applied
     (inserted or changed, after the only-if-different filter) are also written to the delta table with _op 'I' / 'U',
     unless `skip` is true (empty target / full copy: the next hop copies the whole table instead). An optional "row_base" (SQL
@@ -155,27 +161,42 @@ def upsert_statements(tgt, header_cols, cols, arbiter, present, identity, stg="_
     ORDER BY _row_no, so the numbers must keep increasing from chunk to chunk (a key in two chunks: the later row wins).
     """
     out = []
+    header_cols = list(header_cols)
+    sel_items = [f"s.{q(c)}" for c in header_cols]
+    if audit and audit != "copy":
+        exprs = sweep_audit.insert_exprs(audit)
+        for i, c in enumerate(header_cols):
+            if c in exprs:
+                sel_items[i] = f"COALESCE(s.{q(c)}, {exprs[c]})"
+        for c in sweep_audit.AUDIT_NAMES:
+            if c in cols and c not in header_cols:
+                header_cols.append(c)
+                sel_items.append(exprs[c])
     head = ", ".join(q(c) for c in header_cols)
     ins_cols = f"INSERT INTO {tgt} AS t ({head})" + (" OVERRIDING SYSTEM VALUE" if identity else "")
-    select = f"SELECT {head} FROM {stg} AS s {where}"
+    select = f"SELECT {', '.join(sel_items)} FROM {stg} AS s {where}"
     on_conflict = ""
     cap_cols = ", ".join(q(c) for c in header_cols)
     rown = f"row_number() OVER () + {capture['row_base']}" if capture and capture.get("row_base") else "row_number() OVER ()"
     if arbiter:
         a_set = set(arbiter["cols"])
-        upd = [c for c in header_cols if c not in a_set and cols[c]["identity"] != "a" and c not in no_update]
-        sets = [f"{q(c)} = EXCLUDED.{q(c)}" for c in upd]
-        # triggers are off, so set the audit columns the audit trigger would have set on an update
-        if "modifiedby" in cols and "modifiedby" not in present:
-            sets.append('"modifiedby" = CURRENT_USER')
-        if "modifieddate" in cols and "modifieddate" not in present:
-            sets.append('"modifieddate" = CURRENT_TIMESTAMP')
+        skip = sweep_audit.AUDIT_SET if audit else ()
+        upd = [c for c in header_cols if c not in a_set and cols[c]["identity"] != "a" and c not in no_update and c not in skip]
+        if audit == "copy":                                  # the _m columns are compared too (a changed label is a change)
+            cmp_cols = upd + [c for c in ("createdby_m", "createddate_m") if c in header_cols and c not in no_update]
+            sets = [f"{q(c)} = EXCLUDED.{q(c)}" for c in cmp_cols] + [f"{q(c)} = EXCLUDED.{q(c)}" for c in ("modifiedby", "modifieddate") if c in header_cols]
+        else:
+            cmp_cols = upd
+            sets = [f"{q(c)} = EXCLUDED.{q(c)}" for c in upd]
+            # triggers are off, so set what the audit trigger would set on an update: modifiedby / modifieddate only
+            if audit:
+                sets += [f'"{c}" = {e}' for c, e in (("modifiedby", "SESSION_USER"), ("modifieddate", "now()")) if c in cols]
         arb_list = ", ".join(q(c) for c in arbiter["cols"])
-        if keep_target or not upd:
+        if keep_target or not cmp_cols:
             on_conflict = f" ON CONFLICT ({arb_list}) DO NOTHING"
         else:
-            old = ", ".join(_cmp(f"t.{q(c)}", cols[c]["type"]) for c in upd)
-            new = ", ".join(_cmp(f"EXCLUDED.{q(c)}", cols[c]["type"]) for c in upd)
+            old = ", ".join(_cmp(f"t.{q(c)}", cols[c]["type"]) for c in cmp_cols)
+            new = ", ".join(_cmp(f"EXCLUDED.{q(c)}", cols[c]["type"]) for c in cmp_cols)
             on_conflict = (f" ON CONFLICT ({arb_list}) DO UPDATE SET {', '.join(sets)} "
                            f"WHERE ({old}) IS DISTINCT FROM ({new})")
         key_join = " AND ".join(f"t.{q(c)} = s.{q(c)}" for c in arbiter["cols"])

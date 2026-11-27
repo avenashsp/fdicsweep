@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [6.3.0] - 2026-11-27
+
+6.3.0: six canonical audit columns (createdby_m / createddate_m nullable, loader session setting), DM01-DM06 real data models, model DDL capture and replay to GB/gold
+
+### Added
+- **Six canonical audit columns on every table of every layer** (single source: the new dependency-free module `sweep_audit.py`, re-exported by `sweep_common.py`): `createdby` / `modifiedby` varchar(40) NOT NULL DEFAULT `SESSION_USER`; `createddate` / `modifieddate` timestamp NOT NULL DEFAULT `now()`; `createddate_m` timestamp NULL and `createdby_m` varchar(40) NULL, defaulted from the session setting `sweep.loader`. `createdby` / `modifiedby` are always `SESSION_USER` (never `CURRENT_USER`, never a literal); only `createdby_m` holds a literal, `'dcc_migration'` (Oracle / VSAM loaders and promote of the oracle / vsam tracks) or `'fe_migration'` (data models, FE-created data, promote of model outputs); only the two `_m` columns may be NULL (a third-party insert leaves them NULL). See `docs/audit_columns.md`.
+- **Audit trigger:** shared `sweep_ctl.fn_audit_cols()` (migration 3 / `sweep_meta.sql`) and per-table `trg_sweep_audit BEFORE INSERT OR UPDATE` (insert: defaults, `modifieddate = coalesce(modifieddate, createddate)`; update: `created*` kept, the `_m` columns kept unless the session is a loader / model session, `modifiedby := SESSION_USER`, `modifieddate := now()`). Created idempotently on every table the code creates or alters: Oracle step 04, VSAM step 04, the post-step of `fwd-ddl` (after every FE file, on each table it created or altered; FE files stay immutable and run in silver only) and the post-step of the models runner. `sweep_ctl` / `sweep_delta` tables are excluded.
+- **Loader session setting:** loader psql sessions run with `PGOPTIONS='-c sweep.loader=dcc_migration'` (`sweep_common.set_loader_tag`, also the fast-bulk `\copy` sessions); promote sets the tag per track (`model_output` = `fe_migration`); a plain session leaves the `_m` columns NULL. **Fast bulk asserts the setting** before the COPY and fails loudly without it.
+- **Migration 3** (`python3 sweep.py migrate`): `sweep_ctl.fn_audit_cols()`, `sweep_ctl.model_ddl_history`, the DDL capture event trigger `sweep_capture_ddl` (needs `rds_superuser`; without the privilege it is skipped with a notice and `models run` refuses to start), `model_run_log.ddl_capture`.
+- **DM01-DM06 real data models** (`data_models/DM01_program_bank_capacity.py`, `DM02_brokerglpair.py`, `DM03_bank.py`, `DM04_program_bank_rate.py`, `DM05_program_bank_rate_tier.py` - depends on DM04, `DM06_ledger_config.py`), each with a sibling `.analysis.md` and the shared helper `data_models/_dm_support.py`. Standalone (`python3 data_models/DMnn_x.py [--execute]`, dry run by default) and runner-compatible (`--mode full|delta`, `SWEEP_MODEL` header, `SWEEP_MODEL_WORKDIR`, `SWEEP_MODEL_RESULT`). Cleanups: no `CREATED_BY` constant, no `migration_hub`, no `_bkp3` / `_backup` suffixes (DM05 no longer auto-detects a backup table), `bss00099` is `bss00098`, no hard-coded host / user / password (libpq environment). DM01 override `(108, 1707) = 25000000.0000`, DM03's five overrides and its `ALTER TABLE ... ADD COLUMN`, DM02's `hogan_broker_map.csv` (now `data_models/config/dm02_brokerglpair/`; a missing map stops the run, nothing is inserted without it), DM06's nine schemas with `--replace` / `--truncate` are kept. The own-row detection is `createdby_m = 'fe_migration'`. DM03 flips `createdby_m` of a bank it enriches from `dcc_migration` to `fe_migration` (`createddate_m` unchanged).
+- **Runner:** discovery accepts the prefix `DM(\d+)[_-]name` next to the numeric prefix (ordered by the number; the model name keeps the dm number, e.g. `dm03_bank`); the models session carries `sweep.loader=fe_migration` and a capture tag; the output-name guard lets a table that the silver manifest lists with track `model_output` be written although it is also an Oracle table (`bcs.bank`).
+- **Model DDL capture and replay:** the DDL a model runs in silver (and the audit post-step) is captured per run (`sweep_ctl.model_ddl_history`, stored in `model_run_log.ddl_capture`) and **replayed by promote to gold backup and gold before the rows are copied**: idempotent statements generated from the source catalog (table, missing columns, primary / unique / check constraints, plain indexes, audit trigger), recorded in the target so the next hop replays them too; never drops anything; not counted as drift. On a layer with `allow_ddl=false` it needs `promote --allow-ddl` (`chain --allow-ddl`).
+- `layers check` has the check **audit columns**; `layers validate` lists `MISSING_AUDIT_COLUMN` rows (informational). `docs/audit_columns.md` and a new section "Real models DM01-DM06" in `docs/data_models.md`.
+
+### Changed
+- The loaders list the six columns explicitly in the INSERT (a value the file carries wins unless it is NULL); an `ON CONFLICT DO UPDATE` sets only the data columns, `modifiedby` and `modifieddate` and never overwrites `created*` / the `_m` columns; the six columns never count in the `IS DISTINCT FROM` guard (a changed `modifieddate` alone is no change any more). Promote copies the six as data (`TOOL_AUDIT_COLS` is the six columns; delta detection, row fingerprints and the models' self-compare ignore them).
+- Oracle step 04 and VSAM step 04 / `common_schema` emit all six columns (the old four-column Oracle set and every `CURRENT_USER` default are gone; a source column with an audit name keeps its data with the standard type / default; legacy variants such as `created_at` are never touched). `fn_update_audit_timestamp` / `trg_audit_modified` are replaced by `fn_audit_cols` / `trg_sweep_audit`.
+- The tool's own audit trigger `trg_sweep_audit` no longer forces the staged path of `--fast-bulk` (the loaders run with triggers off and set the six columns themselves).
+- Version 6.3.0; the changelog file is `CHANGELOG_v6.3.0.md`.
+
+### Removed
+- `data_models/37_brokerglpair.py`, its analysis note, `tests/test_brokerglpair.py` and the golden original: replaced by DM02.
+
+### Unchanged
+- No `audit-columns apply`, no `--drop-legacy`, no migration of existing tables: the data is reloaded fresh. The Word operations guide is not updated by this release.
+
+### Tests
+- New `tests/test_audit_columns.py` (exact column types / defaults, VSAM / Oracle DDL, trigger rules, loader session setting for the staged load and fast bulk, fast bulk without the setting fails loudly, upsert never overwrites `created*` / `_m`, the six excluded from the change guard, audit-named source columns, missing-column check, grep rule: no `CURRENT_USER` for an audit column and no literal other than `dcc_migration` / `fe_migration`), `tests/test_dm_models.py` (header, discovery order, DM05 after DM04, cleanups, dry run is the default, `--execute` writes the six columns, DM02 map file, DM06 `--replace` keeps foreign rows, DM03 `ALTER` and the `createdby_m` flip with `createddate_m` unchanged), runner DDL capture / replay / event-trigger precondition in `tests/test_models.py`, and the `fwd-ddl` post-step in `tests/test_fwd_ddl.py`.
+
+---
+
 ## [6.2.3] - 2026-11-27
 
 `--fast-bulk` for tables that arrive as several part files, with a correct delta registry, ledger and promote.

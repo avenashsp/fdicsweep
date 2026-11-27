@@ -1,4 +1,4 @@
-# Medallion layers, promote and migrate (v6.2.3)
+# Medallion layers, promote and migrate (v6.3.0)
 
 SWEEP now fills **four PostgreSQL databases in ONE Aurora cluster**, one per layer, in a fixed chain:
 
@@ -10,6 +10,10 @@ SWEEP now fills **four PostgreSQL databases in ONE Aurora cluster**, one per lay
 | `gold` | `SWEEPG` | all Oracle tables + the model output tables - **the only database the application and the FE team use** | gold_backup |
 
 Load order is always **bronze -> silver -> gold_backup -> gold**. S3 files are read **once** (into bronze), for Day-1 and for every Day-2 delta / snapshot. The Database team owns every layer; the application and the FE team change data, tables, columns and triggers directly in **gold**, so the pipeline must never damage gold: nothing is ever deleted, nothing in gold is ever truncated or replaced, and gold / gold_backup never get DDL from the pipeline.
+
+## Audit columns and model DDL replay (6.3.0)
+
+Promote copies the six canonical audit columns **as data** (a row keeps its `createdby_m` of `dcc_migration` / `fe_migration` and its dates), sets the session tag by track and never writes a literal into `createdby` / `createddate` / `modifiedby` / `modifieddate`. Before the rows of a table a data model changed in silver are copied, promote **replays the model's DDL** (table / columns / constraints / indexes / audit trigger, idempotent, never a drop) in the target; on gold backup / gold this needs `--allow-ddl`. Details: [audit_columns.md](audit_columns.md) and [data_models.md](data_models.md).
 
 ## 1. Layer profiles - `sweep_layers.json`
 
@@ -96,7 +100,7 @@ python3 sweep.py layers reconcile --from <layer> --to <layer> [--tables ...] [--
 python3 sweep.py layers check [--layer X]
 ```
 
-* **reconcile:** per table row counts plus a key-hash comparison (`--exact` hashes every row; the default compares a 1 percent sample of the keys), Excel report, exit code. Only columns of the **same type** are compared; type differences are reported separately (`type_differences`, status `TYPE_DIFFERENCE`). Bronze vs silver vs gold_backup must match for the Oracle tables and model outputs, and **VSAM tables are enforced in silver** (informational in gold_backup). **gold uses a superset check:** every key of gold_backup must still exist in gold and `count(gold) >= count(gold_backup)` (the keys are streamed from gold_backup into gold through the same cross-database pipe `promote` uses; a 1 percent sample by default, all keys with `--exact`) - the application may add and change rows in gold, never remove them. Differences an applied FE file explains are `FE_ADDED` / `FE_CHANGED` / `FE_DROPPED`, count as PASS and appear in the `FE_Changes` sheet. Tool-set audit columns (`createddate_m`, `createdby_m`) are not compared. **Run and review it before the first chained delta.**
+* **reconcile:** per table row counts plus a key-hash comparison (`--exact` hashes every row; the default compares a 1 percent sample of the keys), Excel report, exit code. Only columns of the **same type** are compared; type differences are reported separately (`type_differences`, status `TYPE_DIFFERENCE`). Bronze vs silver vs gold_backup must match for the Oracle tables and model outputs, and **VSAM tables are enforced in silver** (informational in gold_backup). **gold uses a superset check:** every key of gold_backup must still exist in gold and `count(gold) >= count(gold_backup)` (the keys are streamed from gold_backup into gold through the same cross-database pipe `promote` uses; a 1 percent sample by default, all keys with `--exact`) - the application may add and change rows in gold, never remove them. Differences an applied FE file explains are `FE_ADDED` / `FE_CHANGED` / `FE_DROPPED`, count as PASS and appear in the `FE_Changes` sheet. The six canonical audit columns are not compared (and `layers check` / `layers validate` flag a table that lacks one: `MISSING_AUDIT_COLUMN`). **Run and review it before the first chained delta.**
 * **check:** database reachable, PostgreSQL >= 16, privilege to set `session_replication_role`, `sweep_ctl` migrated, schema drift summary against the upstream layer (columns / tables an applied FE file dropped are not drift), sequences behind `max(column)`.
 
 ### Validate one layer and monitor

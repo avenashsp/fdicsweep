@@ -570,7 +570,8 @@ def cmd_promote(args):
             return _layer_error(LayerError("--from and --to are required (promote moves data one hop, e.g. --from bronze --to silver)"))
         results, code = sp.promote(args.from_layer, args.to_layer, tables=tables or None, full=args.full, dry_run=args.dry_run,
                                    workers=args.workers, transport=args.transport, ignore_pending_fwd=getattr(args, "ignore_pending_fwd", False),
-                                   ignore_model_status=getattr(args, "ignore_model_status", False))
+                                   ignore_model_status=getattr(args, "ignore_model_status", False),
+                                   allow_ddl=getattr(args, "allow_ddl", False))
         for r in results:
             print(f"{r['status']:<10} {r['table']:<50} inserted {r['inserted']:>9} updated {r['updated']:>9} unchanged {r['unchanged']:>9}"
                   + (f"  {r['message']}" if r["message"] else ""))
@@ -771,6 +772,8 @@ def main():
     p_prom.add_argument("--status", action="store_true", help="Print the delta x layer status matrix and exit")
     p_prom.add_argument("--purge", action="store_true", help="Remove delta tables every layer applied (plus SWEEP_DELTA_RETENTION_DAYS) and exit")
     p_prom.add_argument("--ignore-pending-fwd", action="store_true", help="Promote data even when the target layer has pending FE (fwd-ddl) files")
+    p_prom.add_argument("--allow-ddl", action="store_true",
+                        help="Replay the DDL a data model ran in silver (new table / column / index) on a layer with allow_ddl=false (gold_backup, gold) before the rows are copied")
     p_prom.add_argument("--ignore-model-status", action="store_true", help="Promote model output tables even when their model has no SUCCESS on the current inputs")
     p_prom.add_argument("--limit", type=int, default=10, help="Deltas per table shown by --status (default 10)")
 

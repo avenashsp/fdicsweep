@@ -154,14 +154,14 @@ def test_only_rows_that_differ_are_updated(gz_file):
     assert _q("SELECT v FROM pc.t WHERE id=2") == "CHANGED"
 
 
-def test_modifieddate_from_the_file_counts_as_a_change(gz_file):
+def test_audit_columns_from_the_file_never_count_as_a_change_since_6_3_0(gz_file):
+    # 6.3.0: the six canonical audit columns are excluded from the IS DISTINCT FROM guard (a changed modifieddate alone is no change)
     _t("pd", "t", "id int primary key, v text, modifieddate timestamp")
     _load(gz_file, "a.csv.gz", "id,v,modifieddate\n1,a,2020-01-01 00:00:00\n", "pd", "t")
     o = _load(gz_file, "b.csv.gz", "id,v,modifieddate\n1,a,2021-01-01 00:00:00\n", "pd", "t")
-    assert (o.updated, o.unchanged) == (1, 0)
-    assert _q("SELECT modifieddate FROM pd.t") == "2021-01-01 00:00:00"
-    o = _load(gz_file, "c.csv.gz", "id,v,modifieddate\n1,a,2021-01-01 00:00:00\n", "pd", "t")
     assert (o.updated, o.unchanged) == (0, 1)
+    o = _load(gz_file, "c.csv.gz", "id,v,modifieddate\n1,CH,2021-01-01 00:00:00\n", "pd", "t")
+    assert (o.updated, o.unchanged) == (1, 0)
 
 
 def test_counts_balance_on_a_partitioned_table(gz_file):
@@ -448,7 +448,7 @@ def test_the_single_pass_script_keeps_unsuffixed_counters_and_promotes_signature
     import inspect
     params = list(inspect.signature(pl.build_staged_script).parameters)
     assert params == ["schema", "table", "header_cols", "stream_cmd", "meta", "plan", "trigger_mode", "max_rejects", "uri", "log_sql", "track",
-                      "copy_from", "keep_target", "capture", "pre_sql", "apply_pre_sql", "post_sql", "dry_run_sql", "raw_cols", "col_map", "defaults"]
+                      "copy_from", "keep_target", "capture", "pre_sql", "apply_pre_sql", "post_sql", "dry_run_sql", "raw_cols", "col_map", "defaults", "audit"]
     meta = {"columns": {"id": {"type": "integer", "notnull": False, "hasdef": False, "identity": "", "generated": ""}}, "keys": [], "checks": [],
             "fks": [], "triggers": []}
     plan = {"present": {"id"}, "arbiter": None, "alt_keys": [], "not_null": [], "checks": [], "skipped_checks": [], "fks": [], "identity": False}

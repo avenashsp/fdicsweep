@@ -22,6 +22,7 @@ Generates inside outputs/vsam/gen_ddl/:
   - reports/vsam/<db>_vsam_04_generate_ddl_report_<ts>.xlsx
 =============================================================================
 """
+import sweep_audit
 import sys
 import re
 import json
@@ -54,22 +55,12 @@ from vsam.vsam_common import get_all_active_schemas, get_korg_override_pkey, loa
 
 logger = get_logger("vsam_04_generate_ddl", "vsam_04_generate_ddl")
 
-AUDIT_COLS = [
-    '  "createddate" timestamp without time zone DEFAULT CURRENT_TIMESTAMP',
-    '  "createdby" character varying(40) DEFAULT CURRENT_USER',
-    '  "modifieddate" timestamp without time zone DEFAULT CURRENT_TIMESTAMP',
-    '  "modifiedby" character varying(40) DEFAULT CURRENT_USER',
-    '  "createddate_m" timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP',
-    '  "createdby_m" character varying(40) NOT NULL DEFAULT CURRENT_USER',
-]
+AUDIT_COLS = sweep_audit.create_table_lines()      # the six canonical audit columns (sweep_audit)
 
 CTL_DDL = CTL_ALL_SQL      # control schema objects (oracle_load_log / vsam_load_log, rejects, delta registry ...)
 
 
-AUDIT_COL_NAMES = {
-    "createddate", "createdby", "modifieddate", "modifiedby",
-    "createddate_m", "createdby_m"
-}
+AUDIT_COL_NAMES = set(sweep_audit.AUDIT_NAMES)
 
 
 def build_table_ddl(schema, table, columns, key_cols):
@@ -110,7 +101,8 @@ def build_table_ddl(schema, table, columns, key_cols):
     pre_sql = (
         f"CREATE TABLE IF NOT EXISTS {q(schema)}.{q(table)} (\n"
         + ",\n".join(col_lines)
-        + "\n);"
+        + "\n);\n"
+        + sweep_audit.trigger_sql(schema, table)
     )
 
     post_sql = ""

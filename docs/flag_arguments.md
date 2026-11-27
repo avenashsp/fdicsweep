@@ -1,4 +1,4 @@
-# SWEEP Migration Framework - Complete CLI Flags Reference (v6.2.3)
+# SWEEP Migration Framework - Complete CLI Flags Reference (v6.3.0)
 
 Complete flags reference for all CLI commands and python scripts in the **SWEEP Unified Data Migration Framework** across both **Oracle** and **VSAM** tracks.
 
@@ -372,7 +372,7 @@ Invalid selectors (unknown table / schema / file / company / copybook, unparseab
 
 | Command | Flags |
 | :--- | :--- |
-| `promote` | `--from L`, `--to L`, `--tables`, `--full`, `--dry-run`, `--workers N`, `--transport {auto,program,stream}`, `--status`, `--purge`, `--limit N`, `--ignore-pending-fwd`, `--ignore-model-status` |
+| `promote` | `--from L`, `--to L`, `--tables`, `--full`, `--dry-run`, `--workers N`, `--transport {auto,program,stream}`, `--status`, `--purge`, `--limit N`, `--ignore-pending-fwd`, `--ignore-model-status`, `--allow-ddl` (replay the DDL a data model ran in silver on gold backup / gold) |
 | `chain` | `--until {bronze,silver,models,gold_backup,gold}`, `--skip-models`, `--models a,b`, `--force-models`, `--allow-ddl`, `--tracks oracle,vsam`, `--skip-load`, `--workers N`, `--transport`, `--tables`, `--dry-run` |
 | `fwd-ddl status` / `check` | `--layer L` (optional: all layers), `--allow-ddl` (check on gold / gold_backup) |
 | `fwd-ddl apply` | `--layer L` (required; silver, gold_backup or gold - bronze is refused), `--file F`, `--dry-run`, `--allow-data`, `--force`, `--allow-ddl` (required on gold / gold_backup) |

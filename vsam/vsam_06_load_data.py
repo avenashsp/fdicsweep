@@ -36,6 +36,7 @@ from pathlib import Path
 
 import pandas as pd
 
+import sweep_common
 from sweep_common import (
     VSAM_LOAD_LOG_TABLE,
     LAYER,
@@ -727,6 +728,7 @@ def main():
     args = parser.parse_args()
     sel = selector_or_exit(args, logger)
     layer = ensure_layer(args, logger)
+    sweep_common.set_loader_tag(sweep_common.TAG_LOADER)      # createdby_m = 'dcc_migration' for every row this run loads
     require_bronze(layer, logger, "VSAM Step 06")
     if not sel.dry_run:
         require_migrated(logger)

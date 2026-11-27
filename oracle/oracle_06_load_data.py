@@ -25,6 +25,7 @@ import threading
 from typing import NamedTuple
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import sweep_common
 from sweep_common import (
     log_summary,
     ORACLE_OUTPUTS_DIR,
@@ -787,6 +788,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     layer = ensure_layer(args, logger)
+    sweep_common.set_loader_tag(sweep_common.TAG_LOADER)      # createdby_m = 'dcc_migration' for every row this run loads
     require_bronze(layer, logger, "Oracle Step 06")
     require_migrated(logger)
     FULL_LOAD = args.full

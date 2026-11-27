@@ -27,6 +27,7 @@ import argparse
 from pathlib import Path
 from itertools import groupby
 from collections import defaultdict
+import sweep_audit
 from sweep_common import (
     log_summary,
     ORACLE_INPUTS_DIR,
@@ -657,17 +658,7 @@ def generate_ddl(owners_filter=None, tables_filter=None, selector=None):
                 h.write("SET statement_timeout = 0;\n")
 
             # In s_alter, ensure audit function exists
-            s_alter.write("""CREATE SCHEMA IF NOT EXISTS sweep_ctl;
-CREATE OR REPLACE FUNCTION sweep_ctl.fn_update_audit_timestamp()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.modifieddate = CURRENT_TIMESTAMP;
-    NEW.modifiedby = CURRENT_USER;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-""")
+            s_alter.write("CREATE SCHEMA IF NOT EXISTS sweep_ctl;\n" + sweep_audit.FUNCTION_SQL + "\n")
 
             s_idx.write("SET maintenance_work_mem = '2GB';\nSET max_parallel_maintenance_workers = 4;\n")
             s_views.write("""-- Oracle Compatibility Functions for Views
@@ -723,9 +714,6 @@ $$ LANGUAGE sql IMMUTABLE;
         h_tables, h_pk, h_alter, h_idx, h_fk, h_val, h_views, h_trg = (tbufs[k] for k in KINDS)
         touched.add(schema)
 
-        # Check existing columns
-        existing_cols = {norm_col(c_col["column_name"]) for c_col in cols}
-
         # 1. Base Columns DDL (with Identity & Foreign Key Identity Alignment support)
         col_lines = []
         for c_col in cols:
@@ -749,16 +737,10 @@ $$ LANGUAGE sql IMMUTABLE;
             else:
                 col_lines.append(f"    {q(cname)} {pg_type}")
 
-        # Inject the 4 required audit columns if not already present
-        audit_cols_to_add = [
-            ("createddate_m", "TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP"),
-            ("createdby_m", "VARCHAR(50) DEFAULT CURRENT_USER"),
-            ("modifieddate", "TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP"),
-            ("modifiedby", "VARCHAR(50) DEFAULT CURRENT_USER")
-        ]
-        for a_col, a_def in audit_cols_to_add:
-            if a_col not in existing_cols:
-                col_lines.append(f"    {q(a_col)} {a_def}")
+        # The six canonical audit columns (sweep_audit): a source column with one of these names is kept as data but
+        # takes the standard type / NOT NULL / default (see the audit column rules); legacy variants are never touched
+        col_lines = [ln for ln, c_col in zip(col_lines, cols) if norm_col(c_col["column_name"]) not in sweep_audit.AUDIT_SET]
+        col_lines.extend(sweep_audit.create_table_lines(indent="    "))
 
         # Check if table is partitioned
         part_info = partitions.get((owner, table), [])
@@ -860,9 +842,8 @@ $$ LANGUAGE sql IMMUTABLE;
                 if raw_stmt:
                     h_alter.write(f"ALTER TABLE {q(schema)}.{q(t_clean)} {raw_stmt};\n")
 
-        # Attach audit trigger to automatically update modifieddate and modifiedby
-        h_alter.write(f"DROP TRIGGER IF EXISTS trg_audit_modified ON {q(schema)}.{q(t_clean)};\n")
-        h_alter.write(f"CREATE TRIGGER trg_audit_modified BEFORE UPDATE ON {q(schema)}.{q(t_clean)} FOR EACH ROW EXECUTE FUNCTION sweep_ctl.fn_update_audit_timestamp();\n\n")
+        # Attach the canonical audit trigger (insert defaults / update modifiedby + modifieddate)
+        h_alter.write(sweep_audit.trigger_sql(schema, t_clean) + "\n")
 
         # 3. Post-Load Scripts: Indexes (CONCURRENTLY)
         table_idxs = indexes.get((owner, table), [])

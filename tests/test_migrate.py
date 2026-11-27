@@ -31,23 +31,23 @@ def _cols(table):
 
 def test_migration_copies_legacy_rows_and_renames(pg_db):
     c.run_psql(LEGACY_DDL)
-    assert m.migrate_current_database() == [1, 2]
+    assert m.migrate_current_database() == [1, 2, 3]
     assert c.run_psql("SELECT uri || '|' || loaded_rows FROM sweep_ctl.oracle_load_log", tuples_only=True) == "s3://b/oracle/a.csv.gz|10"
     vs = c.query_db_rows("SELECT uri || '|' || target_schema || '|' || loaded_rows FROM sweep_ctl.vsam_load_log ORDER BY 1")
     assert vs == ["s3://b/vsam/x#y.csv|bcs|3", "s3://b/vsam/x#y.csv|bss01104|4"]      # split at the LAST '#'
     assert c.run_psql("SELECT count(*) FROM sweep_ctl.load_log_legacy", tuples_only=True) == "3"   # kept, not dropped
     assert c.run_psql("SELECT to_regclass('sweep_ctl.load_log') IS NULL", tuples_only=True) == "t"
-    assert c.run_psql("SELECT count(*) FROM sweep_ctl.schema_version", tuples_only=True) == "2"
+    assert c.run_psql("SELECT count(*) FROM sweep_ctl.schema_version", tuples_only=True) == "3"
     for t in ("load_rejects", "load_audit"):
         assert any(x.startswith("track:") for x in _cols(t))
 
 
 def test_migration_is_idempotent(pg_db):
     c.run_psql(LEGACY_DDL)
-    assert m.migrate_current_database() == [1, 2]
+    assert m.migrate_current_database() == [1, 2, 3]
     assert m.migrate_current_database() == []
     assert c.run_psql("SELECT count(*) FROM sweep_ctl.oracle_load_log", tuples_only=True) == "1"
-    assert c.run_psql("SELECT count(*) FROM sweep_ctl.schema_version", tuples_only=True) == "2"
+    assert c.run_psql("SELECT count(*) FROM sweep_ctl.schema_version", tuples_only=True) == "3"
 
 
 def test_dry_run_changes_nothing(pg_db):
@@ -89,7 +89,7 @@ def test_migration_2_adds_the_fe_and_history_tables_to_a_version_1_database(pg_d
     finally:
         m.MIGRATIONS[:] = monkey_all
     c.run_psql("DROP TABLE IF EXISTS sweep_ctl.fwd_ddl_log, sweep_ctl.fwd_ddl_changes, sweep_ctl.fwd_ddl_rules, sweep_ctl.load_history, sweep_ctl.model_run_log")
-    assert m.migrate_current_database() == [2]                       # only the new migration runs
+    assert m.migrate_current_database() == [2, 3]                    # only the new migrations run
     assert m.migrate_current_database() == []
-    assert c.run_psql("SELECT string_agg(version::text, ',' ORDER BY version) FROM sweep_ctl.schema_version", tuples_only=True) == "1,2"
+    assert c.run_psql("SELECT string_agg(version::text, ',' ORDER BY version) FROM sweep_ctl.schema_version", tuples_only=True) == "1,2,3"
     assert c.run_psql("SELECT count(*) FROM sweep_ctl.oracle_load_log", tuples_only=True) == "1"     # data of migration 1 untouched

@@ -105,15 +105,15 @@ def parse_sql_file_blocks(file_path, stage_code):
     # 0. Alter Statements File: Function, Check constraints, Alter column, Audit triggers
     if stage_code == "alter":
         # First split out any function definitions with $$ ... $$
-        func_chunks = re.findall(r'(CREATE\s+OR\s+REPLACE\s+FUNCTION\s+sweep_ctl\.fn_update_audit_timestamp[\s\S]*?\$\$\s*LANGUAGE\s+plpgsql;)', content, re.I)
+        func_chunks = re.findall(r'(CREATE\s+OR\s+REPLACE\s+FUNCTION\s+sweep_ctl\.fn_audit_cols[\s\S]*?\$fn\$;)', content, re.I)
         for fc in func_chunks:
             blocks.append({
                 "sql": fc.strip(),
                 "object_type": "SESSION",
                 "schema": "sweep_ctl",
                 "table": "",
-                "object_name": "fn_update_audit_timestamp",
-                "raw": "CREATE FUNCTION sweep_ctl.fn_update_audit_timestamp()"
+                "object_name": "fn_audit_cols",
+                "raw": "CREATE FUNCTION sweep_ctl.fn_audit_cols()"
             })
             content = content.replace(fc, "")
 

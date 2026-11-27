@@ -25,6 +25,7 @@ Rejected rows never fail the file unless their number reaches `max_rejects` (def
 `fast_bulk` is a direct COPY for an empty table without keys / CHECK / foreign keys (no bad-row isolation; NOT NULL and identity columns are fine).
 Big files are staged in CHUNKS inside the same transaction (staged_prologue, staged_chunk per chunk, staged_epilogue).
 """
+import sweep_audit
 from sweep_common import ORACLE_LOAD_LOG_TABLE, lit, q
 from sweep_loadpipe import (  # re-exported: the Oracle loader and its tests import these from here
     MAX_DUP_ROWS_PRINTED, MAX_REJECT_ROWS_PRINTED, REJECT_TABLE, REJECT_TABLE_DDL, TEXT_TYPES, _cmp,
@@ -119,7 +120,7 @@ def build_fast_script(schema, table, header_cols, stream_cmd, meta, trigger_mode
     off, on = _trigger_off_on(schema, table, meta, trigger_mode)
     col_list = ", ".join(q(c) for c in header_cols)
     return (
-        "\\set ON_ERROR_STOP on\nBEGIN;\n" + off +
+        "\\set ON_ERROR_STOP on\nBEGIN;\n" + sweep_audit.assert_loader_sql() + off +
         f"SELECT NOT EXISTS (SELECT 1 FROM {tgt}) AS was_empty, COALESCE((SELECT max(id) FROM {HISTORY_TABLE} "
         f"WHERE target_schema = {lit(schema)} AND target_table = {lit(table)}), 0) AS hist0 \\gset\n"
         f"\\copy {tgt} ({col_list}) FROM PROGRAM '{stream_cmd}' WITH (FORMAT csv, HEADER true, ENCODING 'UTF8');\n"
@@ -158,7 +159,7 @@ def copy_from_stdin(raw_cols):
 
 
 def staged_chunk(schema, table, header_cols, meta, plan, max_rejects, ci=None, *, keep_target=False, capture=None, apply_pre_sql="",
-                 dry_run_sql=None, col_map=None, defaults=None):
+                 dry_run_sql=None, col_map=None, defaults=None, audit=sweep_audit.TAG_LOADER):
     """
     Everything that happens to the rows currently in _raw (the whole file, or one chunk of it): validation, typed staging, key / FK /
     alternate-key handling, the upsert and - for the first chunk - the delta capture set-up. `ci` is the chunk number: counters get
@@ -202,7 +203,8 @@ def staged_chunk(schema, table, header_cols, meta, plan, max_rejects, ci=None, *
         "WHERE NOT EXISTS (SELECT 1 FROM _rej b WHERE b.row_no = r._row_no);\nTRUNCATE _raw;\n")
 
     # 3. NOT NULL + CHECK in one pass
-    tests = [f"CASE WHEN {q(c)} IS NULL THEN {lit('NOT_NULL:' + c)} END" for c in plan["not_null"]]
+    tests = [f"CASE WHEN {q(c)} IS NULL THEN {lit('NOT_NULL:' + c)} END" for c in plan["not_null"]
+             if not (audit and audit != "copy" and c in sweep_audit.AUDIT_SET)]      # a NULL in a file-carried audit column is filled with the default (COALESCE in the INSERT)
     tests += [f"CASE WHEN (({ck['expr']})) IS FALSE THEN {lit('CHECK:' + ck['name'])} END" for ck in plan["checks"]]
     if tests:
         add("INSERT INTO _rej SELECT x._row_no, split_part(r, ':', 1), substr(r, strpos(r, ':') + 1), x.js FROM "
@@ -280,7 +282,7 @@ def staged_chunk(schema, table, header_cols, meta, plan, max_rejects, ci=None, *
         cap_spec = dict(capture_spec(schema, table), row_base=base) if capture.get("downstream", True) else None
     add(apply_pre_sql)
     for stmt in upsert_statements(tgt, header_cols, cols, plan["arbiter"], plan["present"], plan["identity"],
-                                  keep_target=keep_target, capture=cap_spec, no_update=set(defaults), sfx=sfx):
+                                  keep_target=keep_target, capture=cap_spec, no_update=set(defaults), sfx=sfx, audit=audit):
         add(stmt)
     if ci:
         add("DROP TABLE _stg;\n")
@@ -317,7 +319,7 @@ def staged_epilogue(schema, table, header_cols, meta, trigger_mode, uri, log_sql
 
 def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trigger_mode, max_rejects, uri, log_sql, *,
                         track="oracle", copy_from=None, keep_target=False, capture=None, pre_sql="", apply_pre_sql="", post_sql="",
-                        dry_run_sql=None, raw_cols=None, col_map=None, defaults=None):
+                        dry_run_sql=None, raw_cols=None, col_map=None, defaults=None, audit=sweep_audit.TAG_LOADER):
     """
     The staged one-transaction script for a whole file in ONE pass (prologue + one chunk + epilogue; see the module docstring).
     Besides Step 06 it is the apply script of `sweep.py promote` (which never chunks):
@@ -326,6 +328,7 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
       capture        {run_id, layer, full, uris, downstream}: copy the applied delta to sweep_delta and register it
       pre_sql        right after BEGIN (lock / statement timeouts), apply_pre_sql right before the apply (e.g. TRUNCATE)
       post_sql       after the apply (sequences) ; dry_run_sql: report counts and ROLLBACK instead of applying
+      audit          sweep_audit tag of a loader ('dcc_migration') or 'copy' (promote: the six audit columns travel as data)
       raw_cols       the columns of the FILE in file order (raw staging); col_map {table column: file column} and defaults
                      {table column: SQL expression} come from the FE loader rules (sweep_fwd_rules): header_cols are TABLE columns
     A chunked Step 06 load assembles the same pieces (staged_prologue / staged_chunk per chunk / staged_epilogue) in oracle_06_load_data.
@@ -335,7 +338,7 @@ def build_staged_script(schema, table, header_cols, stream_cmd, meta, plan, trig
     head = (staged_prologue(schema, table, raw_cols, meta, trigger_mode, pre_sql)
             + (copy_from or copy_from_program(raw_cols, stream_cmd))
             + staged_chunk(schema, table, header_cols, meta, plan, max_rejects, None, keep_target=keep_target, capture=capture,
-                           apply_pre_sql=apply_pre_sql, dry_run_sql=dry_run_sql, col_map=col_map, defaults=defaults))
+                           apply_pre_sql=apply_pre_sql, dry_run_sql=dry_run_sql, col_map=col_map, defaults=defaults, audit=audit))
     if dry_run_sql is not None:
         return head
     return head + staged_epilogue(schema, table, header_cols, meta, trigger_mode, uri, log_sql, track=track, capture=capture, post_sql=post_sql)
@@ -346,7 +349,7 @@ def fast_bulk_blockers(meta, header_cols, has_rules=False):
     Reasons why a table cannot take the direct-COPY path (empty list = it can). The fast path is for BARE tables only - empty or not (the
     part files of one table load one after the other into the same table). The staged load is used when the table has ANY of: a primary
     key or unique constraint, a foreign key, a CHECK constraint, ANY index (unique or not, partial, expression, valid or invalid, also on
-    child partitions), ANY user trigger (enabled or disabled), FE column rules, or a GENERATED ALWAYS identity column in the file. NOT NULL
+    child partitions), ANY user trigger (enabled or disabled; the tool's own audit trigger trg_sweep_audit does not count), FE column rules, or a GENERATED ALWAYS identity column in the file. NOT NULL
     columns (COPY enforces them: a NULL fails the file), identity BY DEFAULT and serial / sequence defaults do NOT block it. Every reason
     names the object that forces the staged path.
     """
@@ -366,7 +369,7 @@ def fast_bulk_blockers(meta, header_cols, has_rules=False):
             return ", ".join(x for x in (("unique" if i["unique"] else ""), ("partial" if i["partial"] else ""), ("expression" if i["expr"] else ""),
                                           ("invalid" if not i["valid"] else ""), f"on {i['on']}") if x)
         why.append("table has index(es): " + "; ".join(f"{i['name']} ({kind(i)})" for i in idx[:3]) + (" ..." if len(idx) > 3 else ""))
-    trg = meta.get("all_triggers", [])
+    trg = [t for t in meta.get("all_triggers", []) if t["name"] != sweep_audit.TRIGGER_NAME]      # the audit trigger is the tool's own: loaders run with it off and set the six columns
     if trg:
         why.append("table has user trigger(s): " + ", ".join(f"{t['name']}{'' if t['enabled'] else ' (disabled)'} on {t['on']}" for t in trg[:3])
                    + (" ..." if len(trg) > 3 else ""))

@@ -17,6 +17,7 @@ Generates:
     Sheets: RowCounts | ColumnAudit | TypeAudit | PKAudit | FileReconciliation
 =============================================================================
 """
+import sweep_audit
 import sys
 import re
 import argparse
@@ -37,9 +38,7 @@ from vsam.vsam_common import OUT, load_csv_safe, read_json
 
 logger = get_logger("vsam_07_validate", "vsam_07_validate")
 
-AUDIT_REQUIRED = {
-    "createddate", "createdby", "modifieddate", "modifiedby", "createddate_m", "createdby_m"
-}
+AUDIT_REQUIRED = set(sweep_audit.AUDIT_NAMES)      # the six canonical audit columns
 
 # PostgreSQL datatype normalization for comparison
 def pg_base_type(pg_type):

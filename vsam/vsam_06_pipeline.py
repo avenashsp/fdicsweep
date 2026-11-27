@@ -20,6 +20,7 @@ together, so they share one transaction and one connection):
       rejected rows -> sweep_ctl.load_rejects, vsam_load_log rows (with the S3 metadata), COMMIT
     END
 """
+import sweep_audit
 from sweep_common import VSAM_LOAD_LOG_TABLE, lit, q
 from sweep_delta import capture_setup_sql, capture_spec, registry_sql
 from sweep_loadpipe import (MAX_DUP_ROWS_PRINTED, MAX_REJECT_ROWS_PRINTED, REJECT_TABLE, TEXT_TYPES, history_insert_sql,
@@ -184,7 +185,7 @@ def build_unit_script(unit):
                 for stmt in upsert_statements(f"{q(d)}.{q(table)}", f["present"], cols, a, set(f["present"]), False,
                                               stg=f"_s{f['i']}", where=f"WHERE s._dest = {lit(d)}",
                                               sfx=f"|{f['i']}|{d}", existing=f"_ex{f['i']}", capture=spec,
-                                              no_update=set(f.get("defaults") or ())):
+                                              no_update=set(f.get("defaults") or ()), audit=sweep_audit.TAG_LOADER):
                     add(stmt)
     else:
         for d in dests:       # snapshot replace: a destination that receives rows is emptied first
@@ -193,7 +194,7 @@ def build_unit_script(unit):
         for f in files:
             for d in dests:
                 for stmt in upsert_statements(f"{q(d)}.{q(table)}", f["present"], cols, None, set(f["present"]), False,
-                                              stg=f"_s{f['i']}", where=f"WHERE s._dest = {lit(d)}", sfx=f"|{f['i']}|{d}"):
+                                              stg=f"_s{f['i']}", where=f"WHERE s._dest = {lit(d)}", sfx=f"|{f['i']}|{d}", audit=sweep_audit.TAG_LOADER):
                     add(stmt)
 
     if cap:

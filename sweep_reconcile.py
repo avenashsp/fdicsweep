@@ -31,6 +31,12 @@ def _columns(schema, table, dbname):
     return list(_column_types(schema, table, dbname))
 
 
+def missing_audit_columns(schema, table, dbname):
+    """The canonical audit columns (sweep_audit) a table lacks ([] when it carries all six; [] too when the table does not exist)."""
+    have = set(_column_types(schema, table, dbname))
+    return [] if not have else [c for c in sorted(TOOL_AUDIT_COLS) if c not in have]
+
+
 def _column_types(schema, table, dbname):
     """{column: type} (generated columns left out), in column order."""
     rows = query_db_dicts(
@@ -215,6 +221,11 @@ def _check_layer(lay):
                 f"schema version {max(done) if done else 'none'} (current {LATEST_VERSION}); run: python3 sweep.py migrate --layer {lay.name}")
             tables = read_manifest(lay)
             add("manifest", "OK" if tables else "WARN", f"{len(tables)} enabled table(s) in {lay.manifest_path.name}")
+            lacking = [f"{r['schema']}.{r['table']} ({', '.join(m)})" for r in tables
+                       for m in [missing_audit_columns(r["schema"], r["table"], lay.database)] if m]
+            add("audit columns", "OK" if not lacking else "WARN",
+                "every table carries the six canonical audit columns" if not lacking else
+                f"{len(lacking)} table(s) lack audit column(s): {'; '.join(lacking[:3])}" + (" ..." if len(lacking) > 3 else ""))
             if lay.upstream and tables:
                 up = get_layer(lay.upstream)
                 drift, missing_tables = [], []
@@ -284,6 +295,8 @@ def schema_comparison(src, tgt, tables, felog):
             st = felog.table(key[0], key[1], "MISSING_IN_TARGET") or "MISSING_IN_TARGET"
             rows.append({**base, "column_name": "", "source_type": "", "target_type": "", "status": st})
             continue
+        for c in missing_audit_columns(*key, tgt.database):         # the six canonical audit columns are expected in every table
+            rows.append({**base, "column_name": c, "source_type": stypes.get(c, ""), "target_type": "", "status": "MISSING_AUDIT_COLUMN"})
         for c in sorted(set(stypes) | set(ttypes)):
             if c in TOOL_AUDIT_COLS:
                 continue

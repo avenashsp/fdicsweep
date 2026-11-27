@@ -1,4 +1,4 @@
-# SWEEP CLI Command Reference - Oracle Migration Track (v6.2.3)
+# SWEEP CLI Command Reference - Oracle Migration Track (v6.3.0)
 
 > **6.0.0:** Steps 05-08 need `--layer` (Step 06 only `--layer bronze`); Steps 04, 05 and 07 refuse gold / gold_backup without `--allow-ddl`; Oracle 05 and 07 accept `--tables`; every step accepts `--tables`, `--schemas` / `--owners`, `--exclude-tables`, `--dry-run` (Oracle 02, 03, 06 also `--file` / `--filename`); targeted runs merge their outputs. Step 06 writes `sweep_ctl.oracle_load_log`, captures the applied delta for `promote` and loads again when the target table is empty. See [layers_and_promote.md](layers_and_promote.md) and [targeting_and_outputs.md](targeting_and_outputs.md).
 >
@@ -174,7 +174,7 @@ python3 -m oracle.oracle_03_type_gate --rows 1000
 ---
 
 ### Step 04: Generate Target DDL (`gen-ddl` / `ddl`)
-Generates PostgreSQL DDL split into pre-load bare tables (with audit columns) and post-load objects (PKs, indexes, views, triggers):
+Generates PostgreSQL DDL split into pre-load bare tables (with the six canonical audit columns and the `trg_sweep_audit` trigger, see [audit_columns.md](audit_columns.md)) and post-load objects (PKs, indexes, views, triggers):
 
 ```bash
 # Generate DDL for all discovered tables
@@ -274,7 +274,7 @@ python3 -m oracle.oracle_06_load_data --workers 4 --bg
 * **Fast-bulk registry and ledger**: the rows of a file are the rows the `\copy` itself reports (psql `ROW_COUNT`, in the same transaction) - the target table is **never counted** (no `count(*)`, so a table with billions of rows costs nothing extra). Every fast-bulk file is registered in `delta_registry` as a **full copy** (`rows_inserted` = rows of the file, `rows_updated` 0, no delta table, strictly increasing sequence number per table, assigned under the same lock as the staged path), also when the table was not empty. The ledger row (`load_history`) has `rows_read` = `rows_inserted` = the rows of the file; `rows_before` is 0 only when the table was empty before the COPY (and no other load of the table committed in the meantime), otherwise NULL: the ledger check then reports the table as informational `LEDGER_BASELINE_UNKNOWN` (not `LEDGER_MISMATCH`). `oracle_load_log.loaded_rows`, the report and the console summary show the rows of the file. A bad row fails only its file: nothing is loaded, no registry or ledger row is written (a `FAILED` history row stays) and a retry works. `promote` copies a table whose pending registry entries are all full copies (the parts) **once** per hop and registers every covered sequence in the target.
 * **Rejected rows are counted once per source row:** a row that breaks several rules (two empty NOT NULL columns, NOT NULL + CHECK, ...) has one entry per reason in `sweep_ctl.load_rejects` but is ONE rejected row in the counts, so `read = inserted + updated + unchanged + rejected + duplicates` always balances (also in VSAM Step 06 and `promote`).
 * **Which files**: a file counts as already loaded only when `sweep_ctl.oracle_load_log` has a `SUCCESS` row whose stored S3 `LastModified`, `ETag` and size (columns `s3_last_modified`, `s3_etag`, `s3_size`) all equal what S3 reports now **and the target table is not empty** (a table somebody truncated by hand is loaded again). Step 02 writes them to the file map; Step 06 re-checks the object (HEAD) right before loading and stores what it saw, so a stale file map does not matter. A re-delivered file (same name and path, different metadata) is loaded again; `--reload`, `--file` and `--filename` force a load. Rows from earlier versions without metadata are treated as loaded (use `--reload` to re-verify them). `oracle_load_log` keeps one row per URI.
-* **Triggers**: switched off for the load transaction (`SET LOCAL session_replication_role = replica`, or `DISABLE TRIGGER` / `ENABLE TRIGGER` inside the transaction as a fallback - `--trigger-mode`), so audit columns are set explicitly on updates.
+* **Triggers**: switched off for the load transaction (`SET LOCAL session_replication_role = replica`, or `DISABLE TRIGGER` / `ENABLE TRIGGER` inside the transaction as a fallback - `--trigger-mode`), so the loaders set the audit columns explicitly: an INSERT lists all six (`createdby_m = 'dcc_migration'`), an update sets only `modifiedby` / `modifieddate` ([audit_columns.md](audit_columns.md)). `--fast-bulk` relies on the column defaults, asserts the session setting `sweep.loader` and does not treat the tool's own `trg_sweep_audit` as a blocker.
 * **Upsert**: `INSERT ... ON CONFLICT (key) DO UPDATE ... WHERE (target columns) IS DISTINCT FROM (file columns)` - only rows that actually differ are updated. A `modifieddate` / `modifiedby` that comes from the file is source data and counts as a change. Counts: `inserted`, `updated`, `unchanged` (identical rows, not touched), `rejected`, `duplicates` (in-file, last row wins); `read = inserted + updated + unchanged + rejected + duplicates` is checked before the commit.
 * **NOT NULL columns**: when the table has them (Step 07 applies `SET NOT NULL` after the first load, so a reload meets them), the staged and chunked loads reject a row with a NULL there as `NOT_NULL` (one entry per column in `sweep_ctl.load_rejects`, ONE rejected row in the counts); `--fast-bulk` is a direct `COPY`, so one NULL in a NOT NULL column **fails the whole file** (nothing is loaded) - by design.
 * **Bad rows**: `NOT_NULL`, `CHECK`, `BAD_VALUE`, `FK_MISSING` and `ALT_KEY_CONFLICT` rows are rejected, not fatal; they are listed in `sweep_ctl.load_rejects` and the `Reject_Summary` / `Rejected_Rows` sheets. **By default (`--max-rejects 0`) rejected rows never fail a file**; only technical errors (a row-count mismatch, a broken stream) roll it back. `--max-rejects N` fails and rolls back a file at N rejected rows.
@@ -377,7 +377,7 @@ python3 sweep.py oracle load-data --min-size-mb 100 --max-size-mb 1000 --workers
 python3 sweep.py oracle load-data --min-size-mb 1000 --workers 2 --bg
 ```
 
-### Step 06 options (v6.2.3)
+### Step 06 options (v6.3.0)
 
 ```bash
 python3 sweep.py oracle load-data                           # default: rejected rows never fail a file (--max-rejects 0)

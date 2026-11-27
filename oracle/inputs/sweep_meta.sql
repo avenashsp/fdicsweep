@@ -451,3 +451,64 @@ DO $$ BEGIN
         CREATE OPERATOR public.+ (FUNCTION = public.timestamp_add_int, LEFTARG = timestamp without time zone, RIGHTARG = integer);
     END IF;
 END $$;
+
+-- -----------------------------------------------------------------------------
+-- 6.3.0: canonical audit trigger function, DDL capture of data models (migration 3)
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION sweep_ctl.fn_audit_cols() RETURNS trigger LANGUAGE plpgsql AS $fn$
+DECLARE loader text := nullif(current_setting('sweep.loader', true), '');
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        NEW.createdby := coalesce(NEW.createdby, SESSION_USER);
+        NEW.modifiedby := coalesce(NEW.modifiedby, SESSION_USER);
+        NEW.createddate := coalesce(NEW.createddate, now());
+        NEW.modifieddate := coalesce(NEW.modifieddate, NEW.createddate);
+    ELSE
+        NEW.createdby := OLD.createdby;
+        NEW.createddate := OLD.createddate;
+        IF loader IS NULL THEN                       -- only a loader / model session may set the _m columns of an existing row
+            NEW.createdby_m := OLD.createdby_m;
+            NEW.createddate_m := OLD.createddate_m;
+        END IF;
+        NEW.modifiedby := SESSION_USER;
+        NEW.modifieddate := now();
+    END IF;
+    RETURN NEW;
+END
+$fn$;
+
+-- DDL a data model ran in silver (captured by the event trigger below, replayed by promote into GB / gold)
+CREATE TABLE IF NOT EXISTS sweep_ctl.model_ddl_history (
+    id            bigserial PRIMARY KEY,
+    capture_tag   text NOT NULL,                 -- '<run_id>:<model>'
+    command_tag   text,
+    object_type   text,
+    schema_name   text,
+    object_identity text,
+    captured_by   text NOT NULL DEFAULT SESSION_USER,
+    captured_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sweep_model_ddl_history_tag ON sweep_ctl.model_ddl_history (capture_tag);
+ALTER TABLE sweep_ctl.model_run_log ADD COLUMN IF NOT EXISTS ddl_capture text;
+CREATE OR REPLACE FUNCTION sweep_ctl.fn_capture_ddl() RETURNS event_trigger AS $fn$
+DECLARE r record; tag text := nullif(current_setting('sweep.capture', true), '');
+BEGIN
+    IF tag IS NULL THEN RETURN; END IF;
+    FOR r IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
+        CONTINUE WHEN r.schema_name IN ('sweep_ctl', 'sweep_delta', 'pg_temp') OR r.in_extension;
+        INSERT INTO sweep_ctl.model_ddl_history (capture_tag, command_tag, object_type, schema_name, object_identity)
+        VALUES (tag, r.command_tag, r.object_type, r.schema_name, r.object_identity);
+    END LOOP;
+END
+$fn$ LANGUAGE plpgsql;
+DO $ev$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = 'sweep_capture_ddl') THEN
+        BEGIN
+            CREATE EVENT TRIGGER sweep_capture_ddl ON ddl_command_end EXECUTE FUNCTION sweep_ctl.fn_capture_ddl();
+        EXCEPTION WHEN insufficient_privilege THEN
+            RAISE NOTICE 'sweep: event trigger not created (needs rds_superuser); data-model DDL capture is unavailable';
+        END;
+    END IF;
+END
+$ev$;

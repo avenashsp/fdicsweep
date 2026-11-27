@@ -98,9 +98,9 @@ def test_no_old_schema_and_no_backup_output_names_in_the_models_folder():
         assert not [i for i in m.inputs if "bss00099" in i]
 
 
-def test_the_shipped_brokerglpair_header_declares_what_the_decisions_say():
-    m = {x.name: x for x in sm.discover(ROOT / "data_models")}["brokerglpair"]
-    assert m.outputs == ["bcs.brokerglpair"] and m.delta_strategy == "update_in_place"
+def test_the_shipped_dm02_header_declares_what_the_decisions_say():
+    m = {x.name: x for x in sm.discover(ROOT / "data_models")}["dm02_brokerglpair"]
+    assert m.outputs == ["bcs.brokerglpair"] and m.delta_strategy == "insert_missing"
     assert m.update_key == ["hogan_product_code", "total_number"] and "bss00098.stg_genledgeinterface_v" in m.inputs
 
 
@@ -279,16 +279,16 @@ def test_promote_refuses_a_model_output_whose_model_has_not_succeeded_on_the_cur
         mdl.env.manifest(l, [{"schema": "app", "table": "customer"}, {"track": "model_output", "schema": "app", "table": "m1_out"}])
     mdl.write("10_m1.py", mdl.hdr(), INSERT_ONE)
     with pytest.raises(sl.LayerError, match="not ready to promote.*app.m1_out.*model m1 has no SUCCESS"):
-        mdl.env.promote("silver", "gold_backup")
+        mdl.env.promote("silver", "gold_backup", allow_ddl=True)
     assert sm.run_models_cmd() == 0
-    assert mdl.env.promote("silver", "gold_backup")[1] == 0
+    assert mdl.env.promote("silver", "gold_backup", allow_ddl=True)[1] == 0
     assert psql(mdl.env.dbs["gold_backup"], "SELECT count(*) FROM app.m1_out") == "1"
     mdl.env.bronze_load(DELTA1)
     assert mdl.env.promote("bronze", "silver")[1] == 0                                               # a new silver input delta: the output is stale
     with pytest.raises(sl.LayerError, match="received delta"):
-        mdl.env.promote("silver", "gold_backup")
-    assert mdl.env.promote("silver", "gold_backup", ignore_model_status=True)[1] == 0               # explicit override
-    assert sm.run_models_cmd() == 0 and mdl.env.promote("silver", "gold_backup")[1] == 0
+        mdl.env.promote("silver", "gold_backup", allow_ddl=True)
+    assert mdl.env.promote("silver", "gold_backup", ignore_model_status=True, allow_ddl=True)[1] == 0               # explicit override
+    assert sm.run_models_cmd() == 0 and mdl.env.promote("silver", "gold_backup", allow_ddl=True)[1] == 0
 
 
 def test_chain_runs_the_models_in_silver_before_gold_backup_and_stops_when_one_fails(mdl):
@@ -299,14 +299,14 @@ def test_chain_runs_the_models_in_silver_before_gold_backup_and_stops_when_one_f
     assert sp.run_chain(until="models", transport="program") == 0
     assert mdl.runs() == "m1:SUCCESS:full"
     assert psql(mdl.env.dbs["silver"], "SELECT count(*) FROM app.m1_out") == "4" and psql(mdl.env.dbs["gold_backup"], "SELECT count(*) FROM app.m1_out") == "0"
-    assert sp.run_chain(until="gold_backup", transport="program") == 0                                # models up to date, outputs go on
+    assert sp.run_chain(allow_ddl=True, until="gold_backup", transport="program") == 0                                # models up to date, outputs go on
     assert psql(mdl.env.dbs["gold_backup"], "SELECT count(*) FROM app.m1_out") == "4"
     mdl.write("10_m1.py", mdl.hdr(), "sys.exit('boom')")
     mdl.env.bronze_load("id,name,qty\n7,g,70\n")
-    assert sp.run_chain(until="gold", transport="program", models_args={"force": True}) == 1          # a failed model stops the chain
+    assert sp.run_chain(allow_ddl=True, until="gold", transport="program", models_args={"force": True}) == 1          # a failed model stops the chain
     assert psql(mdl.env.dbs["gold"], "SELECT count(*) FROM app.customer WHERE id = 7") == "0"
     assert psql(mdl.env.dbs["gold_backup"], "SELECT count(*) FROM app.customer WHERE id = 7") == "0"   # nothing was promoted to gold_backup
-    assert sp.run_chain(until="gold_backup", skip_models=True, transport="program") == 0               # --skip-models promotes without them
+    assert sp.run_chain(allow_ddl=True, until="gold_backup", skip_models=True, transport="program") == 0               # --skip-models promotes without them
     assert psql(mdl.env.dbs["gold_backup"], "SELECT count(*) FROM app.customer WHERE id = 7") == "1"
 
 
@@ -321,3 +321,43 @@ def test_status_and_list_commands(mdl, capsys):
     assert sm.run_models_cmd() == 0
     assert sm.models_status() == 0
     assert "SUCCESS" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- 6.3.0: DDL capture, audit post-step, replay in promote
+def test_model_ddl_is_captured_audited_and_replayed_by_promote_before_the_rows(mdl):
+    for l in ("silver", "gold_backup"):
+        mdl.env.manifest(l, [{"schema": "app", "table": "customer"}, {"track": "model_output", "schema": "app", "table": "m1_out"}])
+    mdl.write("10_m1.py", mdl.hdr(), 'sql("ALTER TABLE app.m1_out ADD COLUMN IF NOT EXISTS extra text")\n'
+                                      'sql("INSERT INTO app.m1_out (id, n, extra) VALUES (1, 1, \'x\') ON CONFLICT DO NOTHING")')
+    assert sm.run_models_cmd() == 0
+    silver, gb = mdl.env.dbs["silver"], mdl.env.dbs["gold_backup"]
+    cap = json.loads(psql(silver, "SELECT ddl_capture FROM sweep_ctl.model_run_log WHERE model = 'm1' AND status = 'SUCCESS'"))
+    assert any(d["identity"] == "app.m1_out" and d["command"] == "ALTER TABLE" for d in cap)            # the model's ALTER is captured
+    audit = "createdby,createddate,createddate_m,createdby_m,modifiedby,modifieddate"
+    cols = lambda db: sorted(psql(db, "SELECT column_name FROM information_schema.columns WHERE table_schema = 'app' AND table_name = 'm1_out'").split("\n"))
+    assert set(audit.split(",")) <= set(cols(silver))                                                    # post-step: the six columns in silver
+    assert psql(silver, "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'app.m1_out'::regclass AND tgname = 'trg_sweep_audit'") == "1"
+    # the capture is restricted to the model session: nothing outside a model run is recorded
+    psql(silver, "ALTER TABLE app.customer ADD COLUMN IF NOT EXISTS unrelated int")
+    assert psql(silver, "SELECT count(*) FROM sweep_ctl.model_ddl_history WHERE object_identity = 'app.customer'") == "0"
+    # gold_backup has allow_ddl=false: without --allow-ddl the replay is not done and the drift is reported
+    results, code = mdl.env.promote("silver", "gold_backup")
+    assert code != 0 and "extra" not in cols(gb)
+    results, code = mdl.env.promote("silver", "gold_backup", allow_ddl=True)
+    assert code == 0, results
+    assert {"extra"} | set(audit.split(",")) <= set(cols(gb))                                          # replayed BEFORE the rows were copied
+    assert psql(gb, "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'app.m1_out'::regclass AND tgname = 'trg_sweep_audit'") == "1"
+    assert psql(gb, "SELECT extra FROM app.m1_out") == "x"
+    # promote copies the six as data: no literal of its own, the model's values arrive unchanged
+    same = "SELECT createdby || '|' || createddate::text || '|' || modifiedby || '|' || createdby_m || '|' || createddate_m::text FROM app.m1_out"
+    assert psql(gb, same) == psql(silver, same) and psql(gb, "SELECT createdby_m FROM app.m1_out") == "fe_migration"
+    # no drift on the next promote, and the replay is recorded so the next hop replays too
+    results, code = mdl.env.promote("silver", "gold_backup", allow_ddl=True)
+    assert code == 0 and all(r["inserted"] == 0 for r in results)
+    assert psql(gb, "SELECT count(*) FROM sweep_ctl.model_run_log WHERE mode = 'ddl-replay'") != "0"
+
+
+def test_a_run_is_refused_when_the_ddl_capture_event_trigger_is_missing(mdl):
+    mdl.write("10_m1.py", mdl.hdr(), INSERT_ONE)
+    psql(mdl.env.dbs["silver"], "DROP EVENT TRIGGER sweep_capture_ddl")
+    assert sm.run_models_cmd() == 1 and mdl.runs() == ""                                                 # nothing was started

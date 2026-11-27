@@ -120,3 +120,12 @@ def _no_real_data_models(tmp_path_factory, monkeypatch):
     """The data models of the repository need their own source tables: tests that do not test models see an empty models folder."""
     empty = tmp_path_factory.mktemp("no_data_models")
     monkeypatch.setenv("SWEEP_MODELS_DIR", str(empty))
+
+
+@pytest.fixture(autouse=True)
+def loader_session():
+    """The loaders run as a loader session (sweep.loader = dcc_migration), like `sweep.py` sets it at the start of Step 06.
+    A test that needs a plain session calls sweep_common.set_loader_tag("")."""
+    sweep_common.set_loader_tag(sweep_common.TAG_LOADER)
+    yield
+    sweep_common.set_loader_tag("")

@@ -88,7 +88,8 @@ def fwd(chain_env, tmp_path, monkeypatch):
 
 def _cols(env, layer):
     return psql(env.dbs[layer], "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns "
-                                "WHERE table_schema = 'app' AND table_name = 'customer'")
+                                "WHERE table_schema = 'app' AND table_name = 'customer' "
+                                "AND column_name NOT IN ('createdby', 'createddate', 'modifiedby', 'createddate_m', 'createdby_m')")      # 6.3.0 post-step columns
 
 
 def test_files_apply_in_numeric_order_once_and_are_immutable(fwd, capsys):
@@ -336,3 +337,28 @@ def test_chain_applies_new_fe_files_in_silver_after_the_data_promote(fwd):
     assert sp.run_chain(until="gold_backup", skip_models=True, transport="program", allow_ddl=True) == 0
     assert _cols(fwd.env, "silver").endswith("a,b") and _cols(fwd.env, "gold_backup").endswith("a,b")     # silver first, then gold_backup
     assert _cols(fwd.env, "gold") == "id,name,qty,modifieddate" and _cols(fwd.env, "bronze") == "id,name,qty,modifieddate"
+
+
+# ---------------------------------------------------------------- 6.3.0: audit post-step
+def test_the_audit_post_step_adds_missing_columns_skips_existing_ones_and_creates_the_trigger(fwd, capsys):
+    fwd.write("V1__new_table.sql", "CREATE TABLE app.fresh (id int PRIMARY KEY);\nALTER TABLE app.customer ADD COLUMN extra int;\n")
+    assert fd.cmd_apply(fwd.args()) == 0
+    db = fwd.env.dbs["silver"]
+    six = {"createdby", "createddate", "modifiedby", "modifieddate", "createddate_m", "createdby_m"}
+    cols = lambda t: set(psql(db, f"SELECT column_name FROM information_schema.columns WHERE table_schema = 'app' AND table_name = '{t}'").split("\n"))
+    assert six <= cols("fresh") and six <= cols("customer")                                           # created AND altered tables
+    assert psql(db, "SELECT data_type FROM information_schema.columns WHERE table_schema = 'app' AND table_name = 'customer' AND column_name = 'modifieddate'") \
+        == "timestamp without time zone"                                                              # an existing column is skipped, not redefined
+    for t in ("fresh", "customer"):
+        assert psql(db, f"SELECT count(*) FROM pg_trigger WHERE tgrelid = 'app.{t}'::regclass AND tgname = 'trg_sweep_audit'") == "1"
+    # the audit columns are not listed as FE changes, and a table the file did not touch is left alone
+    assert psql(db, "SELECT count(*) FROM sweep_ctl.fwd_ddl_changes WHERE object_name LIKE 'fresh.created%' OR object_name LIKE 'customer.created%'") == "0"
+    # idempotent: the next file touching the table does not duplicate anything
+    fwd.write("V2__more.sql", "ALTER TABLE app.fresh ADD COLUMN more int;\n")
+    assert fd.cmd_apply(fwd.args()) == 0
+    assert psql(db, "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'app.fresh'::regclass AND tgname = 'trg_sweep_audit'") == "1"
+    assert psql(db, "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'app' AND table_name = 'fresh' AND column_name = 'createdby'") == "1"
+    # a row inserted by a third party (a plain session) gets the defaults, the _m columns stay NULL
+    c.set_loader_tag("")
+    psql(db, "INSERT INTO app.fresh (id) VALUES (1)")
+    assert psql(db, "SELECT createdby = SESSION_USER AND createdby_m IS NULL AND createddate_m IS NULL FROM app.fresh") == "t"
