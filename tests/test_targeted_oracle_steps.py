@@ -75,7 +75,7 @@ def test_step01_targeted_run_merges_one_table_and_keeps_the_rest(env):
     for owner, table in (("BSS01001", "ORDERS"), ("BSS01104", "CUSTOMER")):        # untouched entries are byte-identical
         assert [l for l in before if l.startswith(f"{owner},{table},")] == [l for l in after if l.startswith(f"{owner},{table},")]
     assert (env.meta / "sequences.csv").exists() and len(_rows(env.meta / "sequences.csv")) == 1   # --tables leaves owner-level files alone
-    assert len(_rows(env.meta / "constraints.csv")) == 3
+    assert len(_rows(env.meta / "constraints.csv")) == 4      # PK_CUSTOMER, PK_ORDERS, FK_ORD_CUST + the NOT_NULL row of BSS01104.CUSTOMER.ID (no primary key there)
 
 
 def test_step01_schema_selector_and_dry_run_and_unknown_table(env, capsys):
