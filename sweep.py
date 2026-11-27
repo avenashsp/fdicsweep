@@ -896,7 +896,7 @@ def main():
     o_load.add_argument("--dry-run", action="store_true", help="Simulate load")
     o_load.add_argument("--reload", action="store_true", help="Force reloading/upserting files even if previously loaded")
     o_load.add_argument("--max-rejects", type=int, default=None, help="Fail a file when this many rows are rejected (default 0 = never fail; N = fail the file at N rejects)")
-    o_load.add_argument("--fast-bulk", action="store_true", help="Direct COPY (no temp staging) into empty tables without keys / CHECK / foreign keys; NOT NULL and identity columns are fine (no bad-row isolation)")
+    o_load.add_argument("--fast-bulk", action="store_true", help="Direct COPY (no temp staging) into BARE tables (no key, FK, CHECK, index or trigger), empty or not - part files of one table; registered as full copies (no bad-row isolation)")
     o_load.add_argument("--chunk-rows", type=int, default=None, help="Records per chunk for staged loads of big files (default 2,000,000; 0 = never chunk)")
     o_load.add_argument("--chunk-min-mb", type=float, default=None, help="Only files at least this big (compressed MB) are chunked (default 256)")
     o_load.add_argument("--full", action="store_true", help="Do not capture the applied delta: the promote hop copies the whole table")

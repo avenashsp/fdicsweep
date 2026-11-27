@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [6.2.3] - 2026-11-27
+
+`--fast-bulk` for tables that arrive as several part files, with a correct delta registry, ledger and promote.
+
+### Changed
+- **`--fast-bulk` rule (Oracle Step 06):** the direct COPY path is for **bare** tables, **empty or not**. The "table is not empty" blocker is gone, so every part file of one table (`BSS01001.BROKERACCOUNTDETAIL_202345.csv.gz`, `_202350`, ...) takes the fast path instead of only the first one (the others used to fall back to the slower staged load, with one warning per file). The staged load is used when the table has ANY of: a primary key or unique constraint, a foreign key, a CHECK constraint, **any index** (unique or not, partial, expression, valid or invalid, also on child partitions), **any user trigger** (enabled or disabled), FE loader rules, or a GENERATED ALWAYS identity column in the file. NOT NULL columns, identity BY DEFAULT and serial / sequence defaults do not block. The warning names the object that forced the staged path. `load_table_meta` also returns `indexes` and `all_triggers` (the existing fields are unchanged); `fast_bulk_blockers(meta, header_cols, has_rules)` lost its `table_is_empty` argument. The staged path is unchanged.
+- **Rows of a fast-bulk file** are the rows the `\copy` reports (psql `ROW_COUNT`, inside the same transaction); the target table is **never counted** (no `count(*)`: on a table with billions of rows that would take hours). `oracle_load_log.loaded_rows`, the report and the console summary show the rows of the file.
+- **Delta registry:** a fast-bulk file is always registered as a **full copy** (`rows_inserted` = rows of the file, `rows_updated` 0, `rows_total` = rows of the file, no delta table), also into a non-empty table; the sequence number is taken under the same advisory lock the staged path uses, right before the insert, so two workers loading two parts of one table copy in parallel and each gets its own sequence number and its own rows.
+- **Ledger (`load_history`):** `rows_read` = `rows_inserted` = rows of the file. `rows_before` is 0 only when the table was empty before the COPY and no other load of the table committed its history row in the meantime; otherwise NULL. A table with history but no baseline is reported by the ledger check as informational **`LEDGER_BASELINE_UNKNOWN`** instead of `LEDGER_MISMATCH` (Oracle Step 08, VSAM Step 07, `validate`).
+- **`promote`:** a run of consecutive full-copy registry entries of one table (the part files) is now **one** apply - the whole source table is copied once per hop, not once per part. The target registers every covered sequence (rows 0, message "covered by the full copy of delta N"), so the next hop sees them in strict order. Captured deltas, a lone full copy and `promote --full` are unchanged.
+- Version 6.2.3; the changelog file is `CHANGELOG_v6.2.3.md`.
+
+### Unchanged
+- The staged and chunked loads, FE (fwd-ddl), models, layers and the delta design.
+- One consequence to know: Step 04 attaches the audit trigger and Step 07 applies keys, indexes and triggers after the first load, so a reload of such a table (it is no longer bare) uses the staged load.
+
+### Tests
+- New: the blocker rule (pure, every blocker alone, non-blockers), every blocker on a real table (primary key, unique constraint, foreign key, CHECK, plain / partial / expression / invalid index, index on a child partition, enabled / disabled trigger, GENERATED ALWAYS in the file, FE rule) with the log naming the object, `load_table_meta` indexes and triggers, a bare non-empty table (rows appended, per-file counts, full-copy registry entry, ledger row, baseline unknown, no `count(*)` on the target), baseline logic and ledger match (also after a manual truncate), two part files loaded by two workers at the same time (3 rounds), a bad row failing only its file, a partitioned parent (rows counted over the leaf partitions, verified against `pg_stat_xact_user_tables`), and `promote` copying several full-copy entries once with the next hop still working.
+
+---
+
 ## [6.2.2] - 2026-11-27
 
 Fix: inline NOT NULL columns of the Oracle dump were lost in bronze, and the Oracle Step 08 validator reported 126 false `NULLABILITY_MISMATCH`.

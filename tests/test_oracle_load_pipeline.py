@@ -219,12 +219,13 @@ def test_fast_bulk_skip_reason_is_logged_and_staged_load_used(gz_file, grab, ddl
     assert any("--fast-bulk skipped" in m and why in m for m in msgs)
 
 
-def test_fast_bulk_skipped_when_table_is_not_empty(gz_file, grab):
+def test_fast_bulk_is_used_for_a_bare_table_that_is_not_empty(gz_file, grab):
     _t("ph", "t", "id int, v text")
     c.run_psql("INSERT INTO ph.t VALUES (0, 'x')")
     msgs = grab(o6.logger)
-    o = _load(gz_file, "a.csv.gz", "id,v\n1,a\n", "ph", "t", fast_bulk=True)
-    assert o.path == "staged" and any("table is not empty" in m for m in msgs)
+    o = _load(gz_file, "a.csv.gz", "id,v\n1,a\n2,b\n", "ph", "t", fast_bulk=True)
+    assert (o.status, o.path, o.rows) == ("SUCCESS", "fast bulk", 2), o.error                   # the rows of the FILE, not of the table
+    assert _q("SELECT count(*) FROM ph.t") == "3" and not any("--fast-bulk skipped" in m for m in msgs)
 
 
 def test_fast_bulk_is_skipped_for_fe_rules_and_generated_always_identity(gz_file, grab, monkeypatch):
@@ -239,7 +240,7 @@ def test_fast_bulk_is_skipped_for_fe_rules_and_generated_always_identity(gz_file
     o = _load(gz_file, "b.csv.gz", "v\nx\n", "pq", "t2", fast_bulk=True)
     assert o.path == "fast bulk"                                           # the file does not carry the ALWAYS column: fine
     _t("pq", "t3", "id bigint GENERATED ALWAYS AS IDENTITY, v text")
-    mt = pl.fast_bulk_blockers({"keys": [], "checks": [], "fks": [], "columns": {"id": {"identity": "a"}}}, ["id"], True)
+    mt = pl.fast_bulk_blockers({"keys": [], "checks": [], "fks": [], "columns": {"id": {"identity": "a"}}}, ["id"])
     assert mt and "GENERATED ALWAYS" in mt[0]
 
 

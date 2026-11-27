@@ -1,4 +1,4 @@
-# SWEEP CLI Command Reference - VSAM Migration Track (v6.2.2)
+# SWEEP CLI Command Reference - VSAM Migration Track (v6.2.3)
 
 > **6.0.0:** Steps 05-07 need `--layer` (Step 06 only `--layer bronze`); VSAM 04 / 05 refuse gold / gold_backup without `--allow-ddl`; VSAM 01 has `--copybook`, VSAM 04 / 05 accept `--tables` / `--schemas`, VSAM 06 accepts `--file` / `--filename` / `--exclude-tables`; every step accepts `--dry-run`; targeted runs merge their outputs. Step 06 writes `sweep_ctl.vsam_load_log` (PK `uri, target_schema`, real URI), registers a delta per destination schema (a keyless snapshot replace is registered as a full copy) and loads again when a table it loaded into is empty. Step 04 never applies a key taken from the Step 03 profile. See [layers_and_promote.md](layers_and_promote.md) and [targeting_and_outputs.md](targeting_and_outputs.md).
 >

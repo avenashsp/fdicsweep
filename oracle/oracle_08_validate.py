@@ -85,7 +85,7 @@ from sweep_common import (
     PGUSER,
 )
 from sweep_fwd_ddl import FeIndex, load_fe_changes
-from sweep_validate import FE_STATUSES, LEDGER_MISMATCH, FeLog, drop_discrepancies, ledger_check
+from sweep_validate import FE_STATUSES, LEDGER_BASELINE_UNKNOWN, LEDGER_MISMATCH, FeLog, drop_discrepancies, ledger_check
 from sweep_s3meta import has_meta, make_meta, meta_equal, meta_from_row
 from sweep_targeting import add_targeting_args, selector_or_exit, validate_or_exit
 from sweep_layers import add_layer_arg, ensure_layer
@@ -367,7 +367,8 @@ def run_full_parity_audit(exact_counts=False, tables_filter=None, schemas_filter
         {"Metric": "Views & Materialized Views", "Value": f"{total_views_matched} of {total_views_ora} Matched", "Parity_Assessment": f"{round((total_views_matched/max(total_views_ora,1))*100,1)}%"},
         {"Metric": "Table Triggers", "Value": f"{total_trgs_matched} of {total_trgs_ora} Matched", "Parity_Assessment": f"{round((total_trgs_matched/max(total_trgs_ora,1))*100,1)}%"},
         {"Metric": "Table Row Count Parity", "Value": f"{row_matched_cnt} of {len(row_count_audit)} Tables Aligned", "Parity_Assessment": f"{round((row_matched_cnt/max(len(row_count_audit),1))*100,1)}%"},
-        {"Metric": "Ledger (rows vs sweep_ctl.load_history)", "Value": f"{sum(1 for lr in ledger if lr['ledger_status'] != LEDGER_MISMATCH)} of {len(ledger)} Tables Match", "Parity_Assessment": "ZERO MISMATCHES" if not ledger_bad else f"{ledger_bad} MISMATCHES"},
+        {"Metric": "Ledger (rows vs sweep_ctl.load_history)", "Value": f"{sum(1 for lr in ledger if lr['ledger_status'] not in (LEDGER_MISMATCH, LEDGER_BASELINE_UNKNOWN))} of {len(ledger)} Tables Match"
+                                                                         f"{(' (' + str(sum(1 for lr in ledger if lr['ledger_status'] == LEDGER_BASELINE_UNKNOWN)) + ' baseline unknown)') if any(lr['ledger_status'] == LEDGER_BASELINE_UNKNOWN for lr in ledger) else ''}", "Parity_Assessment": "ZERO MISMATCHES" if not ledger_bad else f"{ledger_bad} MISMATCHES"},
         {"Metric": "Differences explained by FE files", "Value": len(felog.rows), "Parity_Assessment": "PASS (listed in sheet FE_Changes)"},
         {"Metric": "S3 Data Files Ingestion Parity", "Value": f"{total_s3_loaded} of {total_s3_planned} Loaded into DB", "Parity_Assessment": f"{round((total_s3_loaded/max(total_s3_planned,1))*100,1)}%"}
     ]

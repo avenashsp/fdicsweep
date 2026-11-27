@@ -71,6 +71,17 @@ def load_table_meta(schema, table):
         f"FROM pg_constraint WHERE conrelid = {reg} AND contype = 'f' ORDER BY conname")
     triggers = query_db_dicts(
         f"SELECT tgname AS name FROM pg_trigger WHERE tgrelid = {reg} AND NOT tgisinternal AND tgenabled = 'O' ORDER BY tgname")
+    # everything that makes a table NOT bare (the direct-COPY path needs a bare table): ALL indexes and ALL non-internal triggers of the
+    # table and of its partitions (any depth), whatever their state - unique or not, partial, expression, valid or invalid; enabled or disabled
+    family = (f"WITH RECURSIVE rel(oid, name) AS (SELECT {reg}::oid, {reg}::text WHERE {reg} IS NOT NULL UNION ALL "
+              f"SELECT i.inhrelid, i.inhrelid::regclass::text FROM pg_inherits i JOIN rel ON i.inhparent = rel.oid) ")
+    indexes = query_db_dicts(
+        family + "SELECT c.relname AS name, rel.name AS on_rel, ix.indisunique AS uniq, ix.indpred IS NOT NULL AS partial, "
+                 "ix.indexprs IS NOT NULL AS expr, ix.indisvalid AS valid FROM pg_index ix JOIN pg_class c ON c.oid = ix.indexrelid "
+                 "JOIN rel ON rel.oid = ix.indrelid ORDER BY c.relname")
+    all_triggers = query_db_dicts(
+        family + "SELECT t.tgname AS name, rel.name AS on_rel, t.tgenabled AS state FROM pg_trigger t JOIN rel ON rel.oid = t.tgrelid "
+                 "WHERE NOT t.tgisinternal ORDER BY t.tgname")
     flag = lambda v: str(v).strip().lower() in ("t", "true", "1")
     return {
         "columns": {c["name"]: {"type": c["type"], "notnull": flag(c["notnull"]), "hasdef": flag(c["hasdef"]),
@@ -80,6 +91,9 @@ def load_table_meta(schema, table):
         "fks": [{"name": f["name"], "parent": f["parent"], "self_ref": flag(f["self_ref"]),
                  "cols": f["cols"].split(","), "parent_cols": f["parent_cols"].split(",")} for f in fks if f["cols"]],
         "triggers": [t["name"] for t in triggers],
+        "indexes": [{"name": i["name"], "on": i["on_rel"], "unique": flag(i["uniq"]), "partial": flag(i["partial"]), "expr": flag(i["expr"]),
+                     "valid": flag(i["valid"])} for i in indexes],
+        "all_triggers": [{"name": t["name"], "on": t["on_rel"], "enabled": t["state"] != "D"} for t in all_triggers],
     }
 
 
@@ -234,17 +248,20 @@ HISTORY_TABLE = f"{CTL_SCHEMA}.load_history"
 
 
 def history_insert_sql(track, layer, source, run_id, uri, schema, table, *, read, inserted, updated, unchanged, rejected, dup,
-                       s3_meta=None, reset=False, status="SUCCESS", message=None, count_target=None, where="true"):
+                       s3_meta=None, reset=False, status="SUCCESS", message=None, count_target=None, where="true", before_sql=None):
     """
     One load_history row. The counts are SQL scalar expressions evaluated INSIDE the load transaction, so the row exists only if
     the data does. rows_before (the ledger baseline) is stored on the first row of a table - the rows it already held - or as 0 when
-    the load replaced the table (`reset`).
+    the load replaced the table (`reset`). `before_sql` overrides the baseline with an SQL expression (the fast-bulk path, which never counts
+    the target table).
     """
     from sweep_s3meta import meta_sql_values
     tgt = f"{q(schema)}.{q(table)}"
     lm, etag, size = meta_sql_values(s3_meta)
     ins = f"COALESCE({inserted}, 0)"
-    if reset:
+    if before_sql is not None:
+        before = before_sql
+    elif reset:
         before = "0"
     else:
         before = (f"CASE WHEN NOT EXISTS (SELECT 1 FROM {HISTORY_TABLE} h WHERE h.target_schema = {lit(schema)} "

@@ -12,6 +12,7 @@ from collections import defaultdict
 from sweep_common import CTL_SCHEMA, lit, q, query_db_dicts
 
 LEDGER_MATCH, LEDGER_MISMATCH = "LEDGER_MATCH", "LEDGER_MISMATCH"
+LEDGER_BASELINE_UNKNOWN = "LEDGER_BASELINE_UNKNOWN"      # informational: no empty-table baseline was recorded (a fast-bulk load into a non-empty table)
 FE_STATUSES = ("FE_ADDED", "FE_CHANGED", "FE_DROPPED")
 
 
@@ -48,6 +49,20 @@ def ledger_expected(dbname=None):
                                               "track": r["track"], "loads": int(r["loads"] or 0)} for r in rows}
 
 
+def ledger_unknown(dbname=None):
+    """{(schema, table): track} of the tables that have load history but NO baseline row (rows_before is NULL on every SUCCESS row)."""
+    try:
+        rows = query_db_dicts(f"""
+            SELECT DISTINCT ON (o.target_schema, o.target_table) o.target_schema AS s, o.target_table AS t, o.track
+            FROM {CTL_SCHEMA}.load_history o WHERE o.status = 'SUCCESS' AND NOT EXISTS (
+                SELECT 1 FROM {CTL_SCHEMA}.load_history b WHERE b.target_schema = o.target_schema AND b.target_table = o.target_table
+                AND b.status = 'SUCCESS' AND b.rows_before IS NOT NULL)
+            ORDER BY o.target_schema, o.target_table, o.id DESC""", dbname=dbname)
+    except RuntimeError:
+        return {}
+    return {(r["s"].lower(), r["t"].lower()): r["track"] for r in rows}
+
+
 def _keyed_tables(dbname=None):
     rows = query_db_dicts("SELECT DISTINCT n.nspname AS s, c.relname AS t FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid "
                           "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE i.indisunique AND i.indisvalid", dbname=dbname)
@@ -78,7 +93,8 @@ def ledger_check(schemas=None, tables=None, fe=None, dbname=None):
     """
     ok = _in_filter(schemas, tables)
     expected = {k: v for k, v in ledger_expected(dbname).items() if ok(*k)}
-    if not expected:
+    unknown = {k: v for k, v in ledger_unknown(dbname).items() if ok(*k)}
+    if not expected and not unknown:
         return []
     existing = _existing_tables(dbname)
     keyed = _keyed_tables(dbname)
@@ -101,7 +117,12 @@ def ledger_check(schemas=None, tables=None, fe=None, dbname=None):
             row.update(ledger_status=LEDGER_MISMATCH, note=f"{diff:+d} row(s) not explained by the load history"
                        + (f" (table touched by {fe.changed_tables[(s, t)]})" if fe is not None and fe.table_touched(s, t) else ""))
         out.append(row)
-    return out
+    for (s, t), track in sorted(unknown.items()):             # not counted (never a count(*) of a big table), only reported
+        if (s, t) in existing:
+            out.append({"target_schema": s, "target_table": t, "track": track, "ledger_rule": "no baseline", "ledger_loads": "", "ledger_rows": "",
+                        "actual_rows": "", "ledger_status": LEDGER_BASELINE_UNKNOWN,
+                        "note": "informational: the table held rows before its first recorded load, so the history cannot predict its row count"})
+    return sorted(out, key=lambda r: (r["target_schema"], r["target_table"]))
 
 
 # -----------------------------------------------------------------------------

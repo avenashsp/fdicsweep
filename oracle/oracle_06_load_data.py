@@ -53,7 +53,8 @@ from sweep_common import (
     DB_ERRORS,
 )
 from oracle.oracle_06_pipeline import (
-    build_fast_script, build_staged_script, copy_from_stdin, csum, ensure_reject_table, fast_bulk_blockers, load_log_insert,
+    FAST_ROWS, build_fast_script, build_staged_script, copy_from_stdin, csum, ensure_reject_table, fast_baseline_sql, fast_bulk_blockers,
+    load_log_insert,
     load_table_meta, parse_output, persist_failed_file_rejects, plan_load, probe_trigger_mode, staged_chunk, staged_epilogue,
     staged_prologue,
 )
@@ -332,18 +333,21 @@ def load_single_file(job, worker_id, region=AWS_REGION, dry_run=False, max_rejec
 
         use_fast = False
         if fast_bulk:
-            why = fast_bulk_blockers(meta, header_cols, is_table_empty(schema, table), has_rules)
+            why = fast_bulk_blockers(meta, header_cols, has_rules)
             use_fast = not why
             if why:
                 logger.warning(f"[Worker {worker_id}] --fast-bulk skipped for {schema}.{table} - using the staged load: {'; '.join(why)}")
         chunked = (not use_fast) and chunk_rows > 0 and size_mb_val >= chunk_min_mb
         if use_fast:
             path = "fast bulk"
-            logger.info(f"[Worker {worker_id}] Started stream: {name} ({format_size_actual(size_mb_val)}) -> {schema}.{table} (fast bulk - direct COPY, no staging)")
+            logger.info(f"[Worker {worker_id}] Started stream: {name} ({format_size_actual(size_mb_val)}) -> {schema}.{table} (fast bulk - direct COPY into a bare table, no staging)")
+            # the rows of THIS file come from the \\copy itself (psql ROW_COUNT -> :n), inside the transaction: the target table is never counted.
+            # Registry: always a full copy of this file's rows; ledger: rows_read = rows_inserted = the file's rows, baseline 0 only when the
+            # table was empty (see fast_baseline_sql), otherwise unknown
             script = build_fast_script(schema, table, header_cols, stream_cmd, meta, trigger_mode,
-                                       fast_registry_sql(schema, table, current_run_id(), uri, header_cols, "bronze") + log_sql
-                                       + hist(read=f"(SELECT count(*) FROM {q(schema)}.{q(table)})", inserted=f"(SELECT count(*) FROM {q(schema)}.{q(table)})",
-                                              updated="0", unchanged="0", rejected="0", dup="0", reset=True))
+                                       fast_registry_sql(schema, table, current_run_id(), uri, header_cols, LAYER or "bronze") + log_sql
+                                       + hist(read=FAST_ROWS, inserted=FAST_ROWS, updated="0", unchanged="0", rejected="0", dup="0",
+                                              before_sql=fast_baseline_sql(schema, table)))
         else:
             how = f"upsert on {', '.join(plan['arbiter']['cols'])}" if plan["arbiter"] else "append - no key"
             path = "staged, chunked" if chunked else "staged"
@@ -769,8 +773,9 @@ if __name__ == "__main__":
     parser.add_argument("--max-rejects", type=int, default=DEFAULT_MAX_REJECTS,
                         help=f"Fail (and roll back) a file when this many rows are rejected (default {DEFAULT_MAX_REJECTS} = never; only technical errors fail a file)")
     parser.add_argument("--fast-bulk", action="store_true",
-                        help="Direct COPY (no temp staging) for an empty table without keys / CHECK / foreign keys; NOT NULL and identity columns are fine "
-                             "(fastest first load; one bad row fails the file). Otherwise the staged load is used and the log says why")
+                        help="Direct COPY (no temp staging) into a BARE table - no key, foreign key, CHECK, index or trigger - empty or not (the part files of one "
+                             "table); NOT NULL and identity columns are fine. Registered as a full copy. One bad row fails the file. Otherwise the staged "
+                             "load is used and the log names the object that forced it")
     parser.add_argument("--chunk-rows", type=int, default=DEFAULT_CHUNK_ROWS,
                         help=f"Staged loads of big files run in chunks of this many records inside the one transaction, so temp storage holds one "
                              f"chunk instead of the whole file (default {DEFAULT_CHUNK_ROWS:,}; 0 = never chunk)")

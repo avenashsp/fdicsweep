@@ -344,7 +344,10 @@ def apply_one(src, tgt, mrow, delta, opts, meta_cache):
     script = build_staged_script(
         schema, table, header_cols, stream_cmd, tmeta, plan, trig, 0, uri, log_sql, track=track, copy_from=copy_from,
         keep_target=keep_target, capture=None if dry else capture, pre_sql=timeout_sql(tgt), apply_pre_sql=apply_pre,
-        post_sql=sequence_sql(schema, table, tmeta), raw_cols=raw_cols, col_map=resolution.col_map, defaults=resolution.defaults,
+        post_sql=sequence_sql(schema, table, tmeta) + (covered_registry_sql(schema, table, opts["run_id"], uri, header_cols,
+                                                                            delta.get("origin_layer") or src.name, seq, delta["covers"])
+                                                       if capture and len(delta.get("covers") or ()) > 1 else ""),
+        raw_cols=raw_cols, col_map=resolution.col_map, defaults=resolution.defaults,
         dry_run_sql=dry_run_counts_sql(tgt_sql, header_cols, tmeta["columns"], plan, keep_target, replace) if dry else None)
     res = run_apply_script(script, transport, argv, "-c synchronous_commit=off" if not dry else "-c statement_timeout=0")
     if os.environ.get("SWEEP_PROMOTE_DEBUG_DIR"):          # keeps the generated script and its output for troubleshooting
@@ -400,7 +403,33 @@ def plan_deltas(src, tgt, mrow, opts):
         expect += 1
     if last == 0 and not out[0]["full"] and not has_rows(schema, table, tgt.database) and has_rows(schema, table, src.database):
         raise PromoteError(f"{schema}.{table} is empty in {tgt.name}: it needs a baseline (`promote --full`) before deltas can be applied")
+    return collapse_full_copies(out)
+
+
+def collapse_full_copies(deltas):
+    """
+    A run of CONSECUTIVE full-copy registry entries of one table (the part files of a --fast-bulk load: part1, part2, ...) is ONE apply: a full
+    copy takes the whole source table, so copying it once per part would repeat the same work. The collapsed entry keeps the first sequence
+    number (the next one the target expects) and lists every covered one in `covers`; apply_one registers them all in the target, so the strict
+    sequence order of the next hop holds. Captured deltas and a lone full copy are untouched.
+    """
+    out = []
+    for d in deltas:
+        if out and d["full"] and out[-1]["full"] and d["seq"] is not None and out[-1]["seq"] is not None:
+            out[-1]["covers"].append(d["seq"])
+            continue
+        out.append(dict(d, covers=[d["seq"]]) if d["full"] and d["seq"] is not None else d)
     return out
+
+
+def covered_registry_sql(schema, table, run_id, uri, columns, origin, seq, covers):
+    """Registry rows for the sequences a collapsed full copy covers besides its own (written only when the copy itself was registered)."""
+    return "".join(
+        f"INSERT INTO {REGISTRY} (run_id, seq, target_schema, target_table, origin_layer, source_uris, rows_inserted, rows_updated, rows_total, "
+        f"full_copy, delta_table, columns, status, message) SELECT {lit(run_id)}, {int(s)}, {lit(schema)}, {lit(table)}, {lit(origin)}, {lit(uri)}, "
+        f"0, 0, 0, true, NULL, {lit(','.join(columns))}, 'SUCCESS', {lit(f'covered by the full copy of delta {int(seq)} (one copy for several parts)')} "
+        f"WHERE EXISTS (SELECT 1 FROM {REGISTRY} WHERE target_schema = {lit(schema)} AND target_table = {lit(table)} AND seq = {int(seq)});\n"
+        for s in covers if s != seq)
 
 
 def record_failure(src, tgt, mrow, delta, message, opts):

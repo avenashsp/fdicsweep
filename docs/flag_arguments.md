@@ -1,4 +1,4 @@
-# SWEEP Migration Framework - Complete CLI Flags Reference (v6.2.2)
+# SWEEP Migration Framework - Complete CLI Flags Reference (v6.2.3)
 
 Complete flags reference for all CLI commands and python scripts in the **SWEEP Unified Data Migration Framework** across both **Oracle** and **VSAM** tracks.
 
@@ -145,7 +145,7 @@ Every step exits with **status 0 on success and non-zero on failure**, so shell 
 | `--dry-run` | flag | false | List the files that would load without inserting to DB | `--dry-run` |
 | `--reload` | flag | false | Load files again even when their S3 LastModified / ETag / size are unchanged since the last load (upsert on the key, append when there is none) | `--reload` |
 | `--max-rejects` | int | 0 | Oracle Step 06: fail and roll back a file when this many rows are rejected (NOT NULL / CHECK / bad value / FK / alternate-key conflict). `0` (default) = rejected rows never fail a file | `--max-rejects 50` |
-| `--fast-bulk` | flag | false | Oracle Step 06: direct COPY (no temp staging, no bad-row isolation: one bad row fails the file) into an empty table without keys / CHECK / foreign keys / FE column rules; NOT NULL and identity columns are allowed. Otherwise the staged path is used and the log says why. Also loads smallest to largest instead of parent tables first | `--fast-bulk` |
+| `--fast-bulk` | flag | false | Oracle Step 06: direct COPY (no temp staging, no bad-row isolation: one bad row fails the file) into a BARE table - no key, foreign key, CHECK, index or user trigger, no FE column rules - empty or not (part files of one table); NOT NULL, identity BY DEFAULT and serial defaults are allowed. Registered as a full copy, the rows of the file come from the COPY itself (the target is never counted). Otherwise the staged path is used and the log names the object that forced it. Also loads smallest to largest instead of parent tables first | `--fast-bulk` |
 | `--chunk-rows` | int | 2000000 | Oracle Step 06: records per chunk when a big file is staged (one transaction, temp tables emptied after each chunk, one delta sequence per file); `0` = never chunk | `--chunk-rows 1000000` |
 | `--chunk-min-mb` | float | 256 | Oracle Step 06: only files at least this big (compressed size) are loaded in chunks | `--chunk-min-mb 100` |
 | `--trigger-mode` | choice | auto | Oracle Step 06: how triggers are switched off while loading: `replica` (session_replication_role, no lock), `disable` (ALTER TABLE DISABLE TRIGGER), `auto` | `--trigger-mode disable` |

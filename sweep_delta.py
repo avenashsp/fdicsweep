@@ -102,16 +102,19 @@ def last_applied_seq(schema, table, dbname=None):
     return int(rows[0]["n"]) if rows else 0
 
 
-def fast_registry_sql(schema, table, run_id, uri, columns, origin_layer):
+def fast_registry_sql(schema, table, run_id, uri, columns, origin_layer, rows_sql=":n"):
     """
-    Registry row for the --fast-bulk path (direct COPY into an EMPTY table): the load is a full copy, so no delta is captured;
-    the number of rows is read back inside the transaction.
+    Registry row for the --fast-bulk path (direct COPY into a bare table, empty or not): the file is ALWAYS registered as a FULL COPY
+    (no delta is captured; the promote hop copies the source table), rows_inserted = the rows this file copied, rows_updated = 0.
+    `rows_sql` is the number of rows COPIED by the file (the psql variable :n, set from ROW_COUNT right after the \\copy) - the target
+    table is never counted. The sequence number is taken under the same advisory lock the staged path uses, right before the insert,
+    so part files of one table that load at the same time copy in parallel and only queue for their sequence numbers.
     """
-    tgt = f"{q(schema)}.{q(table)}"
-    n = f"(SELECT count(*) FROM {tgt})"
+    key = lit('sweep_delta:' + schema + '.' + table)
     return (
+        f"DO $lk$ BEGIN PERFORM pg_advisory_xact_lock(hashtextextended({key}, 0)); END $lk$;\n"
         f"INSERT INTO {REGISTRY} (run_id, seq, target_schema, target_table, origin_layer, source_uris, rows_inserted, rows_updated, "
         f"rows_total, full_copy, delta_table, columns, status) "
         f"SELECT {lit(run_id)}, COALESCE((SELECT max(seq) FROM {REGISTRY} WHERE target_schema = {lit(schema)} "
-        f"AND target_table = {lit(table)}), 0) + 1, {lit(schema)}, {lit(table)}, {lit(origin_layer)}, {lit(uri)}, {n}, 0, {n}, true, NULL, "
-        f"{lit(','.join(columns))}, 'SUCCESS' WHERE {n} > 0;\n")
+        f"AND target_table = {lit(table)}), 0) + 1, {lit(schema)}, {lit(table)}, {lit(origin_layer)}, {lit(uri)}, {rows_sql}, 0, {rows_sql}, true, NULL, "
+        f"{lit(','.join(columns))}, 'SUCCESS' WHERE {rows_sql} > 0;\n")
