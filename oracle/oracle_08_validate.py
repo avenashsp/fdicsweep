@@ -321,7 +321,7 @@ def run_full_parity_audit(exact_counts=False, tables_filter=None, schemas_filter
     type_mismatches_cnt = sum(1 for c in column_comparison if c["overall_status"] == "TYPE_MISMATCH")
 
     total_cons_ora = sum(len(c_dict) for c_dict in oracle_cons_map.values())
-    total_cons_matched = sum(1 for c in constraints_comparison if c["status"] == "MATCH")
+    total_cons_matched = sum(1 for c in constraints_comparison if c["status"] in ("MATCH", "NOT_VALIDATED_BY_POLICY"))
 
     total_idx_ora = sum(len(i_dict) for i_dict in oracle_idx_map.values())
     total_idx_matched = sum(1 for i in index_comparison if "MATCH" in i["status"])
@@ -361,6 +361,7 @@ def run_full_parity_audit(exact_counts=False, tables_filter=None, schemas_filter
         {"Metric": "Columns Evaluated", "Value": f"{total_cols_matched} of {total_cols_ora} Matched", "Parity_Assessment": f"{round((total_cols_matched/max(total_cols_ora,1))*100,1)}%"},
         {"Metric": "Column Data Type Mismatches", "Value": type_mismatches_cnt, "Parity_Assessment": "ZERO" if type_mismatches_cnt == 0 else "MISMATCHES FOUND"},
         {"Metric": "Constraints (PK, UK, FK, Check)", "Value": f"{total_cons_matched} of {total_cons_ora} Matched & Validated", "Parity_Assessment": f"{round((total_cons_matched/max(total_cons_ora,1))*100,1)}%"},
+        {"Metric": "CHECK constraints NOT VALID by policy", "Value": sum(1 for c in constraints_comparison if c["status"] == "NOT_VALIDATED_BY_POLICY"), "Parity_Assessment": "INFORMATIONAL (not a discrepancy)"},
         {"Metric": "Indexes (Unique & Secondary)", "Value": f"{total_idx_matched} of {total_idx_ora} Matched", "Parity_Assessment": f"{round((total_idx_matched/max(total_idx_ora,1))*100,1)}%"},
         {"Metric": "Database Sequences", "Value": f"{total_seq_matched} of {total_seq_ora} Matched", "Parity_Assessment": f"{round((total_seq_matched/max(total_seq_ora,1))*100,1)}%"},
         {"Metric": "Views & Materialized Views", "Value": f"{total_views_matched} of {total_views_ora} Matched", "Parity_Assessment": f"{round((total_views_matched/max(total_views_ora,1))*100,1)}%"},

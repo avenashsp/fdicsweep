@@ -1,4 +1,4 @@
-# FE SQL files - `sweep.py fwd-ddl` (v6.2.1)
+# FE SQL files - `sweep.py fwd-ddl` (v6.2.2)
 
 Forward engineering (FE) asks for tables to be created and Oracle / VSAM tables to be changed: add, drop or rename columns, retype, new constraints, indexes, views, triggers. Those
 changes are **SQL files in `fwd_ddl/`** that the Database team applies in **silver** and then moves on to **gold_backup** and **gold** (`silver -> gold_backup -> gold`), schema first, then data. **They never run in bronze:** bronze is the raw mirror of the source (the S3 files are loaded into it as they are); `promote` bridges the difference between the raw bronze tables and the FE-changed silver tables (section 2). The files contain **structure only**.

@@ -423,6 +423,35 @@ def parse_alter_ddl(text, default_owner="", source_file=""):
     return results
 
 
+def not_null_row(owner, table, column, source_file=""):
+    """The NOT_NULL constraint row of one column (same shape for an inline NOT NULL and for ALTER ... MODIFY ... NOT NULL)."""
+    owner, table, column = owner.upper(), table.upper(), column.upper()
+    return {"owner": owner, "table_name": table, "constraint_name": f"NN_{table}_{column}", "ctype": "NOT_NULL", "columns": column,
+            "ref_owner": "", "ref_table": "", "ref_columns": "", "check_condition": "", "source_file": source_file}
+
+
+def inline_not_null_rows(tbl, source_file=""):
+    """
+    NOT_NULL constraint rows for the columns of a CREATE TABLE that are declared NOT NULL inline. Primary-key and identity columns
+    get none: the key / the identity already makes them NOT NULL. (Step 04 turns every NOT_NULL row into SET NOT NULL.)
+    """
+    return [not_null_row(tbl["owner"], tbl["table"], c["column_name"], source_file) for c in tbl["columns"]
+            if c["nullable"] == "N" and c.get("is_pk") != "Y" and c.get("is_identity", "N") != "Y"]
+
+
+def dedupe_not_null(constraints):
+    """One NOT_NULL row per (owner, table, column): an inline NOT NULL that an ALTER ... MODIFY repeats is kept once (the first)."""
+    seen, out = set(), []
+    for cn in constraints:
+        if cn.get("ctype") == "NOT_NULL":
+            key = (cn["owner"].upper(), cn["table_name"].upper(), (cn.get("columns") or "").upper())
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(cn)
+    return out
+
+
 def parse_table_ddl(text, default_owner="", source_file=""):
     """Parses complete (single or multi-line) CREATE TABLE statement into columns, constraints, and partitions."""
     m_tbl = OBJ_RE.match(text)
@@ -728,6 +757,7 @@ def extract_metadata_from_master(sql_file_path=None, owners_filter=None, selecto
                         seen_tables.add((tbl["owner"], tbl["table"]))
                         tables_list.extend(tbl["columns"])
                         constraints_list.extend(tbl["constraints"])
+                        constraints_list.extend(inline_not_null_rows(tbl, target_sql.name))     # inline NOT NULL columns, like the MODIFY ones
                         partitions_list.extend(tbl["partitions"])
                         table_stats_list.append({
                             "owner": tbl["owner"],
@@ -759,6 +789,7 @@ def extract_metadata_from_master(sql_file_path=None, owners_filter=None, selecto
     # Write the 7 required metadata CSV files in outputs/oracle_metadata/
     # -------------------------------------------------------------------------
     validate_or_exit(sel.validate_tables, sorted(all_seen), what=f"the dump {target_sql.name}", logger=logger)
+    constraints_list = dedupe_not_null(constraints_list)
 
     if sel.dry_run:
         logger.info(f"[dry-run] {sel.describe()}: would write metadata of {len(seen_tables)} table(s) "

@@ -1,4 +1,4 @@
-# SWEEP CLI Command Reference - Oracle Migration Track (v6.2.1)
+# SWEEP CLI Command Reference - Oracle Migration Track (v6.2.2)
 
 > **6.0.0:** Steps 05-08 need `--layer` (Step 06 only `--layer bronze`); Steps 04, 05 and 07 refuse gold / gold_backup without `--allow-ddl`; Oracle 05 and 07 accept `--tables`; every step accepts `--tables`, `--schemas` / `--owners`, `--exclude-tables`, `--dry-run` (Oracle 02, 03, 06 also `--file` / `--filename`); targeted runs merge their outputs. Step 06 writes `sweep_ctl.oracle_load_log`, captures the applied delta for `promote` and loads again when the target table is empty. See [layers_and_promote.md](layers_and_promote.md) and [targeting_and_outputs.md](targeting_and_outputs.md).
 >
@@ -113,6 +113,7 @@ python3 -m oracle.oracle_01_extract_mtd --owners BSS01001 --bg
 
 * **Inputs**: `oracle/inputs/oracle_dump/*.sql` (or `--file`)
 * **Outputs**: `oracle/outputs/oracle_metadata/oracle_01_metadata_{tables,constraints,indexes,partitions,table_stats,sequences,objects}.csv`
+* **NOT NULL (6.2.2)**: every NOT NULL column gets ONE `NOT_NULL` row (`NN_<table>_<column>`) in `oracle_01_metadata_constraints.csv` - whether the dump declares it inline in `CREATE TABLE` (`"BALANCE" NUMBER(15,2) DEFAULT 0 NOT NULL ENABLE`) or later with `ALTER TABLE ... MODIFY ("STATUS" DEFAULT 'A' NOT NULL ENABLE)`. A column that both declare is written once. Primary-key and identity columns get none (the key / the identity already enforces it). The `nullable` flag of `oracle_01_metadata_tables.csv` still shows the `CREATE TABLE` definition only.
 * **Report**: `oracle/reports/<db>_oracle_01_extract_report_<timestamp>.xlsx`
 * **Log**: `oracle/logs/<db>_oracle_01_extract_<timestamp>.log`
 
@@ -193,6 +194,7 @@ python3 -m oracle.oracle_04_generate_ddl --owners BSS01001
 * **Outputs** (one set per schema):
   - `oracle/outputs/pre_load/<schema>_tables.sql` (bare tables + partitions)
   - `oracle/outputs/post_load/<schema>_unique_and_pk.sql`, `_alter_statements.sql`, `_indexes.sql`, `_fk_not_valid.sql`, `_fk_validate.sql`, `_views.sql`, `_triggers.sql`
+  - every `NOT_NULL` row of Step 01 (inline and `MODIFY`) becomes `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL` in `_alter_statements.sql`; the bare tables of `pre_load` carry no NOT NULL, so the loader can reject bad rows instead of failing on them. CHECK constraints are added `NOT VALID` on purpose (validation is skipped per policy).
 * **Report**: `oracle/reports/<db>_oracle_04_generate_ddl_report_<timestamp>.xlsx`
 * **Log**: `oracle/logs/<db>_oracle_04_generate_ddl_<timestamp>.log`
 
@@ -273,6 +275,7 @@ python3 -m oracle.oracle_06_load_data --workers 4 --bg
 * **Which files**: a file counts as already loaded only when `sweep_ctl.oracle_load_log` has a `SUCCESS` row whose stored S3 `LastModified`, `ETag` and size (columns `s3_last_modified`, `s3_etag`, `s3_size`) all equal what S3 reports now **and the target table is not empty** (a table somebody truncated by hand is loaded again). Step 02 writes them to the file map; Step 06 re-checks the object (HEAD) right before loading and stores what it saw, so a stale file map does not matter. A re-delivered file (same name and path, different metadata) is loaded again; `--reload`, `--file` and `--filename` force a load. Rows from earlier versions without metadata are treated as loaded (use `--reload` to re-verify them). `oracle_load_log` keeps one row per URI.
 * **Triggers**: switched off for the load transaction (`SET LOCAL session_replication_role = replica`, or `DISABLE TRIGGER` / `ENABLE TRIGGER` inside the transaction as a fallback - `--trigger-mode`), so audit columns are set explicitly on updates.
 * **Upsert**: `INSERT ... ON CONFLICT (key) DO UPDATE ... WHERE (target columns) IS DISTINCT FROM (file columns)` - only rows that actually differ are updated. A `modifieddate` / `modifiedby` that comes from the file is source data and counts as a change. Counts: `inserted`, `updated`, `unchanged` (identical rows, not touched), `rejected`, `duplicates` (in-file, last row wins); `read = inserted + updated + unchanged + rejected + duplicates` is checked before the commit.
+* **NOT NULL columns**: when the table has them (Step 07 applies `SET NOT NULL` after the first load, so a reload meets them), the staged and chunked loads reject a row with a NULL there as `NOT_NULL` (one entry per column in `sweep_ctl.load_rejects`, ONE rejected row in the counts); `--fast-bulk` is a direct `COPY`, so one NULL in a NOT NULL column **fails the whole file** (nothing is loaded) - by design.
 * **Bad rows**: `NOT_NULL`, `CHECK`, `BAD_VALUE`, `FK_MISSING` and `ALT_KEY_CONFLICT` rows are rejected, not fatal; they are listed in `sweep_ctl.load_rejects` and the `Reject_Summary` / `Rejected_Rows` sheets. **By default (`--max-rejects 0`) rejected rows never fail a file**; only technical errors (a row-count mismatch, a broken stream) roll it back. `--max-rejects N` fails and rolls back a file at N rejected rows.
 * **Atomicity**: each file is one transaction (staging, validation, upsert, `oracle_load_log` row, delta capture, `COMMIT`); a failed or truncated stream leaves no rows behind. File names are shell-quoted, so keys with spaces, quotes or `;` are safe.
 * **Safety**: a failed "is the table empty?" / "does it have a PK?" lookup fails the file instead of guessing. Each file is bounded by `SWEEP_LOAD_TIMEOUT` (default 6 h). PostgreSQL 16 or later is required (`pg_input_is_valid`).
@@ -338,7 +341,8 @@ python3 -m oracle.oracle_08_validate --exact-counts
 ```
 
 * **Inputs**: Oracle metadata extracts, PostgreSQL catalog, `sweep_ctl.oracle_load_log`
-* **Outputs**: Multi-tab parity audit Excel report (10 tabs, see `docs/sweep_outputs.md`)
+* **Outputs**: Multi-tab parity audit Excel report (11 tabs, see `docs/sweep_outputs.md`)
+* **Nullability (6.2.2)**: a column is NOT NULL in Oracle when its `CREATE TABLE` says so OR a `NOT_NULL` constraint row exists (from `ALTER ... MODIFY ... NOT NULL` and the rows Step 01 writes for the inline ones); PostgreSQL is compared with that combined value (`NULLABILITY_MISMATCH` otherwise; the FE overlay still turns an FE-explained difference into `FE_CHANGED`). The constraint comparison skips the `NOT_NULL`, `DEFAULT` and `RAW_ALTER` rows - they are column rules, checked by the column comparison, not constraints of `pg_constraint`. A CHECK constraint that is `NOT VALID` by policy is reported `NOT_VALIDATED_BY_POLICY` (informational, not a discrepancy, counted as matched, counted in the Executive Summary); an unvalidated foreign key stays `CONSTRAINT_NOT_VALIDATED`.
 * **Exit code**: `0` only when the audit verdict is `PASS - 100% PARITY ACHIEVED`; `1` otherwise
 * **Report**: `oracle/reports/<db>_oracle_08_validate_report_<timestamp>.xlsx`
 * **Log**: `oracle/logs/<db>_oracle_08_validate_<timestamp>.log`
@@ -372,7 +376,7 @@ python3 sweep.py oracle load-data --min-size-mb 100 --max-size-mb 1000 --workers
 python3 sweep.py oracle load-data --min-size-mb 1000 --workers 2 --bg
 ```
 
-### Step 06 options (v6.2.1)
+### Step 06 options (v6.2.2)
 
 ```bash
 python3 sweep.py oracle load-data                           # default: rejected rows never fail a file (--max-rejects 0)

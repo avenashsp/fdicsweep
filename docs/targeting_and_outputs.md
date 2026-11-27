@@ -1,4 +1,4 @@
-# Targeted runs, merge-safe outputs and the load log tables (v6.2.1)
+# Targeted runs, merge-safe outputs and the load log tables (v6.2.2)
 
 ## 1. Uniform targeting flags
 

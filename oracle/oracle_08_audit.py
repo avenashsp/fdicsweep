@@ -298,6 +298,15 @@ def compare_columns(db_connected, discrepancies, meta, pg_cat, schemas_filter, t
         if s and t and c:
             oracle_cols_map[(s, t)][c] = col
 
+    # a column is NOT NULL in Oracle when its CREATE TABLE says so OR a NOT_NULL constraint row exists (ALTER TABLE ... MODIFY ... NOT NULL, and
+    # the rows Step 01 writes for the inline ones): the expected nullability is the combination of both
+    not_null_cols = defaultdict(set)
+    for c_row in meta["constraints"]:
+        if (c_row.get("ctype") or "").upper().strip() == "NOT_NULL":
+            for x in (c_row.get("columns") or "").split(","):
+                if x.strip():
+                    not_null_cols[((c_row.get("owner") or "").lower().strip(), norm_col(c_row.get("table_name") or ""))].add(norm_col(x))
+
     pg_cols_map = defaultdict(dict)
     for col in pg_cat["columns"]:
         s = col["table_schema"].lower().strip()
@@ -334,7 +343,7 @@ def compare_columns(db_connected, discrepancies, meta, pg_cat, schemas_filter, t
             actual_pg = pg_c.get("formatted_type", "") if pg_c else ""
             cid = ora_c.get("column_id", "") if ora_c else pg_c.get("column_id", "")
 
-            ora_null = ora_c.get("nullable", "Y") if ora_c else ""
+            ora_null = ("N" if (ora_c.get("nullable", "Y") == "N" or c in not_null_cols.get((s, t), ())) else "Y") if ora_c else ""
             pg_null = "YES" if pg_c and pg_c.get("is_nullable") else ("NO" if pg_c else "")
 
             # Check Type Parity
@@ -409,6 +418,11 @@ def compare_columns(db_connected, discrepancies, meta, pg_cat, schemas_filter, t
     return column_comparison, oracle_cols_map
 
 
+# Rows of the constraint metadata that are column rules, not constraints of the table: NOT NULL is checked by the column comparison
+# (nullability), a DEFAULT / RAW_ALTER has no pg_constraint row to compare
+NON_CONSTRAINT_TYPES = ("NOT_NULL", "DEFAULT", "RAW_ALTER")
+
+
 def compare_constraints(db_connected, discrepancies, meta, pg_cat, schemas_filter, tables_filter):
     # -------------------------------------------------------------------------
     # LEVEL 4: Constraints Comparison
@@ -421,7 +435,7 @@ def compare_constraints(db_connected, discrepancies, meta, pg_cat, schemas_filte
         cn = norm_col(c_row.get("constraint_name") or "")
         ctype = (c_row.get("ctype") or "").upper().strip()
         cols = ",".join(norm_col(x) for x in c_row.get("columns", "").split(",") if x.strip())
-        if s and t:
+        if s and t and ctype not in NON_CONSTRAINT_TYPES:
             oracle_cons_map[(s, t)][cn] = {
                 "name": cn, "ctype": ctype, "columns": cols,
                 "ref_table": norm_col(c_row.get("ref_table") or ""),
@@ -469,7 +483,10 @@ def compare_constraints(db_connected, discrepancies, meta, pg_cat, schemas_filte
             if not db_connected:
                 status = "DB_UNREACHABLE"
             elif in_ora and in_pg:
-                if is_val is False:
+                if is_val is False and (oc["ctype"] == "C" or pc.get("constraint_type") == "c"):
+                    # CHECK constraints are added NOT VALID on purpose (Step 04: validation is skipped per policy): informational only
+                    status = "NOT_VALIDATED_BY_POLICY"
+                elif is_val is False:
                     status = "UNVALIDATED"
                     discrepancies.append({
                         "Object_Category": "CONSTRAINT", "Target_Schema": s, "Target_Table": t,

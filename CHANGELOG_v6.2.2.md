@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [6.2.2] - 2026-11-27
+
+Fix: inline NOT NULL columns of the Oracle dump were lost in bronze, and the Oracle Step 08 validator reported 126 false `NULLABILITY_MISMATCH`.
+
+### Fixed
+- **Oracle Step 01:** NOT_NULL constraint rows were created only from `ALTER TABLE ... MODIFY ... NOT NULL`; a column declared `NOT NULL` inline in `CREATE TABLE` (for example `"ACCOUNT_NO" VARCHAR2(16) NOT NULL ENABLE`, `"BALANCE" NUMBER(15,2) DEFAULT 0 NOT NULL ENABLE`) produced none, so Step 04 never generated its `SET NOT NULL` and the bronze table was nullable. Every NOT NULL column now gets ONE `NOT_NULL` row (`NN_<table>_<column>`, same shape as the MODIFY rows); a column that both declare is written once. Primary-key and identity columns get none (the key / identity already enforces it). Partitioned tables work as before.
+- **Oracle Step 08:** the expected nullability was the `CREATE TABLE` flag only, so a column that `ALTER ... MODIFY` made NOT NULL (and that PostgreSQL correctly has as NOT NULL) was flagged. A column is now NOT NULL when the CREATE TABLE says so OR a NOT_NULL constraint row exists; PostgreSQL is compared with that combined value. The FE overlay (`FE_CHANGED` / `FE_ADDED` / `FE_DROPPED`) is unchanged.
+- **Oracle Step 08, constraint comparison:** `NOT_NULL`, `DEFAULT` and `RAW_ALTER` rows are column rules, not constraints of `pg_constraint`; they were counted as `MISSING_CONSTRAINT_IN_PG` (the 12 missing constraints of the test run are most likely these - they no longer appear, so what is still listed is a real difference). They are checked by the column comparison.
+
+### Changed
+- **Step 08, CHECK constraints** that are `NOT VALID` on purpose (Step 04: "validation is skipped per policy") are reported `NOT_VALIDATED_BY_POLICY`: informational, not a discrepancy, counted as matched, and shown in a new Executive Summary line. An unvalidated foreign key is still `CONSTRAINT_NOT_VALIDATED`.
+- Version 6.2.2; the changelog file is `CHANGELOG_v6.2.2.md`.
+
+### Not changed (by decision)
+- `--fast-bulk` stays a direct `COPY`: one NULL in a NOT NULL column fails the whole file (nothing is loaded). The staged and chunked loads reject such rows into `sweep_ctl.load_rejects` (one rejected row per source row), unchanged.
+
+### Tests
+- New: the Step 01 parser (inline NOT NULL, `DEFAULT ... NOT NULL ENABLE`, MODIFY, de-duplication, primary-key / identity / partitioned tables), Step 01 output on a dump with the `BSS01001.ACCOUNT` example, Step 04 `SET NOT NULL` for every NOT NULL column, the Step 08 nullability comparison (inline + MODIFY), the constraint comparison (column rules skipped, CHECK informational, FK still a discrepancy), NULLs in NOT NULL columns in the staged, chunked and fast-bulk loads.
+
+---
+
 ## [6.2.1] - 2026-11-25
 
 Fix for "could not extend file ... No space left on device" when loading a very big Oracle file (the staged path kept the whole file in local temp tables), a faster `--fast-bulk`, and a row-count fix. Re-implemented on the 6.2 design (delta capture, ledger, FE rules, promote) from the 5.4.1 / 5.4.2 changes of branch01.
